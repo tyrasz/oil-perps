@@ -1,12 +1,12 @@
 [package]
-name = "orderbook"
+name = "prop-amm"
 version = "0.1.0"
-description = "On-chain order book for perpetual futures"
+description = "Proprietary AMM for perpetual futures trading"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "lib"]
-name = "orderbook"
+name = "prop_amm"
 
 [features]
 no-entrypoint = []
@@ -19,5 +19,6 @@ default = []
 overflow-checks = true
 
 [dependencies]
-anchor-lang = "0.28.0"
-perps-core = { path = "../perps-core", features = ["cpi"] }
+anchor-lang = { version = "0.28.0", features = ["init-if-needed"] }
+anchor-spl = "0.28.0"
+pyth-sdk-solana = "0.8"

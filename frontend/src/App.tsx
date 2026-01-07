@@ -8,9 +8,10 @@ import { MarketStats } from './components/MarketStats';
 import { RecentTrades } from './components/RecentTrades';
 import { AccountPanel } from './components/AccountPanel';
 import { OrdersTable } from './components/OrdersTable';
+import { LpVault } from './components/LpVault';
 import './App.css';
 
-type Tab = 'positions' | 'orders' | 'trades';
+type Tab = 'positions' | 'orders' | 'trades' | 'vault';
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('positions');
@@ -71,12 +72,19 @@ function App() {
             >
               Trade History
             </button>
+            <button
+              className={`tab ${activeTab === 'vault' ? 'active' : ''}`}
+              onClick={() => setActiveTab('vault')}
+            >
+              LP Vault
+            </button>
           </div>
 
           <div className="tab-content">
             {activeTab === 'positions' && <PositionTable />}
             {activeTab === 'orders' && <OrdersTable />}
             {activeTab === 'trades' && <TradeHistory />}
+            {activeTab === 'vault' && <LpVault />}
           </div>
         </div>
       </main>

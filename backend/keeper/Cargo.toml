@@ -5,9 +5,8 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-solana-client = "1.14"
-solana-sdk = "1.14"
-anchor-client = "0.24.2"
+solana-sdk = "1.17"
+anchor-client = "0.29.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
