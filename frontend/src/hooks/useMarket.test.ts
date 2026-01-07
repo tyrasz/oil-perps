@@ -1,34 +1,16 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { renderHook } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { renderHook, waitFor, act } from '@testing-library/react';
+import { useMarket } from './useMarket';
 import { useMarketStore } from '../stores/marketStore';
 
-// Mock the Solana wallet adapter hooks
-vi.mock('@solana/wallet-adapter-react', () => ({
-  useConnection: () => ({
-    connection: {},
-  }),
-  useWallet: () => ({
-    publicKey: null,
-  }),
-}));
-
-// Mock fetch
-vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({
-  json: () => Promise.resolve({}),
-})));
-
-// Mock WebSocket
-vi.stubGlobal('WebSocket', class MockWebSocket {
-  onopen: (() => void) | null = null;
-  onmessage: ((event: { data: string }) => void) | null = null;
-  onclose: (() => void) | null = null;
-  onerror: ((error: Error) => void) | null = null;
-  send = vi.fn();
-  close = vi.fn();
-});
+// Mock fetch for this test file
+const mockFetch = vi.fn();
+global.fetch = mockFetch;
 
 describe('useMarket', () => {
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
     // Reset store state
     useMarketStore.setState({
       market: null,
@@ -40,110 +22,214 @@ describe('useMarket', () => {
       selectedLeverage: 10,
       orderType: 'market',
     });
+
+    mockFetch.mockReset();
+    // Default mock response
+    mockFetch.mockResolvedValue({
+      json: () => Promise.resolve({}),
+    });
   });
 
-  describe('store integration', () => {
-    it('should have access to market state from store', () => {
-      const mockMarket = {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  describe('initial render', () => {
+    it('should return initial state from store', () => {
+      const { result } = renderHook(() => useMarket());
+
+      expect(result.current.market).toBeNull();
+      expect(result.current.orderBook).toBeNull();
+      expect(result.current.recentTrades).toEqual([]);
+    });
+
+    it('should expose refresh functions', () => {
+      const { result } = renderHook(() => useMarket());
+
+      expect(typeof result.current.refreshMarket).toBe('function');
+      expect(typeof result.current.refreshOrderBook).toBe('function');
+    });
+  });
+
+  describe('fetchMarket', () => {
+    it('should fetch market data on mount', async () => {
+      const mockMarketData = {
         address: 'market123',
-        price: 75.5,
-        priceChange24h: 2.5,
-        volume24h: 1000000,
-        openInterest: 500000,
-        longOpenInterest: 300000,
-        shortOpenInterest: 200000,
-        fundingRate: 0.0001,
-        maxLeverage: 20,
-        isPaused: false,
+        long_open_interest: 300_000_000,
+        short_open_interest: 200_000_000,
+        funding_rate: 100,
+        max_leverage: 20_000,
+        is_paused: false,
       };
 
-      useMarketStore.getState().setMarket(mockMarket);
+      const mockStats = {
+        price: 75_500_000,
+        price_change_24h: 2.5,
+        volume_24h: 1_000_000_000_000,
+        open_interest: 500_000_000,
+      };
 
-      const state = useMarketStore.getState();
-      expect(state.market).toEqual(mockMarket);
+      mockFetch
+        .mockResolvedValueOnce({ json: () => Promise.resolve(mockMarketData) })
+        .mockResolvedValueOnce({ json: () => Promise.resolve(mockStats) })
+        .mockResolvedValue({ json: () => Promise.resolve({ bids: [], asks: [] }) });
+
+      const { result } = renderHook(() => useMarket());
+
+      await waitFor(() => {
+        expect(result.current.market).not.toBeNull();
+      });
+
+      expect(result.current.market?.address).toBe('market123');
+      expect(result.current.market?.price).toBe(75.5);
+      expect(result.current.market?.volume24h).toBe(1000000);
     });
 
-    it('should have access to orderBook state from store', () => {
-      const mockOrderBook = {
-        bids: [{ price: 75.00, size: 100, total: 100 }],
-        asks: [{ price: 75.05, size: 80, total: 80 }],
-        spread: 0.05,
-        midPrice: 75.025,
-      };
+    it('should handle API errors gracefully', async () => {
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      mockFetch.mockRejectedValue(new Error('Network error'));
 
-      useMarketStore.getState().setOrderBook(mockOrderBook);
+      renderHook(() => useMarket());
 
-      const state = useMarketStore.getState();
-      expect(state.orderBook).toEqual(mockOrderBook);
-    });
+      await waitFor(() => {
+        expect(consoleSpy).toHaveBeenCalled();
+      });
 
-    it('should track recent trades in store', () => {
-      const trade1 = {
-        signature: 'sig1',
-        side: 'long' as const,
-        price: 75.00,
-        size: 5,
-        timestamp: Date.now(),
-      };
-      const trade2 = {
-        signature: 'sig2',
-        side: 'short' as const,
-        price: 75.10,
-        size: 8,
-        timestamp: Date.now() + 1000,
-      };
-
-      useMarketStore.getState().addTrade(trade1);
-      useMarketStore.getState().addTrade(trade2);
-
-      const trades = useMarketStore.getState().recentTrades;
-      expect(trades).toHaveLength(2);
-      expect(trades[0].signature).toBe('sig2'); // Most recent first
+      consoleSpy.mockRestore();
     });
   });
 
-  describe('data transformation', () => {
+  describe('fetchOrderBook', () => {
+    it('should fetch and transform order book data', async () => {
+      const mockOrderBook = {
+        bids: [
+          [75_000_000, 100_000_000],
+          [74_950_000, 150_000_000],
+        ],
+        asks: [
+          [75_050_000, 80_000_000],
+          [75_100_000, 120_000_000],
+        ],
+      };
+
+      mockFetch
+        .mockResolvedValueOnce({ json: () => Promise.resolve({}) })
+        .mockResolvedValueOnce({ json: () => Promise.resolve({}) })
+        .mockResolvedValueOnce({ json: () => Promise.resolve(mockOrderBook) });
+
+      const { result } = renderHook(() => useMarket());
+
+      await waitFor(() => {
+        expect(result.current.orderBook).not.toBeNull();
+      });
+
+      expect(result.current.orderBook?.bids).toHaveLength(2);
+      expect(result.current.orderBook?.asks).toHaveLength(2);
+      expect(result.current.orderBook?.bids[0].price).toBe(75);
+      expect(result.current.orderBook?.asks[0].price).toBe(75.05);
+    });
+
+    it('should calculate spread correctly', async () => {
+      const mockOrderBook = {
+        bids: [[75_000_000, 100_000_000]],
+        asks: [[75_100_000, 80_000_000]],
+      };
+
+      mockFetch
+        .mockResolvedValueOnce({ json: () => Promise.resolve({}) })
+        .mockResolvedValueOnce({ json: () => Promise.resolve({}) })
+        .mockResolvedValueOnce({ json: () => Promise.resolve(mockOrderBook) });
+
+      const { result } = renderHook(() => useMarket());
+
+      await waitFor(() => {
+        expect(result.current.orderBook).not.toBeNull();
+      });
+
+      expect(result.current.orderBook?.spread).toBeCloseTo(0.1, 2);
+      expect(result.current.orderBook?.midPrice).toBeCloseTo(75.05, 2);
+    });
+
+    it('should handle empty order book', async () => {
+      mockFetch
+        .mockResolvedValueOnce({ json: () => Promise.resolve({}) })
+        .mockResolvedValueOnce({ json: () => Promise.resolve({}) })
+        .mockResolvedValueOnce({ json: () => Promise.resolve({ bids: [], asks: [] }) });
+
+      const { result } = renderHook(() => useMarket());
+
+      await waitFor(() => {
+        expect(result.current.orderBook).not.toBeNull();
+      });
+
+      expect(result.current.orderBook?.spread).toBe(0);
+      expect(result.current.orderBook?.midPrice).toBe(0);
+    });
+  });
+
+  describe('recentTrades', () => {
+    it('should return trades from store', () => {
+      // Pre-populate store with trades
+      useMarketStore.getState().addTrade({
+        signature: 'sig1',
+        side: 'long',
+        price: 75.5,
+        size: 10,
+        timestamp: Date.now(),
+      });
+
+      const { result } = renderHook(() => useMarket());
+
+      expect(result.current.recentTrades).toHaveLength(1);
+      expect(result.current.recentTrades[0].signature).toBe('sig1');
+    });
+  });
+
+  describe('refreshMarket', () => {
+    it('should refetch market data when called', async () => {
+      mockFetch.mockResolvedValue({ json: () => Promise.resolve({}) });
+
+      const { result } = renderHook(() => useMarket());
+
+      const initialCalls = mockFetch.mock.calls.length;
+
+      await act(async () => {
+        await result.current.refreshMarket();
+      });
+
+      expect(mockFetch.mock.calls.length).toBeGreaterThan(initialCalls);
+    });
+  });
+
+  describe('refreshOrderBook', () => {
+    it('should refetch order book when called', async () => {
+      mockFetch.mockResolvedValue({ json: () => Promise.resolve({ bids: [], asks: [] }) });
+
+      const { result } = renderHook(() => useMarket());
+
+      const initialCalls = mockFetch.mock.calls.length;
+
+      await act(async () => {
+        await result.current.refreshOrderBook();
+      });
+
+      expect(mockFetch.mock.calls.length).toBeGreaterThan(initialCalls);
+    });
+  });
+
+  describe('data transformations', () => {
     it('should correctly transform API price data (6 decimal conversion)', () => {
-      // API returns prices in 6 decimal format
-      const rawPrice = 75_500_000; // $75.50 with 6 decimals
+      const rawPrice = 75_500_000;
       const transformedPrice = rawPrice / 1_000_000;
       expect(transformedPrice).toBe(75.5);
     });
 
     it('should correctly transform volume data', () => {
-      const rawVolume = 1_000_000_000_000; // $1M with 6 decimals
+      const rawVolume = 1_000_000_000_000;
       const transformedVolume = rawVolume / 1_000_000;
       expect(transformedVolume).toBe(1000000);
     });
 
-    it('should calculate spread from order book', () => {
-      const bestBid = 75.00;
-      const bestAsk = 75.05;
-      const spread = bestAsk - bestBid;
-      expect(spread).toBeCloseTo(0.05, 2);
-    });
-
-    it('should calculate midPrice from order book', () => {
-      const bestBid = 75.00;
-      const bestAsk = 75.10;
-      const midPrice = (bestBid + bestAsk) / 2;
-      expect(midPrice).toBeCloseTo(75.05, 2);
-    });
-
-    it('should handle empty order book gracefully', () => {
-      const bids: number[] = [];
-      const asks: number[] = [];
-      const bestBid = bids[0] || 0;
-      const bestAsk = asks[0] || 0;
-      const spread = bestAsk - bestBid;
-      const midPrice = (bestBid + bestAsk) / 2;
-
-      expect(spread).toBe(0);
-      expect(midPrice).toBe(0);
-    });
-  });
-
-  describe('order book aggregation', () => {
     it('should calculate cumulative totals for bids', () => {
       const rawBids = [
         [75_000_000, 100_000_000],
@@ -160,51 +246,6 @@ describe('useMarket', () => {
       expect(bids[0].total).toBe(100);
       expect(bids[1].total).toBe(250);
       expect(bids[2].total).toBe(450);
-    });
-
-    it('should calculate cumulative totals for asks', () => {
-      const rawAsks = [
-        [75_050_000, 80_000_000],
-        [75_100_000, 120_000_000],
-      ];
-
-      const asks = rawAsks.map(([price, size], i, arr) => ({
-        price: price / 1_000_000,
-        size: size / 1_000_000,
-        total: arr.slice(0, i + 1).reduce((sum, [, s]) => sum + s / 1_000_000, 0),
-      }));
-
-      expect(asks[0].total).toBe(80);
-      expect(asks[1].total).toBe(200);
-    });
-  });
-
-  describe('WebSocket message handling', () => {
-    it('should parse price update messages', () => {
-      const message = { type: 'price', price: 76_000_000 };
-      const transformedPrice = message.price / 1_000_000;
-      expect(transformedPrice).toBe(76);
-    });
-
-    it('should parse trade messages', () => {
-      const message = {
-        type: 'trade',
-        side: 'long',
-        price: 75_500_000,
-        size: 10_000_000,
-        timestamp: Date.now(),
-      };
-
-      const trade = {
-        signature: '',
-        side: message.side,
-        price: message.price / 1_000_000,
-        size: message.size / 1_000_000,
-        timestamp: message.timestamp,
-      };
-
-      expect(trade.price).toBe(75.5);
-      expect(trade.size).toBe(10);
     });
   });
 });
