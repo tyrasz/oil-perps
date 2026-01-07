@@ -1,0 +1,40 @@
+# Anchor
+.anchor
+target
+test-ledger
+
+# Node
+node_modules
+dist
+
+# Rust
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs
+frontend/dist
+backend/target
+
+# Claude
+.claude/plans

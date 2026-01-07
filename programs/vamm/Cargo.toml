@@ -1,0 +1,23 @@
+[package]
+name = "vamm"
+version = "0.1.0"
+description = "Virtual AMM backstop for liquidity provision"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "vamm"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[profile.release]
+overflow-checks = true
+
+[dependencies]
+anchor-lang = "0.24.2"
+perps-core = { path = "../perps-core", features = ["cpi"] }

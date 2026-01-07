@@ -1,0 +1,69 @@
+use axum::{
+    extract::{Path, Query, State, WebSocketUpgrade},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
+use tracing_subscriber;
+
+mod routes;
+mod ws;
+mod state;
+
+use state::AppState;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::init();
+
+    dotenvy::dotenv().ok();
+
+    let rpc_url = std::env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| "http://localhost:8899".to_string());
+
+    let state = Arc::new(AppState::new(&rpc_url));
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let app = Router::new()
+        // Market endpoints
+        .route("/api/market", get(routes::get_market))
+        .route("/api/market/stats", get(routes::get_market_stats))
+        .route("/api/market/price", get(routes::get_price))
+
+        // Position endpoints
+        .route("/api/positions", get(routes::get_positions))
+        .route("/api/positions/:address", get(routes::get_user_positions))
+
+        // Order book endpoints
+        .route("/api/orderbook", get(routes::get_orderbook))
+        .route("/api/orders/:address", get(routes::get_user_orders))
+
+        // Trade history
+        .route("/api/trades", get(routes::get_trades))
+        .route("/api/trades/:address", get(routes::get_user_trades))
+
+        // User account
+        .route("/api/account/:address", get(routes::get_account))
+
+        // WebSocket
+        .route("/ws", get(ws::websocket_handler))
+
+        .layer(cors)
+        .with_state(state);
+
+    let addr = "0.0.0.0:3001";
+    tracing::info!("Starting API server on {}", addr);
+
+    axum::Server::bind(&addr.parse().unwrap())
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+}

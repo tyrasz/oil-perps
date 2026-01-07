@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "programs/*",
+    "backend/api",
+    "backend/indexer",
+    "backend/keeper"
+]
+
+[workspace.dependencies]
+anchor-lang = "0.24.2"
+solana-program = "1.14"
+solana-client = "1.14"
+solana-sdk = "1.14"
+pyth-sdk-solana = "0.7"
+tokio = { version = "1", features = ["full"] }
+axum = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.7", features = ["runtime-tokio", "postgres"] }
+thiserror = "1"
