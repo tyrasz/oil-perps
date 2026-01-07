@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
-import { createChart, IChartApi, ISeriesApi, CandlestickData, Time } from 'lightweight-charts';
+import { createChart, CandlestickSeries } from 'lightweight-charts';
+import type { IChartApi, ISeriesApi, CandlestickData, Time } from 'lightweight-charts';
 
 interface TradingChartProps {
   symbol?: string;
@@ -36,7 +37,7 @@ export function TradingChart({ symbol = 'OIL-PERP' }: TradingChartProps) {
       height: 400,
     });
 
-    const candleSeries = chart.addCandlestickSeries({
+    const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#22c55e',
       downColor: '#ef4444',
       borderUpColor: '#22c55e',

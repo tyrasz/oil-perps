@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useMarketStore } from '../stores/marketStore';
-import type { OrderSide, OrderType } from '../types';
+import type { OrderSide } from '../types';
 
 export function OrderEntry() {
   const { connected, publicKey } = useWallet();

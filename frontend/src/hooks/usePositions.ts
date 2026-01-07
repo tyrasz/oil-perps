@@ -1,5 +1,5 @@
 import { useEffect, useCallback } from 'react';
-import { useConnection, useWallet } from '@solana/wallet-adapter-react';
+import { useWallet } from '@solana/wallet-adapter-react';
 import { useMarketStore } from '../stores/marketStore';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
