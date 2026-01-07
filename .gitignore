@@ -38,3 +38,4 @@ backend/target
 
 # Claude
 .claude/plans
+coverage/
