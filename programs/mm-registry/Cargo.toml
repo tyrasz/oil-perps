@@ -1,0 +1,23 @@
+[package]
+name = "mm-registry"
+version = "0.1.0"
+description = "Market Maker Registry for permissionless liquidity provision"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "mm_registry"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[profile.release]
+overflow-checks = true
+
+[dependencies]
+anchor-lang = "0.28.0"
+anchor-spl = "0.28.0"
