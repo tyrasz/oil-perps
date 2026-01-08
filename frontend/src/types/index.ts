@@ -1,6 +1,7 @@
 export interface Position {
   address: string;
   owner: string;
+  commodity: string;          // Commodity ID (e.g., 'OIL', 'GOLD')
   side: 'long' | 'short';
   size: number;
   collateral: number;
@@ -14,6 +15,7 @@ export interface Position {
 export interface Order {
   address: string;
   owner: string;
+  commodity: string;          // Commodity ID (e.g., 'OIL', 'GOLD')
   side: 'bid' | 'ask';
   orderType: 'limit' | 'market' | 'stop_loss' | 'take_profit';
   price: number;
@@ -25,6 +27,7 @@ export interface Order {
 
 export interface Trade {
   signature: string;
+  commodity: string;          // Commodity ID (e.g., 'OIL', 'GOLD')
   side: 'long' | 'short';
   price: number;
   size: number;
@@ -33,6 +36,7 @@ export interface Trade {
 
 export interface MarketData {
   address: string;
+  commodity: string;          // Commodity ID (e.g., 'OIL', 'GOLD')
   price: number;
   priceChange24h: number;
   volume24h: number;

@@ -1,7 +1,8 @@
 import { useMarket } from '../hooks/useMarket';
+import { CommoditySelector } from './CommoditySelector';
 
 export function MarketStats() {
-  const { market } = useMarket();
+  const { market, selectedCommodity } = useMarket();
 
   if (!market) {
     return <div className="market-stats loading">Loading...</div>;
@@ -9,9 +10,9 @@ export function MarketStats() {
 
   return (
     <div className="market-stats">
-      <div className="stat">
-        <span className="label">OIL-PERP</span>
-        <span className="value price">${market.price.toFixed(2)}</span>
+      <div className="stat commodity-stat">
+        <CommoditySelector />
+        <span className="value price">${market.price.toFixed(selectedCommodity.decimals)}</span>
         <span className={`change ${market.priceChange24h >= 0 ? 'positive' : 'negative'}`}>
           {market.priceChange24h >= 0 ? '+' : ''}{market.priceChange24h.toFixed(2)}%
         </span>

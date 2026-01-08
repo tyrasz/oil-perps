@@ -5,14 +5,25 @@ import type { OrderSide } from '../types';
 
 export function OrderEntry() {
   const { connected, publicKey } = useWallet();
-  const { market, selectedLeverage, orderType, setSelectedLeverage, setOrderType } = useMarketStore();
+  const {
+    selectedCommodity,
+    markets,
+    selectedLeverage,
+    orderType,
+    setSelectedLeverage,
+    setOrderType
+  } = useMarketStore();
+
+  const market = markets[selectedCommodity.id];
 
   const [side, setSide] = useState<OrderSide>('long');
   const [size, setSize] = useState('');
   const [price, setPrice] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const leverageOptions = [1, 2, 5, 10, 15, 20];
+  // Generate leverage options based on commodity max leverage
+  const maxLev = selectedCommodity.maxLeverage;
+  const leverageOptions = [1, 2, 5, 10, 15, 20].filter(lev => lev <= maxLev);
 
   const calculateMargin = useCallback(() => {
     if (!size || !market) return 0;
@@ -29,6 +40,7 @@ export function OrderEntry() {
     try {
       // TODO: Implement actual transaction submission
       console.log('Submitting order:', {
+        commodity: selectedCommodity.id,
         side,
         size: parseFloat(size),
         price: orderType === 'market' ? market?.price : parseFloat(price),
@@ -52,6 +64,8 @@ export function OrderEntry() {
       ? market.price * (1 - 1 / selectedLeverage * 0.95)
       : market.price * (1 + 1 / selectedLeverage * 0.95)
     : 0;
+
+  const formatPrice = (value: number) => value.toFixed(selectedCommodity.decimals);
 
   return (
     <div className="order-entry">
@@ -86,14 +100,14 @@ export function OrderEntry() {
       </div>
 
       <div className="form-group">
-        <label>Size (Contracts)</label>
+        <label>Size ({selectedCommodity.contractUnit}s)</label>
         <input
           type="number"
           value={size}
           onChange={(e) => setSize(e.target.value)}
           placeholder="0.00"
-          min="0"
-          step="0.01"
+          min={selectedCommodity.minTradeSize}
+          step={selectedCommodity.minTradeSize}
         />
       </div>
 
@@ -104,9 +118,9 @@ export function OrderEntry() {
             type="number"
             value={price}
             onChange={(e) => setPrice(e.target.value)}
-            placeholder={market?.price.toFixed(2) || '0.00'}
+            placeholder={market?.price.toFixed(selectedCommodity.decimals) || '0.00'}
             min="0"
-            step="0.01"
+            step={selectedCommodity.tickSize}
           />
         </div>
       )}
@@ -129,7 +143,7 @@ export function OrderEntry() {
       <div className="order-summary">
         <div className="summary-row">
           <span>Entry Price</span>
-          <span>${orderType === 'market' ? market?.price.toFixed(2) : price || market?.price.toFixed(2)}</span>
+          <span>${orderType === 'market' ? formatPrice(market?.price || 0) : price || formatPrice(market?.price || 0)}</span>
         </div>
         <div className="summary-row">
           <span>Margin Required</span>
@@ -138,7 +152,7 @@ export function OrderEntry() {
         <div className="summary-row">
           <span>Est. Liq. Price</span>
           <span className={side === 'long' ? 'text-red' : 'text-green'}>
-            ${liquidationPrice.toFixed(2)}
+            ${formatPrice(liquidationPrice)}
           </span>
         </div>
         <div className="summary-row">
@@ -156,7 +170,7 @@ export function OrderEntry() {
           ? 'Connect Wallet'
           : isSubmitting
           ? 'Submitting...'
-          : `${side === 'long' ? 'Long' : 'Short'} OIL`}
+          : `${side === 'long' ? 'Long' : 'Short'} ${selectedCommodity.id}`}
       </button>
     </div>
   );

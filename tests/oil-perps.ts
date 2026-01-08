@@ -40,8 +40,22 @@ describe("oil-perps", () => {
   let user1TokenAccount: PublicKey;
   let user2TokenAccount: PublicKey;
 
-  // Market params
+  // Market params for OIL commodity
   const marketParams = {
+    commodity: "OIL",              // Commodity identifier
+    maxLeverage: 20_000, // 20x
+    maintenanceMarginRatio: 500, // 5%
+    initialMarginRatio: 1000, // 10%
+    takerFee: 5, // 0.05%
+    makerFee: 2, // 0.02%
+    liquidationFee: 250, // 2.5%
+    maxOpenInterest: new BN(1_000_000_000_000), // 1M contracts
+    fundingInterval: new BN(3600), // 1 hour
+  };
+
+  // Market params for GOLD commodity (for multi-commodity tests)
+  const goldMarketParams = {
+    commodity: "GOLD",             // Commodity identifier
     maxLeverage: 20_000, // 20x
     maintenanceMarginRatio: 500, // 5%
     initialMarginRatio: 1000, // 10%
@@ -141,7 +155,7 @@ describe("oil-perps", () => {
   });
 
   describe("initialize_market", () => {
-    it("should initialize market with correct parameters", async () => {
+    it("should initialize OIL market with correct parameters", async () => {
       await program.methods
         .initializeMarket(marketParams)
         .accounts({
@@ -163,6 +177,10 @@ describe("oil-perps", () => {
 
       expect(market.authority.toBase58()).to.equal(authority.publicKey.toBase58());
       expect(market.collateralMint.toBase58()).to.equal(collateralMint.toBase58());
+      // Verify commodity identifier
+      const commodityBytes = market.commodity as number[];
+      const commodityStr = Buffer.from(commodityBytes).toString('utf-8').replace(/\0/g, '');
+      expect(commodityStr).to.equal("OIL");
       expect(market.maxLeverage).to.equal(marketParams.maxLeverage);
       expect(market.maintenanceMarginRatio).to.equal(marketParams.maintenanceMarginRatio);
       expect(market.initialMarginRatio).to.equal(marketParams.initialMarginRatio);
