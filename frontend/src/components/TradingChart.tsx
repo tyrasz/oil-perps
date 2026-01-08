@@ -1,12 +1,10 @@
 import { useEffect, useRef } from 'react';
 import { createChart, CandlestickSeries } from 'lightweight-charts';
 import type { IChartApi, ISeriesApi, CandlestickData, Time } from 'lightweight-charts';
+import { useMarketStore } from '../stores/marketStore';
 
-interface TradingChartProps {
-  symbol?: string;
-}
-
-export function TradingChart({ symbol = 'OIL-PERP' }: TradingChartProps) {
+export function TradingChart() {
+  const { selectedCommodity } = useMarketStore();
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
@@ -46,18 +44,19 @@ export function TradingChart({ symbol = 'OIL-PERP' }: TradingChartProps) {
       wickDownColor: '#ef4444',
     });
 
-    // Generate mock data for demo
+    // Generate mock data for demo based on commodity
     const generateMockData = (): CandlestickData<Time>[] => {
       const data: CandlestickData<Time>[] = [];
-      let basePrice = 75;
+      let basePrice = selectedCommodity.basePrice;
+      const volatility = basePrice * 0.02; // 2% volatility
       const now = Math.floor(Date.now() / 1000);
 
       for (let i = 100; i >= 0; i--) {
         const time = (now - i * 3600) as Time;
-        const open = basePrice + (Math.random() - 0.5) * 2;
-        const close = open + (Math.random() - 0.5) * 3;
-        const high = Math.max(open, close) + Math.random() * 1;
-        const low = Math.min(open, close) - Math.random() * 1;
+        const open = basePrice + (Math.random() - 0.5) * volatility;
+        const close = open + (Math.random() - 0.5) * volatility * 1.5;
+        const high = Math.max(open, close) + Math.random() * volatility * 0.5;
+        const low = Math.min(open, close) - Math.random() * volatility * 0.5;
 
         data.push({ time, open, high, low, close });
         basePrice = close;
@@ -84,12 +83,15 @@ export function TradingChart({ symbol = 'OIL-PERP' }: TradingChartProps) {
       window.removeEventListener('resize', handleResize);
       chart.remove();
     };
-  }, []);
+  }, [selectedCommodity]);
 
   return (
     <div className="chart-container">
       <div className="chart-header">
-        <span className="symbol">{symbol}</span>
+        <span className="symbol">
+          <span className="commodity-icon">{selectedCommodity.icon}</span>
+          {selectedCommodity.symbol}
+        </span>
         <span className="interval">1H</span>
       </div>
       <div ref={chartContainerRef} className="chart" />

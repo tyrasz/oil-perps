@@ -20,8 +20,8 @@ function App() {
     <div className="app">
       <header className="header">
         <div className="logo">
-          <span className="logo-icon">⛽</span>
-          <span className="logo-text">OIL PERPS</span>
+          <span className="logo-icon">📈</span>
+          <span className="logo-text">COMMODITY PERPS</span>
         </div>
         <MarketStats />
         <div className="header-right">

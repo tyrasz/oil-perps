@@ -33,7 +33,17 @@ async fn main() {
         .allow_headers(Any);
 
     let app = Router::new()
-        // Market endpoints
+        // Commodity endpoints
+        .route("/api/commodities", get(routes::get_commodities))
+
+        // Market endpoints (commodity-specific)
+        .route("/api/market/:commodity", get(routes::get_market_by_commodity))
+        .route("/api/market/:commodity/stats", get(routes::get_market_stats_by_commodity))
+
+        // Order book endpoints (commodity-specific)
+        .route("/api/orderbook/:commodity", get(routes::get_orderbook_by_commodity))
+
+        // Legacy market endpoints (backward compatibility, defaults to OIL)
         .route("/api/market", get(routes::get_market))
         .route("/api/market/stats", get(routes::get_market_stats))
         .route("/api/market/price", get(routes::get_price))
@@ -42,7 +52,7 @@ async fn main() {
         .route("/api/positions", get(routes::get_positions))
         .route("/api/positions/:address", get(routes::get_user_positions))
 
-        // Order book endpoints
+        // Legacy order book endpoints
         .route("/api/orderbook", get(routes::get_orderbook))
         .route("/api/orders/:address", get(routes::get_user_orders))
 
