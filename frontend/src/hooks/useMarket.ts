@@ -9,8 +9,6 @@ export function useMarket() {
   const {
     selectedCommodity,
     markets,
-    orderBooks,
-    recentTrades,
     setMarket,
     setOrderBook,
     addTrade,

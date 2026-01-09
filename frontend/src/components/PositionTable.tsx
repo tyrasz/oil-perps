@@ -4,7 +4,8 @@ import type { Position } from '../types';
 
 export function PositionTable() {
   const { positions } = usePositions();
-  const { market } = useMarketStore();
+  const { getCurrentMarket } = useMarketStore();
+  const market = getCurrentMarket();
 
   const handleClosePosition = async (position: Position) => {
     // TODO: Implement close position transaction

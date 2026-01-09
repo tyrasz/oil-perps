@@ -9,9 +9,10 @@ import { RecentTrades } from './components/RecentTrades';
 import { AccountPanel } from './components/AccountPanel';
 import { OrdersTable } from './components/OrdersTable';
 import { LpVault } from './components/LpVault';
+import { MarketMakerPanel } from './components/MarketMakerPanel';
 import './App.css';
 
-type Tab = 'positions' | 'orders' | 'trades' | 'vault';
+type Tab = 'positions' | 'orders' | 'trades' | 'vault' | 'mm';
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('positions');
@@ -78,6 +79,12 @@ function App() {
             >
               LP Vault
             </button>
+            <button
+              className={`tab ${activeTab === 'mm' ? 'active' : ''}`}
+              onClick={() => setActiveTab('mm')}
+            >
+              Market Maker
+            </button>
           </div>
 
           <div className="tab-content">
@@ -85,6 +92,7 @@ function App() {
             {activeTab === 'orders' && <OrdersTable />}
             {activeTab === 'trades' && <TradeHistory />}
             {activeTab === 'vault' && <LpVault />}
+            {activeTab === 'mm' && <MarketMakerPanel />}
           </div>
         </div>
       </main>
