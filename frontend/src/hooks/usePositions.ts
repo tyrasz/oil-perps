@@ -2,7 +2,7 @@ import { useEffect, useCallback } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useMarketStore } from '../stores/marketStore';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3003';
 
 export function usePositions() {
   const { publicKey } = useWallet();

@@ -1,10 +1,10 @@
-use solana_client::rpc_client::RpcClient;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
+use crate::oracle::OracleService;
 
 pub struct AppState {
-    pub rpc_client: RpcClient,
-    pub cached_price: RwLock<Option<u64>>,
+    pub rpc_url: String,  // Store URL for future RPC client usage
     pub cached_orderbook: RwLock<Option<OrderBookSnapshot>>,
+    pub oracle_service: Arc<OracleService>,
 }
 
 #[derive(Clone)]
@@ -17,9 +17,9 @@ pub struct OrderBookSnapshot {
 impl AppState {
     pub fn new(rpc_url: &str) -> Self {
         Self {
-            rpc_client: RpcClient::new(rpc_url.to_string()),
-            cached_price: RwLock::new(None),
+            rpc_url: rpc_url.to_string(),
             cached_orderbook: RwLock::new(None),
+            oracle_service: Arc::new(OracleService::new()),
         }
     }
 }

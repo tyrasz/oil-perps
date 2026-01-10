@@ -92,6 +92,8 @@ pub struct MarketStats {
     pub open_interest: u64,
     pub funding_rate: i64,
     pub price_change_24h: f64,
+    pub price_source: String,
+    pub price_timestamp: i64,
 }
 
 #[derive(Serialize)]
@@ -202,7 +204,7 @@ pub async fn get_market_by_commodity(
 
 // Get market stats for a specific commodity
 pub async fn get_market_stats_by_commodity(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(commodity): Path<String>,
 ) -> impl IntoResponse {
     let commodity_upper = commodity.to_uppercase();
@@ -210,13 +212,23 @@ pub async fn get_market_stats_by_commodity(
 
     match config {
         Some(cfg) => {
+            // Get price from multi-oracle service (Pyth -> Backup -> Cache)
+            let price_data = state.oracle_service.get_price(&commodity_upper).await;
+
+            let (price, price_change, source, timestamp) = match price_data {
+                Some(pd) => (pd.price, pd.price_change_24h, pd.source.to_string(), pd.timestamp),
+                None => (cfg.base_price, 0.0, "Fallback".to_string(), chrono::Utc::now().timestamp()),
+            };
+
             let stats = MarketStats {
                 commodity: commodity_upper,
-                price: cfg.base_price,
-                volume_24h: 1_000_000_000_000,
-                open_interest: 500_000_000_000,
+                price,
+                volume_24h: 1_000_000_000_000,  // TODO: Get from indexer
+                open_interest: 500_000_000_000, // TODO: Get from indexer
                 funding_rate: 100,
-                price_change_24h: 1.5,
+                price_change_24h: price_change,
+                price_source: source,
+                price_timestamp: timestamp,
             };
             Json(stats).into_response()
         }
@@ -266,15 +278,23 @@ pub async fn get_market_stats(
 }
 
 pub async fn get_price(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let price = PriceInfo {
-        commodity: "OIL".to_string(),
-        price: 75_000_000,
-        timestamp: chrono::Utc::now().timestamp(),
-        confidence: 50_000,
+    // Get OIL price from multi-oracle service
+    let price_data = state.oracle_service.get_price("OIL").await;
+
+    let (price, confidence, timestamp) = match price_data {
+        Some(pd) => (pd.price, pd.confidence, pd.timestamp),
+        None => (75_000_000, 50_000, chrono::Utc::now().timestamp()),
     };
-    Json(price)
+
+    let price_info = PriceInfo {
+        commodity: "OIL".to_string(),
+        price,
+        timestamp,
+        confidence,
+    };
+    Json(price_info)
 }
 
 pub async fn get_positions(
@@ -350,4 +370,12 @@ pub async fn get_account(
         realized_pnl: 0,
     };
     Json(account)
+}
+
+// Get oracle health status
+pub async fn get_oracle_status(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let status = state.oracle_service.get_status().await;
+    Json(status)
 }

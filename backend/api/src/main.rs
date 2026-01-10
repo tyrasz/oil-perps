@@ -1,24 +1,20 @@
 use axum::{
-    extract::{Path, Query, State, WebSocketUpgrade},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
+    routing::get,
+    Router,
 };
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
-use tracing_subscriber;
 
 mod routes;
 mod ws;
 mod state;
+mod oracle;
 
 use state::AppState;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::init();
+    tracing_subscriber::fmt::init();
 
     dotenvy::dotenv().ok();
 
@@ -26,6 +22,11 @@ async fn main() {
         .unwrap_or_else(|_| "http://localhost:8899".to_string());
 
     let state = Arc::new(AppState::new(&rpc_url));
+
+    // Start background price updates with multi-oracle fallback
+    let oracle_service = state.oracle_service.clone();
+    oracle_service.start_background_updates();
+    tracing::info!("Started multi-oracle price feed (Pyth → Backup → Cache)");
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -63,13 +64,16 @@ async fn main() {
         // User account
         .route("/api/account/:address", get(routes::get_account))
 
+        // Oracle status
+        .route("/api/oracle/status", get(routes::get_oracle_status))
+
         // WebSocket
         .route("/ws", get(ws::websocket_handler))
 
         .layer(cors)
         .with_state(state);
 
-    let addr = "0.0.0.0:3001";
+    let addr = "0.0.0.0:3003";
     tracing::info!("Starting API server on {}", addr);
 
     axum::Server::bind(&addr.parse().unwrap())

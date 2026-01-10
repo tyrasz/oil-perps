@@ -87,7 +87,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
-async fn handle_request(request: WsRequest, state: &AppState) -> WsResponse {
+async fn handle_request(request: WsRequest, _state: &AppState) -> WsResponse {
     match request {
         WsRequest::Subscribe { channel } => {
             // TODO: Add to subscription list
