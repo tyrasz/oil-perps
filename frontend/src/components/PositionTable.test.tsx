@@ -297,4 +297,152 @@ describe('PositionTable', () => {
 
     expect(screen.getByText('$76.50')).toBeInTheDocument();
   });
+
+  it('should show danger class for margin ratio below 10%', () => {
+    useMarketStore.setState({
+      positions: [
+        {
+          address: 'pos1',
+          owner: 'user123',
+          side: 'long',
+          size: 100,
+          collateral: 1000,
+          entryPrice: 75.00,
+          leverage: 10,
+          unrealizedPnl: -800,
+          marginRatio: 5,
+          openedAt: Date.now(),
+        },
+      ],
+    });
+
+    const { container } = render(<PositionTable />);
+
+    const marginCell = container.querySelector('td.danger');
+    expect(marginCell).toBeInTheDocument();
+    expect(marginCell?.textContent).toBe('5.00%');
+  });
+
+  it('should show warning class for margin ratio between 10% and 20%', () => {
+    useMarketStore.setState({
+      positions: [
+        {
+          address: 'pos1',
+          owner: 'user123',
+          side: 'long',
+          size: 100,
+          collateral: 1000,
+          entryPrice: 75.00,
+          leverage: 10,
+          unrealizedPnl: -500,
+          marginRatio: 15,
+          openedAt: Date.now(),
+        },
+      ],
+    });
+
+    const { container } = render(<PositionTable />);
+
+    const marginCell = container.querySelector('td.warning');
+    expect(marginCell).toBeInTheDocument();
+    expect(marginCell?.textContent).toBe('15.00%');
+  });
+
+  it('should show no warning class for margin ratio above 20%', () => {
+    useMarketStore.setState({
+      positions: [
+        {
+          address: 'pos1',
+          owner: 'user123',
+          side: 'long',
+          size: 100,
+          collateral: 1000,
+          entryPrice: 75.00,
+          leverage: 10,
+          unrealizedPnl: 100,
+          marginRatio: 25,
+          openedAt: Date.now(),
+        },
+      ],
+    });
+
+    const { container } = render(<PositionTable />);
+
+    expect(container.querySelector('td.danger')).not.toBeInTheDocument();
+    expect(container.querySelector('td.warning')).not.toBeInTheDocument();
+    expect(screen.getByText('25.00%')).toBeInTheDocument();
+  });
+
+  it('should show positive class for positive PnL', () => {
+    useMarketStore.setState({
+      positions: [
+        {
+          address: 'pos1',
+          owner: 'user123',
+          side: 'long',
+          size: 100,
+          collateral: 1000,
+          entryPrice: 75.00,
+          leverage: 10,
+          unrealizedPnl: 100,
+          marginRatio: 15,
+          openedAt: Date.now(),
+        },
+      ],
+    });
+
+    const { container } = render(<PositionTable />);
+
+    const pnlCell = container.querySelector('td.positive');
+    expect(pnlCell).toBeInTheDocument();
+  });
+
+  it('should show negative class for negative PnL', () => {
+    useMarketStore.setState({
+      positions: [
+        {
+          address: 'pos1',
+          owner: 'user123',
+          side: 'long',
+          size: 100,
+          collateral: 1000,
+          entryPrice: 75.00,
+          leverage: 10,
+          unrealizedPnl: -100,
+          marginRatio: 15,
+          openedAt: Date.now(),
+        },
+      ],
+    });
+
+    const { container } = render(<PositionTable />);
+
+    const pnlCell = container.querySelector('td.negative');
+    expect(pnlCell).toBeInTheDocument();
+  });
+
+  it('should display dash for mark price when market is null', () => {
+    useMarketStore.setState({
+      market: null,
+      positions: [
+        {
+          address: 'pos1',
+          owner: 'user123',
+          side: 'long',
+          size: 100,
+          collateral: 1000,
+          entryPrice: 75.00,
+          leverage: 10,
+          unrealizedPnl: 100,
+          marginRatio: 15,
+          openedAt: Date.now(),
+        },
+      ],
+    });
+
+    render(<PositionTable />);
+
+    // The component renders "$-" when market is null
+    expect(screen.getByText(/\$-/)).toBeInTheDocument();
+  });
 });

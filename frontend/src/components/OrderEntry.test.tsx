@@ -340,4 +340,55 @@ describe('OrderEntry', () => {
       expect(screen.getByText('$700.00')).toBeInTheDocument();
     });
   });
+
+  describe('edge cases', () => {
+    it('should show $0.00 liquidation price when market is null', () => {
+      useMarketStore.setState({
+        market: null,
+      });
+
+      render(<OrderEntry />);
+
+      // When market is null, both margin and liquidation price should be 0
+      const zeroValues = screen.getAllByText(/\$0\.00/);
+      expect(zeroValues.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('should show $0.00 margin when size is empty', () => {
+      render(<OrderEntry />);
+
+      // With no size entered, margin should be 0
+      // Multiple elements show $0.00 (margin and liquidation price when no size)
+      const zeroValues = screen.getAllByText(/\$0\.00/);
+      expect(zeroValues.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('should use market price when limit price is empty', () => {
+      render(<OrderEntry />);
+
+      // Switch to limit order
+      fireEvent.click(screen.getByText('Limit'));
+
+      // Enter size but leave price empty
+      fireEvent.change(getSizeInput(), { target: { value: '100' } });
+
+      // Should use market price ($75) for calculations
+      // Margin = (100 * 75) / 10 = 750
+      expect(screen.getByText('$750.00')).toBeInTheDocument();
+    });
+
+    it('should show placeholder for limit price when market is null', () => {
+      useMarketStore.setState({
+        market: null,
+      });
+
+      render(<OrderEntry />);
+
+      fireEvent.click(screen.getByText('Limit'));
+
+      // Both size and price inputs have placeholder "0.00"
+      const inputs = screen.getAllByPlaceholderText('0.00');
+      expect(inputs.length).toBe(2); // Size input and price input
+    });
+  });
 });
