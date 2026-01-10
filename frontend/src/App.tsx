@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
 import { TradingChart } from './components/TradingChart';
-import { OrderEntry } from './components/OrderEntry';
+import { AdvancedOrderEntry } from './components/AdvancedOrderEntry';
 import { PositionTable } from './components/PositionTable';
 import { OrderBook } from './components/OrderBook';
 import { MarketStats } from './components/MarketStats';
@@ -48,7 +48,7 @@ function App() {
 
           <div className="order-section">
             <div className="section-header">Place Order</div>
-            <OrderEntry />
+            <AdvancedOrderEntry />
           </div>
         </div>
 
