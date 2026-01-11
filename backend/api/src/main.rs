@@ -9,8 +9,10 @@ mod routes;
 mod ws;
 mod state;
 mod oracle;
+mod demo_bot;
 
 use state::AppState;
+use demo_bot::DemoBot;
 
 #[tokio::main]
 async fn main() {
@@ -27,6 +29,10 @@ async fn main() {
     let oracle_service = state.oracle_service.clone();
     oracle_service.start_background_updates();
     tracing::info!("Started multi-oracle price feed (Pyth → Backup → Cache)");
+
+    // Start demo trading bot
+    let demo_bot = Arc::new(DemoBot::new(state.oracle_service.clone(), state.clone()));
+    demo_bot.start();
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
