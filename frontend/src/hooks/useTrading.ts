@@ -140,6 +140,66 @@ export function useTrading() {
   );
 
   /**
+   * Withdraw collateral (USDC) from user account
+   */
+  const withdrawCollateral = useCallback(
+    async (amount: number): Promise<string> => {
+      if (!program || !publicKey) {
+        throw new Error('Wallet not connected');
+      }
+
+      setState(prev => ({ ...prev, isLoading: true, error: null }));
+
+      try {
+        const [userAccountPda] = getUserAccountPDA(publicKey);
+        const [marketPda] = getMarketPDA(USDC_MINT);
+        const [vaultPda] = getVaultPDA(marketPda);
+        const [vaultTokenAccountPda] = getVaultTokenAccountPDA(marketPda);
+
+        const userTokenAccount = await getAssociatedTokenAddress(
+          USDC_MINT,
+          publicKey
+        );
+
+        // Convert amount to 6 decimals
+        const amountInUnits = new BN(amount * Math.pow(10, PRICE_DECIMALS));
+
+        const signature = await program.methods
+          .withdrawCollateral(amountInUnits)
+          .accounts({
+            owner: publicKey,
+            userAccount: userAccountPda,
+            market: marketPda,
+            vault: vaultPda,
+            vaultTokenAccount: vaultTokenAccountPda,
+            userTokenAccount,
+            tokenProgram: TOKEN_PROGRAM_ID,
+          })
+          .rpc();
+
+        console.log('Withdraw successful:', signature);
+        setState(prev => ({
+          ...prev,
+          isLoading: false,
+          lastTxSignature: signature,
+        }));
+
+        return signature;
+      } catch (error) {
+        const errorMessage = parseAnchorError(error);
+        console.error('Withdraw failed:', error);
+        setState(prev => ({
+          ...prev,
+          isLoading: false,
+          error: errorMessage,
+        }));
+        throw new Error(errorMessage);
+      }
+    },
+    [program, publicKey]
+  );
+
+  /**
    * Open a new position
    */
   const openPosition = useCallback(
@@ -316,6 +376,7 @@ export function useTrading() {
     checkUserAccountExists,
     initializeUserIfNeeded,
     depositCollateral,
+    withdrawCollateral,
     openPosition,
     closePosition,
     clearError,

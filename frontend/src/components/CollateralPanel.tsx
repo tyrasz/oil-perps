@@ -8,6 +8,7 @@ export function CollateralPanel() {
   const { userAccount, refreshAccount } = usePositions();
   const {
     depositCollateral,
+    withdrawCollateral,
     isLoading,
     error,
     clearError,
@@ -38,9 +39,8 @@ export function CollateralPanel() {
         await depositCollateral(parseFloat(amount));
         setSuccessMessage('Deposit successful!');
       } else {
-        // TODO: Implement withdraw
-        console.log('Withdraw not yet implemented');
-        return;
+        await withdrawCollateral(parseFloat(amount));
+        setSuccessMessage('Withdrawal successful!');
       }
 
       setAmount('');
@@ -77,7 +77,6 @@ export function CollateralPanel() {
         <button
           className={`mode-tab ${mode === 'withdraw' ? 'active' : ''}`}
           onClick={() => setMode('withdraw')}
-          disabled // Withdraw not implemented yet
         >
           Withdraw
         </button>
@@ -85,19 +84,36 @@ export function CollateralPanel() {
 
       <div className="form-group">
         <label>Amount (USDC)</label>
-        <input
-          type="number"
-          value={amount}
-          onChange={(e) => setAmount(e.target.value)}
-          placeholder="0.00"
-          min="0"
-          step="0.01"
-        />
+        <div className="input-with-max">
+          <input
+            type="number"
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+            placeholder="0.00"
+            min="0"
+            step="0.01"
+          />
+          {mode === 'withdraw' && balance > 0 && (
+            <button
+              className="max-btn"
+              onClick={() => setAmount(balance.toString())}
+              type="button"
+            >
+              Max
+            </button>
+          )}
+        </div>
       </div>
 
       {mode === 'deposit' && (
         <p className="info-text">
           Deposit USDC to use as margin for trading positions.
+        </p>
+      )}
+
+      {mode === 'withdraw' && (
+        <p className="info-text">
+          Withdraw available USDC from your account. Cannot withdraw collateral locked in open positions.
         </p>
       )}
 
@@ -125,7 +141,12 @@ export function CollateralPanel() {
       <button
         className="submit-btn"
         onClick={handleSubmit}
-        disabled={!amount || parseFloat(amount) <= 0 || isLoading}
+        disabled={
+          !amount ||
+          parseFloat(amount) <= 0 ||
+          isLoading ||
+          (mode === 'withdraw' && parseFloat(amount) > balance)
+        }
       >
         {isLoading
           ? 'Processing...'

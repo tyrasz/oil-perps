@@ -1941,6 +1941,31 @@
   padding: 40px;
 }
 
+.collateral-panel .input-with-max {
+  display: flex;
+  gap: 8px;
+}
+
+.collateral-panel .input-with-max input {
+  flex: 1;
+}
+
+.collateral-panel .max-btn {
+  padding: 8px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.collateral-panel .max-btn:hover {
+  background: var(--border);
+  color: var(--text-primary);
+}
+
 /* Error & Success Messages */
 .error-message {
   padding: 12px 16px;
