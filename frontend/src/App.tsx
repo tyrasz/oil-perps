@@ -10,9 +10,10 @@ import { AccountPanel } from './components/AccountPanel';
 import { OrdersTable } from './components/OrdersTable';
 import { LpVault } from './components/LpVault';
 import { MarketMakerPanel } from './components/MarketMakerPanel';
+import { CollateralPanel } from './components/CollateralPanel';
 import './App.css';
 
-type Tab = 'positions' | 'orders' | 'trades' | 'vault' | 'mm';
+type Tab = 'positions' | 'orders' | 'trades' | 'account' | 'vault' | 'mm';
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('positions');
@@ -74,6 +75,12 @@ function App() {
               Trade History
             </button>
             <button
+              className={`tab ${activeTab === 'account' ? 'active' : ''}`}
+              onClick={() => setActiveTab('account')}
+            >
+              Account
+            </button>
+            <button
               className={`tab ${activeTab === 'vault' ? 'active' : ''}`}
               onClick={() => setActiveTab('vault')}
             >
@@ -91,6 +98,7 @@ function App() {
             {activeTab === 'positions' && <PositionTable />}
             {activeTab === 'orders' && <OrdersTable />}
             {activeTab === 'trades' && <TradeHistory />}
+            {activeTab === 'account' && <CollateralPanel />}
             {activeTab === 'vault' && <LpVault />}
             {activeTab === 'mm' && <MarketMakerPanel />}
           </div>

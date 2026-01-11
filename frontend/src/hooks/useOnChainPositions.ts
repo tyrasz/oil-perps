@@ -4,6 +4,7 @@ import { PublicKey } from '@solana/web3.js';
 import { usePerpsProgram } from './usePerpsProgram';
 import { getUserAccountPDA } from '../utils/pda';
 import { PRICE_DECIMALS, LEVERAGE_DECIMALS } from '../config/program';
+import { useMarketStore } from '../stores/marketStore';
 import type { Position, UserAccount } from '../types';
 
 interface OnChainPosition {
@@ -38,6 +39,7 @@ interface OnChainUserAccount {
 export function useOnChainPositions() {
   const { publicKey } = useWallet();
   const { program } = usePerpsProgram();
+  const { markets, selectedCommodity } = useMarketStore();
 
   const [positions, setPositions] = useState<Position[]>([]);
   const [userAccount, setUserAccount] = useState<UserAccount | null>(null);
@@ -101,19 +103,30 @@ export function useOnChainPositions() {
           const entryPrice = acc.account.entryPrice.toNumber() / Math.pow(10, PRICE_DECIMALS);
           const leverage = acc.account.leverage / Math.pow(10, LEVERAGE_DECIMALS);
 
-          // Calculate unrealized PnL (would need current price - for now use 0)
-          // In a real scenario, we'd fetch the current price from oracle
-          const unrealizedPnl = 0;
+          // TODO: Map market address to commodity properly
+          // For now, use selected commodity's current price
+          const commodity = selectedCommodity.id;
+          const currentMarket = markets[commodity];
+          const currentPrice = currentMarket?.price || entryPrice;
 
-          // Calculate margin ratio
-          const notional = size * entryPrice;
-          const marginRatio = notional > 0 ? (collateral / notional) * 100 : 0;
+          // Calculate unrealized PnL based on current price
+          let unrealizedPnl = 0;
+          if (currentPrice > 0) {
+            const priceDiff = isLong
+              ? currentPrice - entryPrice
+              : entryPrice - currentPrice;
+            unrealizedPnl = size * priceDiff;
+          }
+
+          // Calculate margin ratio: (collateral + PnL) / notional * 100
+          const notional = size * currentPrice;
+          const equity = collateral + unrealizedPnl;
+          const marginRatio = notional > 0 ? (equity / notional) * 100 : 0;
 
           return {
             address: acc.publicKey.toString(),
             owner: acc.account.owner.toString(),
-            market: acc.account.market.toString(),
-            commodity: 'OIL', // TODO: Map market address to commodity
+            commodity,
             side: isLong ? 'long' : 'short',
             size,
             collateral,
@@ -134,7 +147,7 @@ export function useOnChainPositions() {
     } finally {
       setIsLoading(false);
     }
-  }, [program, publicKey]);
+  }, [program, publicKey, markets, selectedCommodity]);
 
   /**
    * Refresh all data
