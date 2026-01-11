@@ -344,10 +344,20 @@ pub async fn get_user_orders(
 }
 
 pub async fn get_trades(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Query(_pagination): Query<PaginationQuery>,
 ) -> impl IntoResponse {
-    let trades: Vec<TradeInfo> = vec![];
+    let recent = state.recent_trades.read().await;
+    let trades: Vec<TradeInfo> = recent.iter().rev().take(50).map(|t| TradeInfo {
+        signature: format!("sim_{}", t.timestamp),
+        maker: t.maker.clone(),
+        taker: t.taker.clone(),
+        commodity: t.commodity.clone(),
+        side: t.side.clone(),
+        price: t.price,
+        size: t.size,
+        timestamp: t.timestamp,
+    }).collect();
     Json(trades)
 }
 

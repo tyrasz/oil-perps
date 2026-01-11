@@ -1,27 +1,14 @@
 use rand::Rng;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::oracle::OracleService;
-use crate::state::{AppState, OrderBookSnapshot};
+use crate::state::{AppState, OrderBookSnapshot, SimulatedTrade};
 
 /// Demo trading bot that simulates market activity
 pub struct DemoBot {
     oracle: Arc<OracleService>,
     state: Arc<AppState>,
-    recent_trades: Arc<RwLock<Vec<SimulatedTrade>>>,
-}
-
-#[derive(Clone, Debug)]
-pub struct SimulatedTrade {
-    pub commodity: String,
-    pub side: String,      // "buy" or "sell"
-    pub price: u64,        // 6 decimals
-    pub size: u64,         // 6 decimals
-    pub timestamp: i64,
-    pub maker: String,
-    pub taker: String,
 }
 
 impl DemoBot {
@@ -29,7 +16,6 @@ impl DemoBot {
         Self {
             oracle,
             state,
-            recent_trades: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -176,24 +162,12 @@ impl DemoBot {
         };
 
         // Store in recent trades (rng is dropped, safe to await)
-        let mut trades = self.recent_trades.write().await;
+        let mut trades = self.state.recent_trades.write().await;
         trades.push(trade);
 
         // Keep only last 100 trades
         if trades.len() > 100 {
             trades.remove(0);
-        }
-    }
-
-    /// Get recent trades for a commodity
-    pub async fn get_recent_trades(&self, commodity: Option<&str>) -> Vec<SimulatedTrade> {
-        let trades = self.recent_trades.read().await;
-        match commodity {
-            Some(c) => trades.iter()
-                .filter(|t| t.commodity == c)
-                .cloned()
-                .collect(),
-            None => trades.clone(),
         }
     }
 }
