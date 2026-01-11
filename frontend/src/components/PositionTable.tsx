@@ -1,8 +1,12 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { usePositions } from '../hooks/usePositions';
 import { useMarketStore } from '../stores/marketStore';
 import { useTrading } from '../hooks/useTrading';
 import type { Position } from '../types';
+
+// Liquidation thresholds
+const LIQUIDATION_THRESHOLD = 5; // Critical - will be liquidated soon
+const WARNING_THRESHOLD = 10; // Warning - getting close to liquidation
 
 export function PositionTable() {
   const { positions } = usePositions();
@@ -13,6 +17,13 @@ export function PositionTable() {
   const [closingPositionId, setClosingPositionId] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [lastSignature, setLastSignature] = useState<string | null>(null);
+
+  // Check for positions at risk of liquidation
+  const { criticalPositions, warningPositions } = useMemo(() => {
+    const critical = positions.filter(p => p.marginRatio < LIQUIDATION_THRESHOLD);
+    const warning = positions.filter(p => p.marginRatio >= LIQUIDATION_THRESHOLD && p.marginRatio < WARNING_THRESHOLD);
+    return { criticalPositions: critical, warningPositions: warning };
+  }, [positions]);
 
   const handleClosePosition = async (position: Position) => {
     setClosingPositionId(position.address);
@@ -41,6 +52,34 @@ export function PositionTable() {
 
   return (
     <div className="position-table">
+      {/* Critical liquidation warning */}
+      {criticalPositions.length > 0 && (
+        <div className="liquidation-alert critical">
+          <span className="alert-icon">⚠️</span>
+          <div className="alert-content">
+            <strong>LIQUIDATION IMMINENT</strong>
+            <p>
+              {criticalPositions.length} position{criticalPositions.length > 1 ? 's' : ''} below {LIQUIDATION_THRESHOLD}% margin ratio.
+              Add collateral or close position{criticalPositions.length > 1 ? 's' : ''} immediately to avoid liquidation.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Warning for positions approaching liquidation */}
+      {warningPositions.length > 0 && criticalPositions.length === 0 && (
+        <div className="liquidation-alert warning">
+          <span className="alert-icon">⚡</span>
+          <div className="alert-content">
+            <strong>Margin Warning</strong>
+            <p>
+              {warningPositions.length} position{warningPositions.length > 1 ? 's' : ''} approaching liquidation threshold.
+              Consider adding collateral or reducing position size.
+            </p>
+          </div>
+        </div>
+      )}
+
       <table>
         <thead>
           <tr>
