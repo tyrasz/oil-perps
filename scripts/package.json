@@ -1,0 +1,17 @@
+{
+  "name": "oil-perps-scripts",
+  "version": "1.0.0",
+  "scripts": {
+    "init-market": "npx ts-node initialize-market.ts",
+    "init-market:oil": "npx ts-node initialize-market.ts OIL",
+    "init-market:gold": "npx ts-node initialize-market.ts GOLD",
+    "init-market:silver": "npx ts-node initialize-market.ts SILVER"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.29.0",
+    "@solana/spl-token": "^0.4.0",
+    "@solana/web3.js": "^1.87.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.0"
+  }
+}

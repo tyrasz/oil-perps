@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useMarketStore } from '../stores/marketStore';
 import { useTrading } from '../hooks/useTrading';
@@ -17,6 +17,7 @@ export function OrderEntry() {
   } = useMarketStore();
   const {
     openPosition,
+    checkMarketExists,
     isLoading: isTradingLoading,
     error: tradingError,
     clearError,
@@ -32,6 +33,14 @@ export function OrderEntry() {
   const [size, setSize] = useState('');
   const [price, setPrice] = useState('');
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [marketExists, setMarketExists] = useState<boolean | null>(null);
+
+  // Check if market is initialized on-chain
+  useEffect(() => {
+    if (connected) {
+      checkMarketExists().then(setMarketExists);
+    }
+  }, [connected, checkMarketExists]);
 
   // Generate leverage options based on commodity max leverage
   const maxLev = selectedCommodity.maxLeverage;
@@ -178,6 +187,13 @@ export function OrderEntry() {
         </div>
       </div>
 
+      {/* Market not initialized warning */}
+      {connected && marketExists === false && (
+        <div className="error-message">
+          Market not initialized on-chain. Run the initialize-market script first.
+        </div>
+      )}
+
       {/* Insufficient margin warning */}
       {insufficientMargin && (
         <div className="warning-message">
@@ -209,10 +225,12 @@ export function OrderEntry() {
       <button
         className={`submit-btn ${side}`}
         onClick={handleSubmit}
-        disabled={!connected || !size || isTradingLoading || insufficientMargin}
+        disabled={!connected || !size || isTradingLoading || insufficientMargin || marketExists === false}
       >
         {!connected
           ? 'Connect Wallet'
+          : marketExists === false
+          ? 'Market Not Initialized'
           : isTradingLoading
           ? 'Submitting...'
           : insufficientMargin

@@ -49,6 +49,17 @@ export function useTrading() {
   }, [publicKey, connection]);
 
   /**
+   * Check if market exists on-chain
+   */
+  const checkMarketExists = useCallback(async (): Promise<boolean> => {
+    if (!connection) return false;
+
+    const [marketPda] = getMarketPDA(USDC_MINT);
+    const accountInfo = await connection.getAccountInfo(marketPda);
+    return accountInfo !== null;
+  }, [connection]);
+
+  /**
    * Initialize user account if it doesn't exist
    */
   const initializeUserIfNeeded = useCallback(async (): Promise<void> => {
@@ -374,6 +385,7 @@ export function useTrading() {
 
     // Actions
     checkUserAccountExists,
+    checkMarketExists,
     initializeUserIfNeeded,
     depositCollateral,
     withdrawCollateral,
