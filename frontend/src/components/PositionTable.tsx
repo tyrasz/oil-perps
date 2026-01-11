@@ -1,15 +1,34 @@
+import { useState } from 'react';
 import { usePositions } from '../hooks/usePositions';
 import { useMarketStore } from '../stores/marketStore';
+import { useTrading } from '../hooks/useTrading';
 import type { Position } from '../types';
 
 export function PositionTable() {
   const { positions } = usePositions();
   const { getCurrentMarket } = useMarketStore();
   const market = getCurrentMarket();
+  const { closePosition, error, clearError, getExplorerUrl } = useTrading();
+
+  const [closingPositionId, setClosingPositionId] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [lastSignature, setLastSignature] = useState<string | null>(null);
 
   const handleClosePosition = async (position: Position) => {
-    // TODO: Implement close position transaction
-    console.log('Closing position:', position.address);
+    setClosingPositionId(position.address);
+    clearError();
+    setSuccessMessage(null);
+
+    try {
+      const signature = await closePosition(position.address);
+      setLastSignature(signature);
+      setSuccessMessage('Position closed successfully!');
+      setTimeout(() => setSuccessMessage(null), 10000);
+    } catch (err) {
+      console.error('Failed to close position:', err);
+    } finally {
+      setClosingPositionId(null);
+    }
   };
 
   if (positions.length === 0) {
@@ -60,8 +79,9 @@ export function PositionTable() {
                   <button
                     className="close-btn"
                     onClick={() => handleClosePosition(position)}
+                    disabled={closingPositionId === position.address}
                   >
-                    Close
+                    {closingPositionId === position.address ? 'Closing...' : 'Close'}
                   </button>
                 </td>
               </tr>
@@ -69,6 +89,27 @@ export function PositionTable() {
           })}
         </tbody>
       </table>
+
+      {/* Error message */}
+      {error && (
+        <div className="error-message" onClick={clearError}>
+          {error}
+        </div>
+      )}
+
+      {/* Success message */}
+      {successMessage && lastSignature && (
+        <div className="success-message">
+          {successMessage}{' '}
+          <a
+            href={getExplorerUrl(lastSignature)}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            View tx
+          </a>
+        </div>
+      )}
     </div>
   );
 }

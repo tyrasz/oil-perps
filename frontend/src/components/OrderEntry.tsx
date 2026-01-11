@@ -1,6 +1,7 @@
 import { useState, useCallback } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useMarketStore } from '../stores/marketStore';
+import { useTrading } from '../hooks/useTrading';
 import type { OrderSide } from '../types';
 
 export function OrderEntry() {
@@ -13,13 +14,21 @@ export function OrderEntry() {
     setSelectedLeverage,
     setOrderType
   } = useMarketStore();
+  const {
+    openPosition,
+    isLoading: isTradingLoading,
+    error: tradingError,
+    clearError,
+    getExplorerUrl,
+    lastTxSignature
+  } = useTrading();
 
   const market = markets[selectedCommodity.id];
 
   const [side, setSide] = useState<OrderSide>('long');
   const [size, setSize] = useState('');
   const [price, setPrice] = useState('');
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
   // Generate leverage options based on commodity max leverage
   const maxLev = selectedCommodity.maxLeverage;
@@ -36,25 +45,23 @@ export function OrderEntry() {
   const handleSubmit = async () => {
     if (!connected || !publicKey || !size) return;
 
-    setIsSubmitting(true);
-    try {
-      // TODO: Implement actual transaction submission
-      console.log('Submitting order:', {
-        commodity: selectedCommodity.id,
-        side,
-        size: parseFloat(size),
-        price: orderType === 'market' ? market?.price : parseFloat(price),
-        leverage: selectedLeverage,
-        orderType,
-      });
+    // Clear previous messages
+    clearError();
+    setSuccessMessage(null);
 
-      // Reset form
+    try {
+      await openPosition(side, parseFloat(size), selectedLeverage);
+
+      // Reset form on success
       setSize('');
       setPrice('');
+      setSuccessMessage(`Position opened! View on explorer`);
+
+      // Auto-clear success message after 10 seconds
+      setTimeout(() => setSuccessMessage(null), 10000);
     } catch (error) {
       console.error('Failed to submit order:', error);
-    } finally {
-      setIsSubmitting(false);
+      // Error is already set in useTrading hook
     }
   };
 
@@ -161,14 +168,35 @@ export function OrderEntry() {
         </div>
       </div>
 
+      {/* Error message */}
+      {tradingError && (
+        <div className="error-message" onClick={clearError}>
+          {tradingError}
+        </div>
+      )}
+
+      {/* Success message */}
+      {successMessage && lastTxSignature && (
+        <div className="success-message">
+          {successMessage}{' '}
+          <a
+            href={getExplorerUrl(lastTxSignature)}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            View tx
+          </a>
+        </div>
+      )}
+
       <button
         className={`submit-btn ${side}`}
         onClick={handleSubmit}
-        disabled={!connected || !size || isSubmitting}
+        disabled={!connected || !size || isTradingLoading}
       >
         {!connected
           ? 'Connect Wallet'
-          : isSubmitting
+          : isTradingLoading
           ? 'Submitting...'
           : `${side === 'long' ? 'Long' : 'Short'} ${selectedCommodity.id}`}
       </button>
