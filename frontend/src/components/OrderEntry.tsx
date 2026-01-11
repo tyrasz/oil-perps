@@ -2,6 +2,7 @@ import { useState, useCallback } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useMarketStore } from '../stores/marketStore';
 import { useTrading } from '../hooks/useTrading';
+import { usePositions } from '../hooks/usePositions';
 import type { OrderSide } from '../types';
 
 export function OrderEntry() {
@@ -22,8 +23,10 @@ export function OrderEntry() {
     getExplorerUrl,
     lastTxSignature
   } = useTrading();
+  const { userAccount } = usePositions();
 
   const market = markets[selectedCommodity.id];
+  const availableCollateral = userAccount?.collateralBalance ?? 0;
 
   const [side, setSide] = useState<OrderSide>('long');
   const [size, setSize] = useState('');
@@ -66,6 +69,7 @@ export function OrderEntry() {
   };
 
   const margin = calculateMargin();
+  const insufficientMargin = margin > 0 && margin > availableCollateral;
   const liquidationPrice = market
     ? side === 'long'
       ? market.price * (1 - 1 / selectedLeverage * 0.95)
@@ -153,8 +157,14 @@ export function OrderEntry() {
           <span>${orderType === 'market' ? formatPrice(market?.price || 0) : price || formatPrice(market?.price || 0)}</span>
         </div>
         <div className="summary-row">
+          <span>Available Collateral</span>
+          <span>${availableCollateral.toFixed(2)}</span>
+        </div>
+        <div className="summary-row">
           <span>Margin Required</span>
-          <span>${margin.toFixed(2)}</span>
+          <span className={insufficientMargin ? 'text-red' : ''}>
+            ${margin.toFixed(2)}
+          </span>
         </div>
         <div className="summary-row">
           <span>Est. Liq. Price</span>
@@ -167,6 +177,13 @@ export function OrderEntry() {
           <span>${(margin * selectedLeverage * 0.0005).toFixed(4)}</span>
         </div>
       </div>
+
+      {/* Insufficient margin warning */}
+      {insufficientMargin && (
+        <div className="warning-message">
+          Insufficient collateral. Deposit ${(margin - availableCollateral).toFixed(2)} more or reduce position size.
+        </div>
+      )}
 
       {/* Error message */}
       {tradingError && (
@@ -192,12 +209,14 @@ export function OrderEntry() {
       <button
         className={`submit-btn ${side}`}
         onClick={handleSubmit}
-        disabled={!connected || !size || isTradingLoading}
+        disabled={!connected || !size || isTradingLoading || insufficientMargin}
       >
         {!connected
           ? 'Connect Wallet'
           : isTradingLoading
           ? 'Submitting...'
+          : insufficientMargin
+          ? 'Insufficient Collateral'
           : `${side === 'long' ? 'Long' : 'Short'} ${selectedCommodity.id}`}
       </button>
     </div>
