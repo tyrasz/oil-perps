@@ -1,37 +1,36 @@
 import { useEffect, useCallback } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useMarketStore } from '../stores/marketStore';
+import { useOnChainPositions } from './useOnChainPositions';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3003';
 
 export function usePositions() {
   const { publicKey } = useWallet();
-  const { positions, orders, userAccount, setPositions, setOrders, setUserAccount } = useMarketStore();
+  const { orders, setPositions, setOrders, setUserAccount } = useMarketStore();
 
-  const fetchPositions = useCallback(async () => {
-    if (!publicKey) return;
+  // Use on-chain positions as primary data source
+  const {
+    positions: onChainPositions,
+    userAccount: onChainUserAccount,
+    isLoading,
+    refresh: refreshOnChain,
+    refreshPositions: refreshOnChainPositions,
+  } = useOnChainPositions();
 
-    try {
-      const res = await fetch(`${API_URL}/api/positions/${publicKey.toString()}`);
-      const data = await res.json();
+  // Sync on-chain positions to store
+  useEffect(() => {
+    setPositions(onChainPositions);
+  }, [onChainPositions, setPositions]);
 
-      setPositions(data.map((p: any) => ({
-        address: p.address,
-        owner: p.owner,
-        side: p.side === 'Long' ? 'long' : 'short',
-        size: p.size / 1_000_000,
-        collateral: p.collateral / 1_000_000,
-        entryPrice: p.entry_price / 1_000_000,
-        leverage: p.leverage / 1000,
-        unrealizedPnl: p.unrealized_pnl / 1_000_000,
-        marginRatio: p.margin_ratio / 100,
-        openedAt: p.opened_at,
-      })));
-    } catch (error) {
-      console.error('Failed to fetch positions:', error);
+  // Sync on-chain user account to store
+  useEffect(() => {
+    if (onChainUserAccount) {
+      setUserAccount(onChainUserAccount);
     }
-  }, [publicKey, setPositions]);
+  }, [onChainUserAccount, setUserAccount]);
 
+  // Fetch orders from API (no on-chain order book yet)
   const fetchOrders = useCallback(async () => {
     if (!publicKey) return;
 
@@ -42,6 +41,7 @@ export function usePositions() {
       setOrders(data.map((o: any) => ({
         address: o.address,
         owner: o.owner,
+        commodity: o.commodity || 'OIL',
         side: o.side.toLowerCase(),
         orderType: o.order_type.toLowerCase(),
         price: o.price / 1_000_000,
@@ -55,45 +55,25 @@ export function usePositions() {
     }
   }, [publicKey, setOrders]);
 
-  const fetchAccount = useCallback(async () => {
-    if (!publicKey) return;
-
-    try {
-      const res = await fetch(`${API_URL}/api/account/${publicKey.toString()}`);
-      const data = await res.json();
-
-      setUserAccount({
-        address: data.address,
-        collateralBalance: data.collateral_balance / 1_000_000,
-        totalPositions: data.total_positions,
-        realizedPnl: data.realized_pnl / 1_000_000,
-      });
-    } catch (error) {
-      console.error('Failed to fetch account:', error);
-    }
-  }, [publicKey, setUserAccount]);
-
   useEffect(() => {
     if (publicKey) {
-      fetchPositions();
       fetchOrders();
-      fetchAccount();
 
       const interval = setInterval(() => {
-        fetchPositions();
         fetchOrders();
       }, 5000);
 
       return () => clearInterval(interval);
     }
-  }, [publicKey, fetchPositions, fetchOrders, fetchAccount]);
+  }, [publicKey, fetchOrders]);
 
   return {
-    positions,
+    positions: onChainPositions,
     orders,
-    userAccount,
-    refreshPositions: fetchPositions,
+    userAccount: onChainUserAccount,
+    isLoading,
+    refreshPositions: refreshOnChainPositions,
     refreshOrders: fetchOrders,
-    refreshAccount: fetchAccount,
+    refreshAccount: refreshOnChain,
   };
 }
