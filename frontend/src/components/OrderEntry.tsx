@@ -1,9 +1,13 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useMarketStore } from '../stores/marketStore';
 import { useTrading } from '../hooks/useTrading';
 import { usePositions } from '../hooks/usePositions';
+import { useOnChainMarket } from '../hooks/useOnChainMarket';
 import type { OrderSide } from '../types';
+
+// Maximum position size in USD value (per position)
+const MAX_POSITION_VALUE = 100_000; // $100k max per position
 
 export function OrderEntry() {
   const { connected, publicKey } = useWallet();
@@ -25,6 +29,7 @@ export function OrderEntry() {
     lastTxSignature
   } = useTrading();
   const { userAccount } = usePositions();
+  const { marketData: onChainMarket } = useOnChainMarket();
 
   const market = markets[selectedCommodity.id];
   const availableCollateral = userAccount?.collateralBalance ?? 0;
@@ -84,6 +89,55 @@ export function OrderEntry() {
       ? market.price * (1 - 1 / selectedLeverage * 0.95)
       : market.price * (1 + 1 / selectedLeverage * 0.95)
     : 0;
+
+  // Position size validation
+  const sizeValidation = useMemo(() => {
+    const sizeNum = parseFloat(size) || 0;
+    const priceNum = market?.price || 0;
+    const notionalValue = sizeNum * priceNum;
+
+    // Check minimum trade size
+    if (sizeNum > 0 && sizeNum < selectedCommodity.minTradeSize) {
+      return {
+        valid: false,
+        error: `Minimum size is ${selectedCommodity.minTradeSize} ${selectedCommodity.contractUnit}s`,
+      };
+    }
+
+    // Check maximum position value
+    if (notionalValue > MAX_POSITION_VALUE) {
+      return {
+        valid: false,
+        error: `Max position value is $${MAX_POSITION_VALUE.toLocaleString()}`,
+      };
+    }
+
+    // Check if would exceed max open interest (from on-chain)
+    if (onChainMarket && sizeNum > 0) {
+      const currentOI = side === 'long'
+        ? onChainMarket.longOpenInterest
+        : onChainMarket.shortOpenInterest;
+      const maxOI = onChainMarket.maxOpenInterest;
+
+      if (currentOI + notionalValue > maxOI && maxOI > 0) {
+        const available = Math.max(0, maxOI - currentOI);
+        return {
+          valid: false,
+          error: `Exceeds max OI. Available: $${available.toLocaleString()}`,
+        };
+      }
+    }
+
+    // Check leverage doesn't exceed max
+    if (selectedLeverage > selectedCommodity.maxLeverage) {
+      return {
+        valid: false,
+        error: `Max leverage for ${selectedCommodity.id} is ${selectedCommodity.maxLeverage}x`,
+      };
+    }
+
+    return { valid: true, error: null };
+  }, [size, market, selectedCommodity, selectedLeverage, side, onChainMarket]);
 
   const formatPrice = (value: number) => value.toFixed(selectedCommodity.decimals);
 
@@ -194,8 +248,15 @@ export function OrderEntry() {
         </div>
       )}
 
+      {/* Position size validation error */}
+      {!sizeValidation.valid && sizeValidation.error && (
+        <div className="warning-message">
+          {sizeValidation.error}
+        </div>
+      )}
+
       {/* Insufficient margin warning */}
-      {insufficientMargin && (
+      {insufficientMargin && sizeValidation.valid && (
         <div className="warning-message">
           Insufficient collateral. Deposit ${(margin - availableCollateral).toFixed(2)} more or reduce position size.
         </div>
@@ -225,7 +286,7 @@ export function OrderEntry() {
       <button
         className={`submit-btn ${side}`}
         onClick={handleSubmit}
-        disabled={!connected || !size || isTradingLoading || insufficientMargin || marketExists === false}
+        disabled={!connected || !size || isTradingLoading || insufficientMargin || marketExists === false || !sizeValidation.valid}
       >
         {!connected
           ? 'Connect Wallet'
@@ -233,6 +294,8 @@ export function OrderEntry() {
           ? 'Market Not Initialized'
           : isTradingLoading
           ? 'Submitting...'
+          : !sizeValidation.valid
+          ? 'Invalid Size'
           : insufficientMargin
           ? 'Insufficient Collateral'
           : `${side === 'long' ? 'Long' : 'Short'} ${selectedCommodity.id}`}
