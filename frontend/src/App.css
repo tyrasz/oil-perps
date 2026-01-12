@@ -215,6 +215,18 @@
   font-weight: 500;
 }
 
+.market-stats .funding-stat {
+  position: relative;
+}
+
+.market-stats .funding-countdown {
+  display: block;
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: monospace;
+  margin-top: 2px;
+}
+
 .market-stats .oi-breakdown {
   min-width: 120px;
 }
