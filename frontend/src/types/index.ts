@@ -12,6 +12,22 @@ export interface Position {
   openedAt: number;
 }
 
+export interface ClosedPosition {
+  address: string;
+  owner: string;
+  commodity: string;
+  side: 'long' | 'short';
+  size: number;
+  collateral: number;
+  entryPrice: number;
+  exitPrice: number;
+  leverage: number;
+  realizedPnl: number;
+  openedAt: number;
+  closedAt: number;
+  status: 'closed' | 'liquidated';
+}
+
 export interface Order {
   address: string;
   owner: string;

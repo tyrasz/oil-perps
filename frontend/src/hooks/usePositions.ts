@@ -12,10 +12,12 @@ export function usePositions() {
   // Use on-chain positions as primary data source
   const {
     positions: onChainPositions,
+    closedPositions: onChainClosedPositions,
     userAccount: onChainUserAccount,
     isLoading,
     refresh: refreshOnChain,
     refreshPositions: refreshOnChainPositions,
+    refreshClosedPositions: refreshOnChainClosedPositions,
   } = useOnChainPositions();
 
   // Sync on-chain positions to store
@@ -69,10 +71,12 @@ export function usePositions() {
 
   return {
     positions: onChainPositions,
+    closedPositions: onChainClosedPositions,
     orders,
     userAccount: onChainUserAccount,
     isLoading,
     refreshPositions: refreshOnChainPositions,
+    refreshClosedPositions: refreshOnChainClosedPositions,
     refreshOrders: fetchOrders,
     refreshAccount: refreshOnChain,
   };

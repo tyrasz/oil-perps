@@ -11,6 +11,7 @@ import { OrdersTable } from './components/OrdersTable';
 import { LpVault } from './components/LpVault';
 import { MarketMakerPanel } from './components/MarketMakerPanel';
 import { CollateralPanel } from './components/CollateralPanel';
+import { TradeHistory } from './components/TradeHistory';
 import './App.css';
 
 type Tab = 'positions' | 'orders' | 'trades' | 'account' | 'vault' | 'mm';
@@ -116,30 +117,6 @@ function App() {
           <span className="status-dot online"></span>
         </div>
       </footer>
-    </div>
-  );
-}
-
-function TradeHistory() {
-  return (
-    <div className="trade-history">
-      <table>
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Side</th>
-            <th>Size</th>
-            <th>Price</th>
-            <th>PnL</th>
-            <th>Fee</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr className="empty-row">
-            <td colSpan={6}>No trade history</td>
-          </tr>
-        </tbody>
-      </table>
     </div>
   );
 }
