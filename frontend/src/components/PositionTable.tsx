@@ -2,6 +2,8 @@ import { useState, useMemo } from 'react';
 import { usePositions } from '../hooks/usePositions';
 import { useMarketStore } from '../stores/marketStore';
 import { useTrading } from '../hooks/useTrading';
+import { useTriggerOrderStore } from '../stores/triggerOrderStore';
+import { TpSlManager } from './TpSlManager';
 import type { Position } from '../types';
 
 // Liquidation thresholds
@@ -13,10 +15,12 @@ export function PositionTable() {
   const { getCurrentMarket } = useMarketStore();
   const market = getCurrentMarket();
   const { closePosition, error, clearError, getExplorerUrl } = useTrading();
+  const { getTriggerOrdersForPosition } = useTriggerOrderStore();
 
   const [closingPositionId, setClosingPositionId] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [lastSignature, setLastSignature] = useState<string | null>(null);
+  const [expandedPositionId, setExpandedPositionId] = useState<string | null>(null);
 
   // Check for positions at risk of liquidation
   const { criticalPositions, warningPositions } = useMemo(() => {
@@ -90,6 +94,7 @@ export function PositionTable() {
             <th>Leverage</th>
             <th>PnL</th>
             <th>Margin Ratio</th>
+            <th>TP/SL</th>
             <th>Actions</th>
           </tr>
         </thead>
@@ -97,33 +102,73 @@ export function PositionTable() {
           {positions.map((position) => {
             const pnlClass = position.unrealizedPnl >= 0 ? 'positive' : 'negative';
             const marginClass = position.marginRatio < 10 ? 'danger' : position.marginRatio < 20 ? 'warning' : '';
+            const triggerOrders = getTriggerOrdersForPosition(position.address);
+            const activeTp = triggerOrders.find(o => o.type === 'take_profit' && o.status === 'active');
+            const activeSl = triggerOrders.find(o => o.type === 'stop_loss' && o.status === 'active');
+            const isExpanded = expandedPositionId === position.address;
 
             return (
-              <tr key={position.address}>
-                <td className={position.side === 'long' ? 'long' : 'short'}>
-                  {position.side.toUpperCase()}
-                </td>
-                <td>{position.size.toFixed(4)}</td>
-                <td>${position.entryPrice.toFixed(2)}</td>
-                <td>${market?.price.toFixed(2) || '-'}</td>
-                <td>{position.leverage}x</td>
-                <td className={pnlClass}>
-                  ${position.unrealizedPnl.toFixed(2)}
-                  <span className="pnl-percent">
-                    ({((position.unrealizedPnl / position.collateral) * 100).toFixed(2)}%)
-                  </span>
-                </td>
-                <td className={marginClass}>{position.marginRatio.toFixed(2)}%</td>
-                <td>
-                  <button
-                    className="close-btn"
-                    onClick={() => handleClosePosition(position)}
-                    disabled={closingPositionId === position.address}
-                  >
-                    {closingPositionId === position.address ? 'Closing...' : 'Close'}
-                  </button>
-                </td>
-              </tr>
+              <>
+                <tr key={position.address} className={isExpanded ? 'expanded' : ''}>
+                  <td className={position.side === 'long' ? 'long' : 'short'}>
+                    {position.side.toUpperCase()}
+                  </td>
+                  <td>{position.size.toFixed(4)}</td>
+                  <td>${position.entryPrice.toFixed(2)}</td>
+                  <td>${market?.price.toFixed(2) || '-'}</td>
+                  <td>{position.leverage}x</td>
+                  <td className={pnlClass}>
+                    ${position.unrealizedPnl.toFixed(2)}
+                    <span className="pnl-percent">
+                      ({((position.unrealizedPnl / position.collateral) * 100).toFixed(2)}%)
+                    </span>
+                  </td>
+                  <td className={marginClass}>{position.marginRatio.toFixed(2)}%</td>
+                  <td className="tpsl-cell">
+                    <div className="tpsl-indicators">
+                      {activeTp && (
+                        <span className="tpsl-indicator tp" title={`TP: $${activeTp.triggerPrice.toFixed(2)}`}>
+                          TP
+                        </span>
+                      )}
+                      {activeSl && (
+                        <span className="tpsl-indicator sl" title={`SL: $${activeSl.triggerPrice.toFixed(2)}`}>
+                          SL
+                        </span>
+                      )}
+                      {!activeTp && !activeSl && (
+                        <span className="tpsl-indicator none">-</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="actions-cell">
+                    <button
+                      className="action-btn tpsl-btn"
+                      onClick={() => setExpandedPositionId(isExpanded ? null : position.address)}
+                      title="Set TP/SL"
+                    >
+                      {isExpanded ? '▼' : '▶'} TP/SL
+                    </button>
+                    <button
+                      className="action-btn close-btn"
+                      onClick={() => handleClosePosition(position)}
+                      disabled={closingPositionId === position.address}
+                    >
+                      {closingPositionId === position.address ? '...' : 'Close'}
+                    </button>
+                  </td>
+                </tr>
+                {isExpanded && (
+                  <tr className="expanded-row">
+                    <td colSpan={9}>
+                      <TpSlManager
+                        position={position}
+                        onClose={() => setExpandedPositionId(null)}
+                      />
+                    </td>
+                  </tr>
+                )}
+              </>
             );
           })}
         </tbody>

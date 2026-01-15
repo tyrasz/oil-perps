@@ -12,12 +12,18 @@ import { LpVault } from './components/LpVault';
 import { MarketMakerPanel } from './components/MarketMakerPanel';
 import { CollateralPanel } from './components/CollateralPanel';
 import { TradeHistory } from './components/TradeHistory';
+import { PortfolioAnalytics } from './components/PortfolioAnalytics';
+import { PriceAlerts } from './components/PriceAlerts';
+import { useTriggerOrderMonitor } from './hooks/useTriggerOrderMonitor';
 import './App.css';
 
-type Tab = 'positions' | 'orders' | 'trades' | 'account' | 'vault' | 'mm';
+type Tab = 'positions' | 'orders' | 'trades' | 'account' | 'vault' | 'mm' | 'analytics' | 'alerts';
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('positions');
+
+  // Initialize trigger order monitoring (TP/SL execution)
+  useTriggerOrderMonitor();
 
   return (
     <div className="app">
@@ -93,6 +99,18 @@ function App() {
             >
               Market Maker
             </button>
+            <button
+              className={`tab ${activeTab === 'analytics' ? 'active' : ''}`}
+              onClick={() => setActiveTab('analytics')}
+            >
+              Analytics
+            </button>
+            <button
+              className={`tab ${activeTab === 'alerts' ? 'active' : ''}`}
+              onClick={() => setActiveTab('alerts')}
+            >
+              Alerts
+            </button>
           </div>
 
           <div className="tab-content">
@@ -102,6 +120,8 @@ function App() {
             {activeTab === 'account' && <CollateralPanel />}
             {activeTab === 'vault' && <LpVault />}
             {activeTab === 'mm' && <MarketMakerPanel />}
+            {activeTab === 'analytics' && <PortfolioAnalytics />}
+            {activeTab === 'alerts' && <PriceAlerts />}
           </div>
         </div>
       </main>

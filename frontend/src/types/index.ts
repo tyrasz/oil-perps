@@ -86,3 +86,39 @@ export interface UserAccount {
 
 export type OrderSide = 'long' | 'short';
 export type OrderType = 'market' | 'limit';
+
+// Trigger orders for TP/SL
+export interface TriggerOrder {
+  id: string;
+  positionAddress: string;
+  type: 'take_profit' | 'stop_loss';
+  triggerPrice: number;
+  closePercent: number; // 0-100, percentage of position to close
+  createdAt: number;
+  status: 'active' | 'triggered' | 'cancelled';
+}
+
+// Price alert
+export interface PriceAlert {
+  id: string;
+  commodity: string;
+  condition: 'above' | 'below';
+  targetPrice: number;
+  createdAt: number;
+  triggered: boolean;
+  notified: boolean;
+}
+
+// Portfolio metrics
+export interface PortfolioMetrics {
+  totalValue: number;
+  totalPnl: number;
+  totalPnlPercent: number;
+  winRate: number;
+  totalTrades: number;
+  avgWin: number;
+  avgLoss: number;
+  largestWin: number;
+  largestLoss: number;
+  profitFactor: number;
+}
