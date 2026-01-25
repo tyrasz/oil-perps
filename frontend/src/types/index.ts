@@ -122,3 +122,36 @@ export interface PortfolioMetrics {
   largestLoss: number;
   profitFactor: number;
 }
+
+// Referral system
+export interface ReferralCode {
+  code: string;
+  ownerWallet: string;
+  createdAt: number;
+  discountPercent: number; // Discount for referred users (e.g., 10 = 10% off fees)
+  rewardPercent: number;   // Reward for referrer (e.g., 20 = 20% of fees)
+}
+
+export interface ReferralStats {
+  code: string;
+  totalReferred: number;
+  totalVolume: number;
+  totalRewardsEarned: number;
+  pendingRewards: number;
+  referrals: ReferralRecord[];
+}
+
+export interface ReferralRecord {
+  walletAddress: string;
+  joinedAt: number;
+  totalVolume: number;
+  totalFeesGenerated: number;
+  rewardsEarned: number;
+}
+
+export interface AppliedReferral {
+  code: string;
+  referrerWallet: string;
+  appliedAt: number;
+  discountPercent: number;
+}

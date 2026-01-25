@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { useTriggerOrderStore } from '../stores/triggerOrderStore';
 import { useMarketStore, COMMODITIES } from '../stores/marketStore';
-import type { PriceAlert } from '../types';
 
 export function PriceAlerts() {
   const { priceAlerts, addPriceAlert, removePriceAlert } = useTriggerOrderStore();

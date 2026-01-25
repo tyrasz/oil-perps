@@ -15,6 +15,13 @@ interface OnChainMarketData {
   totalPositions: number;
   totalTrades: number;
   isPaused: boolean;
+  maxLeverage: number;
+  initialMarginRatio: number;
+  maintenanceMarginRatio: number;
+  takerFee: number;
+  makerFee: number;
+  liquidationFee: number;
+  insuranceFund: number;
 }
 
 interface OnChainMarket {
@@ -81,6 +88,13 @@ export function useOnChainMarket() {
         totalPositions: market.totalPositions.toNumber(),
         totalTrades: market.totalTrades.toNumber(),
         isPaused: market.isPaused,
+        maxLeverage: market.maxLeverage,
+        initialMarginRatio: market.initialMarginRatio,
+        maintenanceMarginRatio: market.maintenanceMarginRatio,
+        takerFee: market.takerFee,
+        makerFee: market.makerFee,
+        liquidationFee: market.liquidationFee,
+        insuranceFund: market.insuranceFund.toNumber() / Math.pow(10, PRICE_DECIMALS),
       });
     } catch (err) {
       console.error('Failed to fetch on-chain market:', err);

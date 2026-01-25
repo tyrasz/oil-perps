@@ -14,10 +14,11 @@ import { CollateralPanel } from './components/CollateralPanel';
 import { TradeHistory } from './components/TradeHistory';
 import { PortfolioAnalytics } from './components/PortfolioAnalytics';
 import { PriceAlerts } from './components/PriceAlerts';
+import { ReferralPanel } from './components/ReferralPanel';
 import { useTriggerOrderMonitor } from './hooks/useTriggerOrderMonitor';
 import './App.css';
 
-type Tab = 'positions' | 'orders' | 'trades' | 'account' | 'vault' | 'mm' | 'analytics' | 'alerts';
+type Tab = 'positions' | 'orders' | 'trades' | 'account' | 'vault' | 'mm' | 'analytics' | 'alerts' | 'referrals';
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('positions');
@@ -111,6 +112,12 @@ function App() {
             >
               Alerts
             </button>
+            <button
+              className={`tab ${activeTab === 'referrals' ? 'active' : ''}`}
+              onClick={() => setActiveTab('referrals')}
+            >
+              Referrals
+            </button>
           </div>
 
           <div className="tab-content">
@@ -122,6 +129,7 @@ function App() {
             {activeTab === 'mm' && <MarketMakerPanel />}
             {activeTab === 'analytics' && <PortfolioAnalytics />}
             {activeTab === 'alerts' && <PriceAlerts />}
+            {activeTab === 'referrals' && <ReferralPanel />}
           </div>
         </div>
       </main>

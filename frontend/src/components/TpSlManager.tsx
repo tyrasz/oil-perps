@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react';
 import { useTriggerOrderStore } from '../stores/triggerOrderStore';
 import { useMarketStore } from '../stores/marketStore';
-import type { Position, TriggerOrder } from '../types';
+import type { Position } from '../types';
 
 interface TpSlManagerProps {
   position: Position;
