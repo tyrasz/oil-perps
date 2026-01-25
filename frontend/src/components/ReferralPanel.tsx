@@ -1,32 +1,51 @@
 import { useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
-import { useReferralStore } from '../stores/referralStore';
+import { useOnChainReferral } from '../hooks/useOnChainReferral';
 
 export function ReferralPanel() {
   const { publicKey, connected } = useWallet();
   const {
     myReferralCode,
-    myReferralStats,
-    appliedReferral,
+    userReferral,
+    isLoading,
+    error,
     createReferralCode,
     applyReferralCode,
     claimRewards,
-  } = useReferralStore();
+  } = useOnChainReferral();
 
   const [customCode, setCustomCode] = useState('');
   const [applyCode, setApplyCode] = useState('');
   const [applyError, setApplyError] = useState('');
   const [applySuccess, setApplySuccess] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const handleCreateCode = () => {
-    if (!publicKey) return;
-    createReferralCode(publicKey.toBase58(), customCode || undefined);
-    setCustomCode('');
+  const handleCreateCode = async () => {
+    if (!publicKey || isSubmitting) return;
+
+    // Validate code format
+    const code = customCode.trim().toUpperCase() || generateRandomCode();
+    if (code.length < 4) {
+      setApplyError('Code must be at least 4 characters');
+      return;
+    }
+    if (!/^[A-Z0-9]+$/.test(code)) {
+      setApplyError('Code must be alphanumeric only');
+      return;
+    }
+
+    setIsSubmitting(true);
+    const success = await createReferralCode(code);
+    setIsSubmitting(false);
+
+    if (success) {
+      setCustomCode('');
+    }
   };
 
-  const handleApplyCode = () => {
-    if (!publicKey) return;
+  const handleApplyCode = async () => {
+    if (!publicKey || isSubmitting) return;
     setApplyError('');
     setApplySuccess(false);
 
@@ -35,17 +54,24 @@ export function ReferralPanel() {
       return;
     }
 
-    const success = applyReferralCode(applyCode.trim(), publicKey.toBase58());
+    setIsSubmitting(true);
+    const success = await applyReferralCode(applyCode.trim());
+    setIsSubmitting(false);
+
     if (success) {
       setApplySuccess(true);
       setApplyCode('');
     } else {
-      setApplyError('Invalid code, already used, or cannot use your own code');
+      setApplyError(error || 'Failed to apply referral code');
     }
   };
 
-  const handleClaimRewards = () => {
-    const claimed = claimRewards();
+  const handleClaimRewards = async () => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    const claimed = await claimRewards();
+    setIsSubmitting(false);
+
     if (claimed > 0) {
       alert(`Successfully claimed $${claimed.toFixed(2)} in referral rewards!`);
     }
@@ -59,6 +85,16 @@ export function ReferralPanel() {
 
   const getReferralLink = (code: string) => {
     return `${window.location.origin}?ref=${code}`;
+  };
+
+  // Generate random 8-character code
+  const generateRandomCode = (): string => {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let code = '';
+    for (let i = 0; i < 8; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return code;
   };
 
   if (!connected) {
@@ -78,7 +114,13 @@ export function ReferralPanel() {
     <div className="referral-panel">
       <div className="referral-header">
         <h3>Referral Program</h3>
-        <span className="referral-subtitle">Earn rewards by inviting traders</span>
+        <span className="referral-subtitle">Earn rewards by inviting traders (On-Chain)</span>
+      </div>
+
+      {/* On-chain indicator */}
+      <div className="onchain-badge">
+        <span className="badge-dot" />
+        Secured On-Chain
       </div>
 
       {/* Benefits Overview */}
@@ -99,10 +141,17 @@ export function ReferralPanel() {
         </div>
       </div>
 
+      {/* Global error display */}
+      {error && !applyError && (
+        <div className="error-message">{error}</div>
+      )}
+
       {/* My Referral Code Section */}
       <div className="referral-section">
         <h4>Your Referral Code</h4>
-        {myReferralCode ? (
+        {isLoading && !myReferralCode ? (
+          <div className="loading">Loading...</div>
+        ) : myReferralCode ? (
           <div className="my-code-display">
             <div className="code-box">
               <span className="code-value">{myReferralCode.code}</span>
@@ -134,76 +183,55 @@ export function ReferralPanel() {
               <input
                 type="text"
                 value={customCode}
-                onChange={(e) => setCustomCode(e.target.value.toUpperCase().slice(0, 12))}
+                onChange={(e) => setCustomCode(e.target.value.toUpperCase().slice(0, 8))}
                 placeholder="Custom code (optional)"
-                maxLength={12}
+                maxLength={8}
+                disabled={isSubmitting}
               />
-              <button className="create-btn" onClick={handleCreateCode}>
-                Create Code
+              <button
+                className="create-btn"
+                onClick={handleCreateCode}
+                disabled={isSubmitting}
+              >
+                {isSubmitting ? 'Creating...' : 'Create Code'}
               </button>
             </div>
+            <p className="hint">Leave empty for a random code. Must be 4-8 alphanumeric characters.</p>
           </div>
         )}
       </div>
 
       {/* Referral Stats Section */}
-      {myReferralStats && (
+      {myReferralCode && (
         <div className="referral-section">
           <h4>Your Referral Stats</h4>
           <div className="stats-grid">
             <div className="stat-item">
-              <span className="stat-value">{myReferralStats.totalReferred}</span>
+              <span className="stat-value">{myReferralCode.totalReferred}</span>
               <span className="stat-label">Referred Users</span>
             </div>
             <div className="stat-item">
-              <span className="stat-value">${(myReferralStats.totalVolume / 1_000_000).toFixed(2)}M</span>
+              <span className="stat-value">${myReferralCode.totalVolume.toLocaleString()}</span>
               <span className="stat-label">Total Volume</span>
             </div>
             <div className="stat-item">
-              <span className="stat-value">${myReferralStats.totalRewardsEarned.toFixed(2)}</span>
+              <span className="stat-value">${myReferralCode.totalRewardsEarned.toFixed(2)}</span>
               <span className="stat-label">Total Earned</span>
             </div>
             <div className="stat-item highlight">
-              <span className="stat-value">${myReferralStats.pendingRewards.toFixed(2)}</span>
+              <span className="stat-value">${myReferralCode.pendingRewards.toFixed(2)}</span>
               <span className="stat-label">Pending Rewards</span>
             </div>
           </div>
 
-          {myReferralStats.pendingRewards > 0 && (
-            <button className="claim-btn" onClick={handleClaimRewards}>
-              Claim ${myReferralStats.pendingRewards.toFixed(2)} Rewards
+          {myReferralCode.pendingRewards > 0 && (
+            <button
+              className="claim-btn"
+              onClick={handleClaimRewards}
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? 'Claiming...' : `Claim $${myReferralCode.pendingRewards.toFixed(2)} Rewards`}
             </button>
-          )}
-
-          {/* Referral Leaderboard */}
-          {myReferralStats.referrals.length > 0 && (
-            <div className="referrals-table">
-              <h5>Your Referrals</h5>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Wallet</th>
-                    <th>Joined</th>
-                    <th>Volume</th>
-                    <th>Fees Generated</th>
-                    <th>Your Rewards</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {myReferralStats.referrals.map((referral, index) => (
-                    <tr key={index}>
-                      <td className="wallet-cell">
-                        {referral.walletAddress.slice(0, 4)}...{referral.walletAddress.slice(-4)}
-                      </td>
-                      <td>{new Date(referral.joinedAt).toLocaleDateString()}</td>
-                      <td>${referral.totalVolume.toLocaleString()}</td>
-                      <td>${referral.totalFeesGenerated.toFixed(2)}</td>
-                      <td className="rewards-cell">${referral.rewardsEarned.toFixed(2)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
           )}
         </div>
       )}
@@ -211,17 +239,21 @@ export function ReferralPanel() {
       {/* Apply Referral Code Section */}
       <div className="referral-section">
         <h4>Use a Referral Code</h4>
-        {appliedReferral ? (
+        {userReferral ? (
           <div className="applied-code-display">
             <div className="applied-badge">
               <span className="checkmark">✓</span>
               Referral code applied
             </div>
             <div className="applied-info">
-              <span>Code: <strong>{appliedReferral.code}</strong></span>
+              <span>Referrer: <strong>{userReferral.referrer.slice(0, 4)}...{userReferral.referrer.slice(-4)}</strong></span>
               <span className="discount-badge">
-                {appliedReferral.discountPercent}% fee discount active
+                {(userReferral.discountBps / 100).toFixed(0)}% fee discount active
               </span>
+            </div>
+            <div className="referral-stats-mini">
+              <span>Your volume: ${userReferral.totalVolume.toLocaleString()}</span>
+              <span>Fees saved: ${(userReferral.totalFeesPaid * userReferral.discountBps / 10000).toFixed(2)}</span>
             </div>
           </div>
         ) : (
@@ -237,16 +269,32 @@ export function ReferralPanel() {
                   setApplySuccess(false);
                 }}
                 placeholder="Enter referral code"
-                maxLength={12}
+                maxLength={8}
+                disabled={isSubmitting}
               />
-              <button className="apply-btn" onClick={handleApplyCode}>
-                Apply Code
+              <button
+                className="apply-btn"
+                onClick={handleApplyCode}
+                disabled={isSubmitting}
+              >
+                {isSubmitting ? 'Applying...' : 'Apply Code'}
               </button>
             </div>
             {applyError && <p className="error-message">{applyError}</p>}
             {applySuccess && <p className="success-message">Referral code applied successfully!</p>}
           </div>
         )}
+      </div>
+
+      {/* Security Notice */}
+      <div className="referral-section security-notice">
+        <h4>Security</h4>
+        <ul>
+          <li>All referral data is stored on-chain in Solana accounts</li>
+          <li>Rewards are calculated from actual trading fees</li>
+          <li>Self-referral is prevented at the program level</li>
+          <li>Claims transfer real USDC from the vault</li>
+        </ul>
       </div>
 
       {/* How it Works */}
@@ -257,7 +305,7 @@ export function ReferralPanel() {
             <div className="step-number">1</div>
             <div className="step-content">
               <span className="step-title">Create Your Code</span>
-              <span className="step-desc">Generate a unique referral code to share with friends</span>
+              <span className="step-desc">Generate a unique referral code stored on Solana</span>
             </div>
           </div>
           <div className="step">
@@ -271,7 +319,7 @@ export function ReferralPanel() {
             <div className="step-number">3</div>
             <div className="step-content">
               <span className="step-title">Earn Rewards</span>
-              <span className="step-desc">Receive 20% of all trading fees from your referrals</span>
+              <span className="step-desc">Receive 20% of trading fees, tracked on every trade</span>
             </div>
           </div>
         </div>

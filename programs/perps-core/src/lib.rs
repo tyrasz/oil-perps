@@ -50,4 +50,20 @@ pub mod perps_core {
     pub fn update_funding(ctx: Context<UpdateFunding>) -> Result<()> {
         instructions::update_funding::handler(ctx)
     }
+
+    // Referral system instructions
+    pub fn create_referral_code(
+        ctx: Context<CreateReferralCode>,
+        params: CreateReferralCodeParams,
+    ) -> Result<()> {
+        instructions::create_referral_code::handler(ctx, params)
+    }
+
+    pub fn apply_referral_code(ctx: Context<ApplyReferralCode>) -> Result<()> {
+        instructions::apply_referral_code::handler(ctx)
+    }
+
+    pub fn claim_referral_rewards(ctx: Context<ClaimReferralRewards>) -> Result<()> {
+        instructions::claim_referral_rewards::handler(ctx)
+    }
 }
