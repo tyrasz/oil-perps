@@ -16,3 +16,7 @@ anchor-lang = "0.28.0"
 anchor-spl = "0.28.0"
 solana-program = "1.16"
 pyth-sdk-solana = "0.8"
+
+[profile.release]
+# Fail loudly instead of silently wrapping on arithmetic overflow
+overflow-checks = true

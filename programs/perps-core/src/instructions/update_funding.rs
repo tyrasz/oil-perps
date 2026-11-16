@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 use pyth_sdk_solana::load_price_feed_from_account_info;
+use crate::oracle::normalize_pyth_price;
 use crate::state::Market;
 use crate::errors::PerpsError;
 
@@ -41,10 +42,8 @@ pub fn handler(ctx: Context<UpdateFunding>) -> Result<()> {
 
     require!(price_data.price > 0, PerpsError::InvalidOraclePrice);
 
-    let oracle_price = (price_data.price as u64)
-        .checked_mul(10u64.pow((6 + price_data.expo.abs() as u32) as u32))
-        .and_then(|p| p.checked_div(10u64.pow(price_data.expo.abs() as u32)))
-        .ok_or(PerpsError::MathOverflow)? as u64;
+    let oracle_price = normalize_pyth_price(price_data.price, price_data.expo)
+        .ok_or(PerpsError::InvalidOraclePrice)?;
 
     // Calculate funding rate based on OI imbalance
     // Positive = longs pay shorts, Negative = shorts pay longs

@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use pyth_sdk_solana::load_price_feed_from_account_info;
+use crate::oracle::normalize_pyth_price;
 use crate::state::LpVault;
 use crate::errors::PropAmmError;
 
@@ -70,10 +71,8 @@ pub fn handler(ctx: Context<ClosePositionAmm>, params: ClosePositionParams) -> R
 
     require!(price_data.price > 0, PropAmmError::InvalidOraclePrice);
 
-    let oracle_price = (price_data.price as u64)
-        .checked_mul(10u64.pow((6 + price_data.expo.abs() as u32) as u32))
-        .and_then(|p| p.checked_div(10u64.pow(price_data.expo.abs() as u32)))
-        .ok_or(PropAmmError::MathOverflow)? as u64;
+    let oracle_price = normalize_pyth_price(price_data.price, price_data.expo)
+        .ok_or(PropAmmError::InvalidOraclePrice)?;
 
     // Calculate exit price with spread
     let exit_price = vault.calculate_exit_price(oracle_price, params.is_long);

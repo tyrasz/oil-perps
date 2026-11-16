@@ -1,7 +1,8 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use pyth_sdk_solana::load_price_feed_from_account_info;
-use crate::state::{Market, Position, Vault, UserAccount, Side, PositionStatus};
+use crate::oracle::normalize_pyth_price;
+use crate::state::{split_equity, Market, Position, Vault, UserAccount, Side, PositionStatus};
 use crate::errors::PerpsError;
 
 #[derive(Accounts)]
@@ -78,10 +79,8 @@ pub fn handler(ctx: Context<Liquidate>) -> Result<()> {
 
     require!(price_data.price > 0, PerpsError::InvalidOraclePrice);
 
-    let oracle_price = (price_data.price as u64)
-        .checked_mul(10u64.pow((6 + price_data.expo.abs() as u32) as u32))
-        .and_then(|p| p.checked_div(10u64.pow(price_data.expo.abs() as u32)))
-        .ok_or(PerpsError::MathOverflow)? as u64;
+    let oracle_price = normalize_pyth_price(price_data.price, price_data.expo)
+        .ok_or(PerpsError::InvalidOraclePrice)?;
 
     // Check if position is liquidatable
     require!(
@@ -91,7 +90,7 @@ pub fn handler(ctx: Context<Liquidate>) -> Result<()> {
 
     // Calculate liquidation amounts
     let pnl = position.unrealized_pnl(oracle_price);
-    let remaining_collateral = (position.collateral as i64 + pnl).max(0) as u64;
+    let (remaining_collateral, deficit) = split_equity(position.collateral as i64 + pnl);
 
     // Liquidation fee goes to liquidator
     let liquidation_reward = (remaining_collateral as u128 * market.liquidation_fee as u128 / 10000) as u64;
@@ -111,8 +110,11 @@ pub fn handler(ctx: Context<Liquidate>) -> Result<()> {
         }
     }
 
-    // Add to insurance fund
-    market.insurance_fund = market.insurance_fund.saturating_add(to_insurance);
+    // Add to insurance fund, which also absorbs any loss beyond the collateral
+    let uncovered = market.settle_insurance(to_insurance, deficit);
+    if deficit > 0 {
+        msg!("Bad debt: deficit={}, uncovered={}", deficit, uncovered);
+    }
 
     // Mark position as liquidated
     position.status = PositionStatus::Liquidated;

@@ -93,6 +93,60 @@ impl Market {
             .map(|new_oi| new_oi <= self.max_open_interest)
             .unwrap_or(false)
     }
+
+    /// Credit `credit` to the insurance fund, then use the fund to absorb a
+    /// position's `deficit` (losses beyond its collateral).
+    /// Returns the part of the deficit the fund could not cover.
+    pub fn settle_insurance(&mut self, credit: u64, deficit: u64) -> u64 {
+        let (fund, uncovered) = apply_insurance(self.insurance_fund, credit, deficit);
+        self.insurance_fund = fund;
+        uncovered
+    }
+}
+
+/// Returns `(new_fund, uncovered_deficit)`.
+pub fn apply_insurance(fund: u64, credit: u64, deficit: u64) -> (u64, u64) {
+    let available = fund.saturating_add(credit);
+    let covered = deficit.min(available);
+    (available - covered, deficit - covered)
+}
+
+/// Split a position's final equity into what is paid out and what is owed.
+/// Returns `(payout, deficit)`; at most one of them is non-zero.
+pub fn split_equity(equity: i64) -> (u64, u64) {
+    if equity >= 0 {
+        (equity as u64, 0)
+    } else {
+        (0, equity.unsigned_abs())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credit_with_no_deficit_grows_fund() {
+        assert_eq!(apply_insurance(100, 5, 0), (105, 0));
+    }
+
+    #[test]
+    fn deficit_is_drawn_from_fund() {
+        assert_eq!(apply_insurance(100, 5, 30), (75, 0));
+    }
+
+    #[test]
+    fn deficit_beyond_fund_is_reported_uncovered() {
+        assert_eq!(apply_insurance(10, 5, 40), (0, 25));
+    }
+
+    #[test]
+    fn split_equity_handles_both_signs() {
+        assert_eq!(split_equity(250), (250, 0));
+        assert_eq!(split_equity(0), (0, 0));
+        assert_eq!(split_equity(-75), (0, 75));
+        assert_eq!(split_equity(i64::MIN), (0, i64::MIN.unsigned_abs()));
+    }
 }
 
 #[account]

@@ -1,7 +1,8 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use pyth_sdk_solana::load_price_feed_from_account_info;
-use crate::state::{Market, Position, Vault, UserAccount, Side, PositionStatus, ReferralCode, UserReferral};
+use crate::oracle::normalize_pyth_price;
+use crate::state::{split_equity, Market, Position, Vault, UserAccount, Side, PositionStatus, ReferralCode, UserReferral};
 use crate::errors::PerpsError;
 
 #[derive(Accounts)]
@@ -91,10 +92,8 @@ pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
 
     require!(price_data.price > 0, PerpsError::InvalidOraclePrice);
 
-    let oracle_price = (price_data.price as u64)
-        .checked_mul(10u64.pow((6 + price_data.expo.abs() as u32) as u32))
-        .and_then(|p| p.checked_div(10u64.pow(price_data.expo.abs() as u32)))
-        .ok_or(PerpsError::MathOverflow)? as u64;
+    let oracle_price = normalize_pyth_price(price_data.price, price_data.expo)
+        .ok_or(PerpsError::InvalidOraclePrice)?;
 
     // Calculate PnL
     let pnl = position.unrealized_pnl(oracle_price);
@@ -146,7 +145,7 @@ pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
 
     // Final settlement amount
     let total_pnl = pnl + funding_payment - fee as i64;
-    let settlement = (position.collateral as i64 + total_pnl).max(0) as u64;
+    let (settlement, deficit) = split_equity(position.collateral as i64 + total_pnl);
 
     // Update market OI
     match position.side {
@@ -160,9 +159,13 @@ pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
         }
     }
 
-    // Add fee to insurance fund (minus referral reward which stays for claiming)
+    // Add fee to insurance fund (minus referral reward which stays for claiming),
+    // then let the fund absorb any loss beyond the position's collateral.
     let insurance_fee = fee.saturating_sub(referral_reward);
-    market.insurance_fund = market.insurance_fund.saturating_add(insurance_fee);
+    let uncovered = market.settle_insurance(insurance_fee, deficit);
+    if deficit > 0 {
+        msg!("Bad debt: deficit={}, uncovered={}", deficit, uncovered);
+    }
 
     // Mark position as closed
     position.status = PositionStatus::Closed;

@@ -38,6 +38,11 @@ impl Vamm {
         let total_oi = self.total_long + self.total_short;
         let capacity = (self.base_reserve / 10) as u64; // 10% of base reserve
 
+        if capacity == 0 {
+            // Reserves too small to measure utilization; quote the widest spread.
+            return self.max_spread;
+        }
+
         if total_oi > capacity {
             let utilization = (total_oi * 10000) / capacity;
             let extra_spread = ((utilization - 10000) * (self.max_spread - self.base_spread) as u64 / 10000) as u32;
@@ -95,13 +100,20 @@ pub mod vamm {
         base_spread: u32,
         max_spread: u32,
     ) -> Result<()> {
+        require!(base_reserve > 0 && quote_reserve > 0, ErrorCode::InvalidParameters);
+        // Spreads are in basis points; >= 10000 would make the bid price underflow.
+        require!(base_spread <= max_spread && max_spread < 10_000, ErrorCode::InvalidParameters);
+        let k = base_reserve
+            .checked_mul(quote_reserve)
+            .ok_or(ErrorCode::InvalidParameters)?;
+
         let vamm = &mut ctx.accounts.vamm;
 
         vamm.market = ctx.accounts.market.key();
         vamm.authority = ctx.accounts.authority.key();
         vamm.base_reserve = base_reserve;
         vamm.quote_reserve = quote_reserve;
-        vamm.k = base_reserve * quote_reserve;
+        vamm.k = k;
         vamm.base_spread = base_spread;
         vamm.max_spread = max_spread;
         vamm.utilization_threshold = 8000; // 80%
@@ -256,4 +268,46 @@ pub enum ErrorCode {
     VammPaused,
     #[msg("Invalid liquidity ratio")]
     InvalidLiquidityRatio,
+    #[msg("Invalid vAMM parameters")]
+    InvalidParameters,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vamm(base_reserve: u128, total_long: u64) -> Vamm {
+        Vamm {
+            market: Pubkey::default(),
+            authority: Pubkey::default(),
+            base_reserve,
+            quote_reserve: 75 * base_reserve.max(1),
+            k: 0,
+            base_spread: 10,
+            max_spread: 100,
+            utilization_threshold: 8000,
+            total_long,
+            total_short: 0,
+            total_volume: 0,
+            bump: 0,
+            is_active: true,
+        }
+    }
+
+    #[test]
+    fn spread_does_not_divide_by_zero_with_tiny_reserves() {
+        assert_eq!(vamm(5, 1).get_spread(), 100);
+    }
+
+    #[test]
+    fn spread_is_base_below_capacity() {
+        assert_eq!(vamm(1_000, 50).get_spread(), 10);
+    }
+
+    #[test]
+    fn spread_widens_and_caps_above_capacity() {
+        // capacity = 100; 150 OI -> 150% utilization -> base + 50% of range
+        assert_eq!(vamm(1_000, 150).get_spread(), 55);
+        assert_eq!(vamm(1_000, 10_000).get_spread(), 100);
+    }
 }
