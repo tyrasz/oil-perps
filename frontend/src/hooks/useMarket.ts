@@ -1,21 +1,21 @@
 import { useEffect, useCallback, useRef } from 'react';
 import { useMarketStore, COMMODITIES } from '../stores/marketStore';
 import type { CommodityConfig } from '../config/commodities';
+import type { Trade } from '../types';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3003';
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3003/ws';
+const EMPTY_TRADES: Trade[] = [];
 
-export function useMarket() {
-  const {
-    selectedCommodity,
-    markets,
-    setMarket,
-    setOrderBook,
-    addTrade,
-    getCurrentMarket,
-    getCurrentOrderBook,
-    getCurrentTrades,
-  } = useMarketStore();
+/**
+ * Owns the market data feed: REST polling plus one WebSocket connection.
+ * Mount it exactly once (in App); components read the data via useMarket().
+ */
+export function useMarketFeed() {
+  const selectedCommodity = useMarketStore((s) => s.selectedCommodity);
+  const setMarket = useMarketStore((s) => s.setMarket);
+  const setOrderBook = useMarketStore((s) => s.setOrderBook);
+  const addTrade = useMarketStore((s) => s.addTrade);
 
   const wsRef = useRef<WebSocket | null>(null);
   const subscribedCommoditiesRef = useRef<Set<string>>(new Set());
@@ -129,28 +129,30 @@ export function useMarket() {
     subscribedCommoditiesRef.current.add(commodity.id);
   }, []);
 
-  // WebSocket connection for real-time updates
+  // WebSocket connection for real-time updates. Opened once; handlers read the
+  // latest store state so price updates don't tear down the connection.
   useEffect(() => {
-    let reconnectTimeout: NodeJS.Timeout;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | undefined;
+    let disposed = false;
 
     const connect = () => {
-      wsRef.current = new WebSocket(WS_URL);
+      const ws = new WebSocket(WS_URL);
+      wsRef.current = ws;
 
-      wsRef.current.onopen = () => {
-        console.log('WebSocket connected');
+      ws.onopen = () => {
         subscribedCommoditiesRef.current.clear();
-        // Subscribe to current commodity
-        subscribeToCommodity(selectedCommodity);
+        subscribeToCommodity(useMarketStore.getState().selectedCommodity);
       };
 
-      wsRef.current.onmessage = (event) => {
+      ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          const commodityId = data.commodity || selectedCommodity.id;
+          const state = useMarketStore.getState();
+          const commodityId = data.commodity || state.selectedCommodity.id;
 
           switch (data.type) {
             case 'price': {
-              const currentMarket = markets[commodityId];
+              const currentMarket = state.markets[commodityId];
               if (currentMarket) {
                 setMarket(commodityId, {
                   ...currentMarket,
@@ -176,12 +178,12 @@ export function useMarket() {
         }
       };
 
-      wsRef.current.onclose = () => {
-        console.log('WebSocket disconnected, reconnecting...');
+      ws.onclose = () => {
+        if (disposed) return;
         reconnectTimeout = setTimeout(connect, 3000);
       };
 
-      wsRef.current.onerror = (error) => {
+      ws.onerror = (error) => {
         console.error('WebSocket error:', error);
       };
     };
@@ -189,10 +191,12 @@ export function useMarket() {
     connect();
 
     return () => {
+      disposed = true;
       clearTimeout(reconnectTimeout);
       wsRef.current?.close();
+      wsRef.current = null;
     };
-  }, [selectedCommodity, markets, setMarket, addTrade, subscribeToCommodity]);
+  }, [setMarket, addTrade, subscribeToCommodity]);
 
   // Fetch data for selected commodity when it changes
   useEffect(() => {
@@ -215,21 +219,22 @@ export function useMarket() {
     });
   }, [fetchMarket]);
 
+}
+
+/** Read-only view of market data for the selected commodity. */
+export function useMarket() {
+  const selectedCommodity = useMarketStore((s) => s.selectedCommodity);
+  const markets = useMarketStore((s) => s.markets);
+  const market = useMarketStore((s) => s.markets[s.selectedCommodity.id] ?? null);
+  const orderBook = useMarketStore((s) => s.orderBooks[s.selectedCommodity.id] ?? null);
+  const recentTrades = useMarketStore((s) => s.recentTrades[s.selectedCommodity.id] ?? EMPTY_TRADES);
+
   return {
-    // Current commodity
     selectedCommodity,
-    market: getCurrentMarket(),
-    orderBook: getCurrentOrderBook(),
-    recentTrades: getCurrentTrades(),
-
-    // All markets (for mini-charts, etc.)
+    market,
+    orderBook,
+    recentTrades,
     markets,
-
-    // Refresh functions
-    refreshMarket: () => fetchMarket(selectedCommodity),
-    refreshOrderBook: () => fetchOrderBook(selectedCommodity),
-
-    // Available commodities
     commodities: COMMODITIES,
   };
 }

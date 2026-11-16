@@ -16,12 +16,16 @@ import { PortfolioAnalytics } from './components/PortfolioAnalytics';
 import { PriceAlerts } from './components/PriceAlerts';
 import { ReferralPanel } from './components/ReferralPanel';
 import { useTriggerOrderMonitor } from './hooks/useTriggerOrderMonitor';
+import { useMarketFeed } from './hooks/useMarket';
 import './App.css';
 
 type Tab = 'positions' | 'orders' | 'trades' | 'account' | 'vault' | 'mm' | 'analytics' | 'alerts' | 'referrals';
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('positions');
+
+  // Single app-wide market data feed (REST polling + WebSocket)
+  useMarketFeed();
 
   // Initialize trigger order monitoring (TP/SL execution)
   useTriggerOrderMonitor();
