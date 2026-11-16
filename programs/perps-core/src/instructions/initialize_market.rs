@@ -5,6 +5,7 @@ use crate::errors::PerpsError;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct InitializeMarketParams {
+    pub commodity: String,              // Commodity identifier (e.g., "OIL", "GOLD")
     pub max_leverage: u32,
     pub maintenance_margin_ratio: u32,
     pub initial_margin_ratio: u32,
@@ -59,6 +60,7 @@ pub struct InitializeMarket<'info> {
 }
 
 pub fn handler(ctx: Context<InitializeMarket>, params: InitializeMarketParams) -> Result<()> {
+    require!(!params.commodity.is_empty() && params.commodity.len() <= 8, PerpsError::InvalidMarketConfig);
     require!(params.max_leverage > 0 && params.max_leverage <= 100_000, PerpsError::InvalidMarketConfig);
     require!(params.maintenance_margin_ratio > 0, PerpsError::InvalidMarketConfig);
     require!(params.initial_margin_ratio > params.maintenance_margin_ratio, PerpsError::InvalidMarketConfig);
@@ -68,6 +70,7 @@ pub fn handler(ctx: Context<InitializeMarket>, params: InitializeMarketParams) -
     market.collateral_mint = ctx.accounts.collateral_mint.key();
     market.vault = ctx.accounts.vault.key();
     market.pyth_price_feed = ctx.accounts.pyth_price_feed.key();
+    market.commodity = Market::commodity_from_str(&params.commodity);
 
     market.max_leverage = params.max_leverage;
     market.maintenance_margin_ratio = params.maintenance_margin_ratio;
@@ -95,6 +98,6 @@ pub fn handler(ctx: Context<InitializeMarket>, params: InitializeMarketParams) -
     vault.total_deposits = 0;
     vault.bump = *ctx.bumps.get("vault").unwrap();
 
-    msg!("Market initialized: {}", market.key());
+    msg!("Market initialized: {} for commodity: {}", market.key(), params.commodity);
     Ok(())
 }

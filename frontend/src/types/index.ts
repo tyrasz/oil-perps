@@ -1,6 +1,7 @@
 export interface Position {
   address: string;
   owner: string;
+  commodity: string;          // Commodity ID (e.g., 'OIL', 'GOLD')
   side: 'long' | 'short';
   size: number;
   collateral: number;
@@ -11,9 +12,26 @@ export interface Position {
   openedAt: number;
 }
 
+export interface ClosedPosition {
+  address: string;
+  owner: string;
+  commodity: string;
+  side: 'long' | 'short';
+  size: number;
+  collateral: number;
+  entryPrice: number;
+  exitPrice: number;
+  leverage: number;
+  realizedPnl: number;
+  openedAt: number;
+  closedAt: number;
+  status: 'closed' | 'liquidated';
+}
+
 export interface Order {
   address: string;
   owner: string;
+  commodity: string;          // Commodity ID (e.g., 'OIL', 'GOLD')
   side: 'bid' | 'ask';
   orderType: 'limit' | 'market' | 'stop_loss' | 'take_profit';
   price: number;
@@ -25,6 +43,7 @@ export interface Order {
 
 export interface Trade {
   signature: string;
+  commodity: string;          // Commodity ID (e.g., 'OIL', 'GOLD')
   side: 'long' | 'short';
   price: number;
   size: number;
@@ -33,6 +52,7 @@ export interface Trade {
 
 export interface MarketData {
   address: string;
+  commodity: string;          // Commodity ID (e.g., 'OIL', 'GOLD')
   price: number;
   priceChange24h: number;
   volume24h: number;
@@ -66,3 +86,72 @@ export interface UserAccount {
 
 export type OrderSide = 'long' | 'short';
 export type OrderType = 'market' | 'limit';
+
+// Trigger orders for TP/SL
+export interface TriggerOrder {
+  id: string;
+  positionAddress: string;
+  type: 'take_profit' | 'stop_loss';
+  triggerPrice: number;
+  closePercent: number; // 0-100, percentage of position to close
+  createdAt: number;
+  status: 'active' | 'triggered' | 'cancelled';
+}
+
+// Price alert
+export interface PriceAlert {
+  id: string;
+  commodity: string;
+  condition: 'above' | 'below';
+  targetPrice: number;
+  createdAt: number;
+  triggered: boolean;
+  notified: boolean;
+}
+
+// Portfolio metrics
+export interface PortfolioMetrics {
+  totalValue: number;
+  totalPnl: number;
+  totalPnlPercent: number;
+  winRate: number;
+  totalTrades: number;
+  avgWin: number;
+  avgLoss: number;
+  largestWin: number;
+  largestLoss: number;
+  profitFactor: number;
+}
+
+// Referral system
+export interface ReferralCode {
+  code: string;
+  ownerWallet: string;
+  createdAt: number;
+  discountPercent: number; // Discount for referred users (e.g., 10 = 10% off fees)
+  rewardPercent: number;   // Reward for referrer (e.g., 20 = 20% of fees)
+}
+
+export interface ReferralStats {
+  code: string;
+  totalReferred: number;
+  totalVolume: number;
+  totalRewardsEarned: number;
+  pendingRewards: number;
+  referrals: ReferralRecord[];
+}
+
+export interface ReferralRecord {
+  walletAddress: string;
+  joinedAt: number;
+  totalVolume: number;
+  totalFeesGenerated: number;
+  rewardsEarned: number;
+}
+
+export interface AppliedReferral {
+  code: string;
+  referrerWallet: string;
+  appliedAt: number;
+  discountPercent: number;
+}

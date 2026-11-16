@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use pyth_sdk_solana::load_price_feed_from_account_info;
-use crate::state::{Market, Position, Vault, UserAccount, Side, PositionStatus};
+use crate::state::{Market, Position, Vault, UserAccount, Side, PositionStatus, ReferralCode, UserReferral};
 use crate::errors::PerpsError;
 
 #[derive(Accounts)]
@@ -58,6 +58,21 @@ pub struct ClosePosition<'info> {
     pub pyth_price_feed: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
+
+    // Optional referral accounts - if user has a referral, include these
+    #[account(
+        mut,
+        seeds = [b"user_referral", owner.key().as_ref()],
+        bump = user_referral.bump,
+    )]
+    pub user_referral: Option<Account<'info, UserReferral>>,
+
+    #[account(
+        mut,
+        seeds = [b"referral_code", referral_code.code.as_ref()],
+        bump = referral_code.bump,
+    )]
+    pub referral_code: Option<Account<'info, ReferralCode>>,
 }
 
 pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
@@ -93,7 +108,41 @@ pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
 
     // Calculate fees
     let notional = position.notional_value();
-    let fee = (notional as u128 * market.taker_fee as u128 / 10000) as u64;
+    let base_fee = (notional as u128 * market.taker_fee as u128 / 10000) as u64;
+
+    // Process referral if user has one
+    let (fee, referral_reward) = if let (Some(user_referral), Some(referral_code)) =
+        (&mut ctx.accounts.user_referral, &mut ctx.accounts.referral_code)
+    {
+        // Validate referral relationship
+        if user_referral.referral_code == referral_code.key() && referral_code.is_active {
+            // Calculate discounted fee for user
+            let discount = (base_fee as u128 * user_referral.discount_bps as u128 / 10000) as u64;
+            let discounted_fee = base_fee.saturating_sub(discount);
+
+            // Calculate reward for referrer (based on discounted fee to prevent gaming)
+            let reward = (discounted_fee as u128 * referral_code.reward_bps as u128 / 10000) as u64;
+
+            // Update user referral stats (FIXES SYBIL ATTACK - tracked on actual trades)
+            user_referral.total_volume = user_referral.total_volume.saturating_add(notional);
+            user_referral.total_fees_paid = user_referral.total_fees_paid.saturating_add(discounted_fee);
+            user_referral.total_referrer_rewards = user_referral.total_referrer_rewards.saturating_add(reward);
+
+            // Update referral code stats
+            referral_code.total_volume = referral_code.total_volume.saturating_add(notional);
+            referral_code.total_fees_generated = referral_code.total_fees_generated.saturating_add(discounted_fee);
+            referral_code.total_rewards_earned = referral_code.total_rewards_earned.saturating_add(reward);
+            referral_code.pending_rewards = referral_code.pending_rewards.saturating_add(reward);
+
+            msg!("Referral processed: discount={}, reward={}", discount, reward);
+
+            (discounted_fee, reward)
+        } else {
+            (base_fee, 0)
+        }
+    } else {
+        (base_fee, 0)
+    };
 
     // Final settlement amount
     let total_pnl = pnl + funding_payment - fee as i64;
@@ -111,8 +160,9 @@ pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
         }
     }
 
-    // Add fee to insurance fund
-    market.insurance_fund = market.insurance_fund.saturating_add(fee);
+    // Add fee to insurance fund (minus referral reward which stays for claiming)
+    let insurance_fee = fee.saturating_sub(referral_reward);
+    market.insurance_fund = market.insurance_fund.saturating_add(insurance_fee);
 
     // Mark position as closed
     position.status = PositionStatus::Closed;

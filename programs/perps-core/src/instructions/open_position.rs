@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use pyth_sdk_solana::load_price_feed_from_account_info;
-use crate::state::{Market, Position, UserAccount, Side, PositionStatus};
+use crate::state::{Market, Position, UserAccount, Side, PositionStatus, ExecutionSource};
 use crate::errors::PerpsError;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
@@ -131,6 +131,7 @@ pub fn handler(ctx: Context<OpenPosition>, params: OpenPositionParams) -> Result
     position.opened_at = current_time;
     position.last_updated_at = current_time;
     position.status = PositionStatus::Open;
+    position.execution_source = ExecutionSource::OrderBook;
     position.bump = *ctx.bumps.get("position").unwrap();
 
     // Update market OI

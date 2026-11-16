@@ -5,11 +5,10 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-solana-client = "1.14"
-solana-sdk = "1.14"
-solana-transaction-status = "1.14"
-anchor-client = "0.24.2"
-sqlx = { version = "0.7", features = ["runtime-tokio", "postgres"] }
+solana-sdk = "1.17"
+solana-transaction-status = "1.17"
+anchor-client = "0.29.0"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"

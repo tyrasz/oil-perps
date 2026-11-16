@@ -1,10 +1,24 @@
-use solana_client::rpc_client::RpcClient;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
+use tokio::sync::RwLock as TokioRwLock;
+use crate::oracle::OracleService;
+
+/// Simulated trade from demo bot
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SimulatedTrade {
+    pub commodity: String,
+    pub side: String,
+    pub price: u64,
+    pub size: u64,
+    pub timestamp: i64,
+    pub maker: String,
+    pub taker: String,
+}
 
 pub struct AppState {
-    pub rpc_client: RpcClient,
-    pub cached_price: RwLock<Option<u64>>,
+    pub rpc_url: String,
     pub cached_orderbook: RwLock<Option<OrderBookSnapshot>>,
+    pub oracle_service: Arc<OracleService>,
+    pub recent_trades: Arc<TokioRwLock<Vec<SimulatedTrade>>>,
 }
 
 #[derive(Clone)]
@@ -17,9 +31,10 @@ pub struct OrderBookSnapshot {
 impl AppState {
     pub fn new(rpc_url: &str) -> Self {
         Self {
-            rpc_client: RpcClient::new(rpc_url.to_string()),
-            cached_price: RwLock::new(None),
+            rpc_url: rpc_url.to_string(),
             cached_orderbook: RwLock::new(None),
+            oracle_service: Arc::new(OracleService::new()),
+            recent_trades: Arc::new(TokioRwLock::new(Vec::new())),
         }
     }
 }

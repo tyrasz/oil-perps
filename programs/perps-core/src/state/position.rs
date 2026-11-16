@@ -15,6 +15,13 @@ pub enum PositionStatus {
     Liquidated,
 }
 
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionSource {
+    #[default]
+    OrderBook,
+    Amm,
+}
+
 #[account]
 #[derive(Default)]
 pub struct Position {
@@ -37,6 +44,7 @@ pub struct Position {
     pub last_updated_at: i64,
 
     pub status: PositionStatus,
+    pub execution_source: ExecutionSource,
     pub bump: u8,
 }
 
@@ -54,6 +62,7 @@ impl Position {
         8 +   // opened_at
         8 +   // last_updated_at
         1 +   // status
+        1 +   // execution_source
         1 +   // bump
         32;   // padding
 

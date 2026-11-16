@@ -7,6 +7,9 @@ pub mod close_position;
 pub mod add_margin;
 pub mod liquidate;
 pub mod update_funding;
+pub mod create_referral_code;
+pub mod apply_referral_code;
+pub mod claim_referral_rewards;
 
 pub use initialize_market::*;
 pub use initialize_user::*;
@@ -17,3 +20,6 @@ pub use close_position::*;
 pub use add_margin::*;
 pub use liquidate::*;
 pub use update_funding::*;
+pub use create_referral_code::*;
+pub use apply_referral_code::*;
+pub use claim_referral_rewards::*;

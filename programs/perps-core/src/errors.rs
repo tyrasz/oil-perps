@@ -55,4 +55,32 @@ pub enum PerpsError {
 
     #[msg("Insufficient vault balance")]
     InsufficientVaultBalance,
+
+    // Referral errors
+    #[msg("Invalid referral code format")]
+    InvalidReferralCode,
+
+    #[msg("Referral code already exists")]
+    ReferralCodeExists,
+
+    #[msg("Referral code not found")]
+    ReferralCodeNotFound,
+
+    #[msg("Cannot use your own referral code")]
+    SelfReferralNotAllowed,
+
+    #[msg("User already has a referral applied")]
+    ReferralAlreadyApplied,
+
+    #[msg("User already has a referral code")]
+    UserAlreadyHasCode,
+
+    #[msg("No rewards available to claim")]
+    NoRewardsToClaim,
+
+    #[msg("Referral code is inactive")]
+    ReferralCodeInactive,
+
+    #[msg("Invalid referral parameters")]
+    InvalidReferralParams,
 }

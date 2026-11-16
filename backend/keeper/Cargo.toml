@@ -5,12 +5,20 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-solana-client = "1.14"
-solana-sdk = "1.14"
-anchor-client = "0.24.2"
+solana-sdk = "1.17"
+solana-client = "1.17"
+solana-account-decoder = "1.17"
+anchor-client = "0.29.0"
+anchor-lang = "0.29.0"
+spl-token = "4.0"
+spl-associated-token-account = "2.2"
+pyth-sdk-solana = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 dotenvy = "0.15"
+shellexpand = "3.1"
+borsh = "0.10"
+bs58 = "0.5"
