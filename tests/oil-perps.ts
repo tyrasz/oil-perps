@@ -582,33 +582,42 @@ describe("oil-perps", () => {
       expect(fee).to.equal(2_000_000); // $2
     });
 
-    it("should calculate liquidation fee correctly", () => {
-      const remainingCollateral = 1_000_000_000; // $1,000
+    it("should calculate liquidation reward from maintenance margin", () => {
+      // reward = notional * maintenance_margin_ratio * liquidation_fee / 10000^2
+      // Based on the margin requirement, not the collateral left, so it is
+      // still paid (from the insurance fund) when a position is underwater.
+      const notional = 10_000_000_000; // $10,000
+      const maintenanceMarginRatio = 500; // 5%
       const liquidationFee = 250; // 2.5%
-      const reward = (remainingCollateral * liquidationFee) / 10000;
-      expect(reward).to.equal(25_000_000); // $25
+      const reward = (notional * maintenanceMarginRatio * liquidationFee) / 100_000_000;
+      expect(reward).to.equal(12_500_000); // $12.50
     });
   });
 
   describe("Funding calculations", () => {
+    // payment = size * price / 1e6 (notional, USDC) * rate_diff / 1e6
+    const size = 100_000_000; // 100 contracts
+    const price = 75_000_000; // $75
+    const fundingRate = 100; // cumulative 0.01%
+    const lastFundingPayment = 50;
+    const notional = (size * price) / 1_000_000; // $7,500
+    const fundingDiff = fundingRate - lastFundingPayment; // 0.005%
+
     it("should calculate funding payment for long position", () => {
       // Long pays funding when funding_rate is positive
-      const size = 100_000_000; // 100 contracts
-      const fundingRate = 100; // 0.01%
-      const lastFundingPayment = 50;
-      const fundingDiff = fundingRate - lastFundingPayment;
-      const fundingPayment = -(size * fundingDiff) / 1_000_000; // Long pays
-      expect(fundingPayment).to.equal(-5); // Pays 5 units
+      const fundingPayment = -(notional * fundingDiff) / 1_000_000;
+      expect(fundingPayment).to.equal(-375_000); // Pays $0.375
     });
 
     it("should calculate funding payment for short position", () => {
       // Short receives funding when funding_rate is positive
-      const size = 100_000_000;
-      const fundingRate = 100;
-      const lastFundingPayment = 50;
-      const fundingDiff = fundingRate - lastFundingPayment;
-      const fundingPayment = (size * fundingDiff) / 1_000_000; // Short receives
-      expect(fundingPayment).to.equal(5); // Receives 5 units
+      const fundingPayment = (notional * fundingDiff) / 1_000_000;
+      expect(fundingPayment).to.equal(375_000); // Receives $0.375
+    });
+
+    it("should scale funding with price", () => {
+      const notionalAt150 = (size * 150_000_000) / 1_000_000;
+      expect((notionalAt150 * fundingDiff) / 1_000_000).to.equal(750_000);
     });
   });
 

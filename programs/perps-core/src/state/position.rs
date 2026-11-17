@@ -88,9 +88,32 @@ impl Position {
         ((size * price_diff) / 1_000_000) as i64
     }
 
-    pub fn margin_ratio(&self, current_price: u64) -> u32 {
+    /// Funding accrued since the position last settled, in collateral units
+    /// (USDC, 6 decimals). Positive means the position is owed funding.
+    ///
+    /// `cumulative_funding_rate` is the market's running sum of per-period
+    /// rates (6 decimals, 100 = 0.01%). The payment is that rate applied to the
+    /// position's notional at `price`, so it scales with the commodity's price.
+    pub fn accrued_funding(&self, cumulative_funding_rate: i64, price: u64) -> i64 {
+        let rate_diff = cumulative_funding_rate as i128 - self.last_funding_payment as i128;
+        let notional = (self.size as i128) * (price as i128) / 1_000_000;
+        let payment = notional * rate_diff / 1_000_000;
+
+        // Positive rate: longs pay shorts.
+        let signed = match self.side {
+            Side::Long => -payment,
+            Side::Short => payment,
+        };
+        signed.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    }
+
+    /// Equity (collateral + unrealized PnL + accrued funding) as a share of
+    /// notional, in basis points.
+    pub fn margin_ratio(&self, current_price: u64, accrued_funding: i64) -> u32 {
         let pnl = self.unrealized_pnl(current_price);
-        let equity = (self.collateral as i64).saturating_add(pnl);
+        let equity = (self.collateral as i64)
+            .saturating_add(pnl)
+            .saturating_add(accrued_funding);
 
         if equity <= 0 {
             return 0;
@@ -102,11 +125,17 @@ impl Position {
         }
 
         // margin_ratio = equity / notional * 10000 (basis points)
-        ((equity as u64) * 10000 / notional) as u32
+        let ratio = (equity as u128) * 10_000 / notional as u128;
+        ratio.min(u32::MAX as u128) as u32
     }
 
-    pub fn is_liquidatable(&self, current_price: u64, maintenance_margin_ratio: u32) -> bool {
-        self.margin_ratio(current_price) < maintenance_margin_ratio
+    pub fn is_liquidatable(
+        &self,
+        current_price: u64,
+        accrued_funding: i64,
+        maintenance_margin_ratio: u32,
+    ) -> bool {
+        self.margin_ratio(current_price, accrued_funding) < maintenance_margin_ratio
     }
 }
 
@@ -123,4 +152,63 @@ pub struct UserAccount {
 
 impl UserAccount {
     pub const LEN: usize = 8 + 32 + 8 + 4 + 8 + 8 + 1 + 16;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const USDC: i64 = 1_000_000;
+
+    /// 100 contracts of oil at $75 with $750 collateral (10x).
+    fn oil_position(side: Side) -> Position {
+        Position {
+            side,
+            size: 100 * 1_000_000,
+            collateral: 750 * USDC as u64,
+            entry_price: 75_000_000,
+            last_funding_payment: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn funding_scales_with_notional_not_contract_count() {
+        // 0.01% on $7,500 notional = $0.75
+        let long = oil_position(Side::Long);
+        assert_eq!(long.accrued_funding(100, 75_000_000), -750_000);
+        // Same rate at $150 oil costs twice as much
+        assert_eq!(long.accrued_funding(100, 150_000_000), -1_500_000);
+    }
+
+    #[test]
+    fn funding_sign_depends_on_side_and_rate() {
+        assert_eq!(oil_position(Side::Short).accrued_funding(100, 75_000_000), 750_000);
+        assert_eq!(oil_position(Side::Long).accrued_funding(-100, 75_000_000), 750_000);
+    }
+
+    #[test]
+    fn funding_only_counts_since_last_settlement() {
+        let mut long = oil_position(Side::Long);
+        long.last_funding_payment = 300;
+        assert_eq!(long.accrued_funding(400, 75_000_000), -750_000);
+        assert_eq!(long.accrued_funding(300, 75_000_000), 0);
+    }
+
+    #[test]
+    fn margin_ratio_includes_accrued_funding() {
+        let long = oil_position(Side::Long);
+        // $750 equity on $7,500 notional = 10%
+        assert_eq!(long.margin_ratio(75_000_000, 0), 1_000);
+        // $400 of unpaid funding leaves $350 = 4.67%
+        assert_eq!(long.margin_ratio(75_000_000, -400 * USDC), 466);
+        assert!(!long.is_liquidatable(75_000_000, 0, 500));
+        assert!(long.is_liquidatable(75_000_000, -400 * USDC, 500));
+    }
+
+    #[test]
+    fn margin_ratio_is_zero_when_underwater() {
+        // $10 drop on 100 contracts = -$1,000 > $750 collateral
+        assert_eq!(oil_position(Side::Long).margin_ratio(65_000_000, 0), 0);
+    }
 }

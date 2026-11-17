@@ -104,6 +104,65 @@ impl Market {
     }
 }
 
+impl Market {
+    /// Collateral to post for a position of `notional` at `leverage`
+    /// (3 decimals, 10x = 10_000): `notional / leverage`, rounded up.
+    /// Returns `None` if that is below the initial margin requirement, i.e.
+    /// the leverage is higher than the market's initial margin allows.
+    pub fn required_collateral(&self, notional: u64, leverage: u32) -> Option<u64> {
+        if leverage == 0 {
+            return None;
+        }
+        let collateral = ceil_div(notional as u128 * 1_000, leverage as u128);
+        let initial_margin = ceil_div(notional as u128 * self.initial_margin_ratio as u128, 10_000);
+        if collateral < initial_margin {
+            return None;
+        }
+        u64::try_from(collateral).ok()
+    }
+
+    /// Liquidator reward: `liquidation_fee` applied to the position's
+    /// maintenance margin. Basing it on the margin requirement rather than on
+    /// whatever collateral is left keeps the reward from falling to zero on
+    /// positions that are already underwater, which are the ones that most
+    /// need liquidating.
+    pub fn liquidation_reward_target(&self, notional: u64) -> u64 {
+        let reward = (notional as u128)
+            * self.maintenance_margin_ratio as u128
+            * self.liquidation_fee as u128
+            / 100_000_000;
+        reward.min(u64::MAX as u128) as u64
+    }
+
+    /// Settle a liquidation against the insurance fund.
+    /// Returns `(liquidator_reward, uncovered_bad_debt)`.
+    pub fn settle_liquidation(&mut self, remaining_collateral: u64, deficit: u64, notional: u64) -> (u64, u64) {
+        let target = self.liquidation_reward_target(notional);
+        let (reward, fund, uncovered) =
+            liquidation_payout(self.insurance_fund, remaining_collateral, deficit, target);
+        self.insurance_fund = fund;
+        (reward, uncovered)
+    }
+}
+
+/// Split a liquidated position between the liquidator and the insurance fund.
+///
+/// The reward is paid from the position's remaining collateral first; any
+/// shortfall is topped up from the insurance fund (as far as it can). Leftover
+/// collateral goes to the fund, which then absorbs any bad debt.
+/// Returns `(reward, new_fund, uncovered_bad_debt)`.
+pub fn liquidation_payout(fund: u64, remaining_collateral: u64, deficit: u64, reward_target: u64) -> (u64, u64, u64) {
+    let from_collateral = reward_target.min(remaining_collateral);
+    let fund = fund.saturating_add(remaining_collateral - from_collateral);
+    let top_up = (reward_target - from_collateral).min(fund);
+    let (fund, uncovered) = apply_insurance(fund - top_up, 0, deficit);
+    (from_collateral + top_up, fund, uncovered)
+}
+
+fn ceil_div(a: u128, b: u128) -> u128 {
+    (a + b - 1) / b
+}
+
 /// Returns `(new_fund, uncovered_deficit)`.
 pub fn apply_insurance(fund: u64, credit: u64, deficit: u64) -> (u64, u64) {
     let available = fund.saturating_add(credit);
@@ -138,6 +197,72 @@ mod tests {
     #[test]
     fn deficit_beyond_fund_is_reported_uncovered() {
         assert_eq!(apply_insurance(10, 5, 40), (0, 25));
+    }
+
+    /// OIL as configured by scripts/initialize-market.ts.
+    fn oil_market() -> Market {
+        Market {
+            max_leverage: 20_000,
+            initial_margin_ratio: 1_000,
+            maintenance_margin_ratio: 500,
+            liquidation_fee: 100,
+            ..Default::default()
+        }
+    }
+
+    const NOTIONAL: u64 = 7_500_000_000; // $7,500
+
+    #[test]
+    fn collateral_follows_chosen_leverage() {
+        let m = oil_market();
+        assert_eq!(m.required_collateral(NOTIONAL, 2_000), Some(3_750_000_000)); // 2x
+        assert_eq!(m.required_collateral(NOTIONAL, 5_000), Some(1_500_000_000)); // 5x
+        assert_eq!(m.required_collateral(NOTIONAL, 10_000), Some(750_000_000)); // 10x
+    }
+
+    #[test]
+    fn leverage_above_initial_margin_is_rejected() {
+        // 10% initial margin caps leverage at 10x even though max_leverage is 20x
+        let m = oil_market();
+        assert_eq!(m.required_collateral(NOTIONAL, 10_001), None);
+        assert_eq!(m.required_collateral(NOTIONAL, 20_000), None);
+        assert_eq!(m.required_collateral(NOTIONAL, 0), None);
+    }
+
+    #[test]
+    fn collateral_rounds_up() {
+        // $1 at 3x = 0.333334
+        let m = Market { initial_margin_ratio: 1_000, ..Default::default() };
+        assert_eq!(m.required_collateral(1_000_000, 3_000), Some(333_334));
+    }
+
+    #[test]
+    fn liquidation_reward_is_share_of_maintenance_margin() {
+        // 1% of the 5% maintenance margin on $7,500 = $3.75
+        assert_eq!(oil_market().liquidation_reward_target(NOTIONAL), 3_750_000);
+    }
+
+    #[test]
+    fn liquidation_reward_comes_from_collateral_when_available() {
+        // $40 left, $3 reward: liquidator gets $3, fund gets the other $37
+        assert_eq!(liquidation_payout(100, 40, 0, 3), (3, 137, 0));
+    }
+
+    #[test]
+    fn underwater_liquidation_still_pays_reward_from_fund() {
+        // Nothing left and $25 of bad debt: fund pays the $3 reward and the debt
+        assert_eq!(liquidation_payout(100, 0, 25, 3), (3, 72, 0));
+    }
+
+    #[test]
+    fn partial_collateral_is_topped_up_from_fund() {
+        assert_eq!(liquidation_payout(100, 1, 0, 3), (3, 98, 0));
+    }
+
+    #[test]
+    fn empty_fund_limits_reward_and_reports_bad_debt() {
+        assert_eq!(liquidation_payout(0, 0, 25, 3), (0, 0, 25));
+        assert_eq!(liquidation_payout(2, 0, 25, 3), (2, 0, 25));
     }
 
     #[test]

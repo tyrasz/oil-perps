@@ -82,21 +82,20 @@ pub fn handler(ctx: Context<Liquidate>) -> Result<()> {
     let oracle_price = normalize_pyth_price(price_data.price, price_data.expo)
         .ok_or(PerpsError::InvalidOraclePrice)?;
 
+    // Unpaid funding counts against the position's equity
+    let funding_payment = position.accrued_funding(market.funding_rate, oracle_price);
+
     // Check if position is liquidatable
     require!(
-        position.is_liquidatable(oracle_price, market.maintenance_margin_ratio),
+        position.is_liquidatable(oracle_price, funding_payment, market.maintenance_margin_ratio),
         PerpsError::NotLiquidatable
     );
 
     // Calculate liquidation amounts
     let pnl = position.unrealized_pnl(oracle_price);
-    let (remaining_collateral, deficit) = split_equity(position.collateral as i64 + pnl);
-
-    // Liquidation fee goes to liquidator
-    let liquidation_reward = (remaining_collateral as u128 * market.liquidation_fee as u128 / 10000) as u64;
-
-    // Remainder goes to insurance fund
-    let to_insurance = remaining_collateral.saturating_sub(liquidation_reward);
+    let total_pnl = pnl.saturating_add(funding_payment);
+    let (remaining_collateral, deficit) =
+        split_equity((position.collateral as i64).saturating_add(total_pnl));
 
     // Update market OI
     match position.side {
@@ -110,19 +109,22 @@ pub fn handler(ctx: Context<Liquidate>) -> Result<()> {
         }
     }
 
-    // Add to insurance fund, which also absorbs any loss beyond the collateral
-    let uncovered = market.settle_insurance(to_insurance, deficit);
+    // Pay the liquidator (topped up from the insurance fund if needed); the rest
+    // goes to the fund, which also absorbs any loss beyond the collateral.
+    let insurance_before = market.insurance_fund;
+    let (liquidation_reward, uncovered) =
+        market.settle_liquidation(remaining_collateral, deficit, position.notional_value());
     if deficit > 0 {
         msg!("Bad debt: deficit={}, uncovered={}", deficit, uncovered);
     }
 
     // Mark position as liquidated
     position.status = PositionStatus::Liquidated;
-    position.realized_pnl = pnl;
+    position.realized_pnl = total_pnl;
     position.last_updated_at = current_time;
 
     // Update user stats
-    user_account.realized_pnl = user_account.realized_pnl.saturating_add(pnl);
+    user_account.realized_pnl = user_account.realized_pnl.saturating_add(total_pnl);
 
     // Pay liquidator
     if liquidation_reward > 0 {
@@ -149,11 +151,12 @@ pub fn handler(ctx: Context<Liquidate>) -> Result<()> {
     }
 
     msg!(
-        "Position liquidated: owner={}, size={}, reward={}, insurance={}",
+        "Position liquidated: owner={}, size={}, reward={}, insurance_fund={} -> {}",
         position.owner,
         position.size,
         liquidation_reward,
-        to_insurance
+        insurance_before,
+        market.insurance_fund
     );
 
     Ok(())

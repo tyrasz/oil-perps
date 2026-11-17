@@ -98,12 +98,8 @@ pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
     // Calculate PnL
     let pnl = position.unrealized_pnl(oracle_price);
 
-    // Calculate funding payment
-    let funding_diff = market.funding_rate - position.last_funding_payment;
-    let funding_payment = match position.side {
-        Side::Long => -((position.size as i64 * funding_diff) / 1_000_000),
-        Side::Short => (position.size as i64 * funding_diff) / 1_000_000,
-    };
+    // Funding accrued since open, in collateral units
+    let funding_payment = position.accrued_funding(market.funding_rate, oracle_price);
 
     // Calculate fees
     let notional = position.notional_value();

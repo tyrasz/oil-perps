@@ -77,16 +77,15 @@ pub fn handler(ctx: Context<OpenPosition>, params: OpenPositionParams) -> Result
 
     // Calculate required collateral
     // notional = size * price / 1_000_000
-    // required_collateral = notional * initial_margin_ratio / 10000
+    // required_collateral = notional / leverage (must meet initial margin)
     let notional = (params.size as u128)
         .checked_mul(oracle_price as u128)
         .and_then(|v| v.checked_div(1_000_000))
         .ok_or(PerpsError::MathOverflow)? as u64;
 
-    let required_collateral = (notional as u128)
-        .checked_mul(market.initial_margin_ratio as u128)
-        .and_then(|v| v.checked_div(10000))
-        .ok_or(PerpsError::MathOverflow)? as u64;
+    let required_collateral = market
+        .required_collateral(notional, params.leverage)
+        .ok_or(PerpsError::ExcessiveLeverage)?;
 
     require!(
         user_account.collateral_balance >= required_collateral,
