@@ -1,5 +1,5 @@
 use crate::{KeeperConfig, get_market_pda};
-use crate::liquidator::MarketData;
+use crate::liquidator::{anchor_discriminator, MarketData};
 use borsh::BorshDeserialize;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -102,8 +102,7 @@ async fn execute_funding_update(
     market_pda: &Pubkey,
     market_data: &MarketData,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Instruction discriminator for "update_funding" in Anchor
-    let discriminator: [u8; 8] = [156, 148, 159, 169, 219, 157, 46, 227];
+    let discriminator = anchor_discriminator("global", "update_funding");
 
     let instruction = Instruction {
         program_id: config.perps_program_id,

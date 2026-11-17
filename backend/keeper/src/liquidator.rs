@@ -15,10 +15,9 @@ use tokio::time::interval;
 use tracing::{info, error, warn, debug};
 
 const LIQUIDATION_CHECK_INTERVAL_SECS: u64 = 10;
-const POSITION_DISCRIMINATOR: [u8; 8] = [170, 188, 143, 228, 122, 64, 247, 208]; // From Anchor
 
 // Simplified position struct for deserialization
-#[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
+#[derive(BorshDeserialize, BorshSerialize, Debug, Clone, Default)]
 pub struct PositionData {
     pub owner: Pubkey,
     pub market: Pubkey,
@@ -34,16 +33,18 @@ pub struct PositionData {
     pub status: u8, // 0 = Open, 1 = Closed, 2 = Liquidated
 }
 
-// Market struct for deserialization
-#[derive(BorshDeserialize, BorshSerialize, Debug)]
+// Mirrors programs/perps-core/src/state/market.rs. Borsh decodes fields in
+// declaration order, so this must match the on-chain struct exactly.
+#[derive(BorshDeserialize, BorshSerialize, Debug, Clone, Default)]
 pub struct MarketData {
     pub authority: Pubkey,
     pub collateral_mint: Pubkey,
+    pub vault: Pubkey,
     pub pyth_price_feed: Pubkey,
     pub commodity: [u8; 8],
     pub max_leverage: u32,
-    pub initial_margin_ratio: u32,
     pub maintenance_margin_ratio: u32,
+    pub initial_margin_ratio: u32,
     pub taker_fee: u32,
     pub maker_fee: u32,
     pub liquidation_fee: u32,
@@ -51,13 +52,21 @@ pub struct MarketData {
     pub short_open_interest: u64,
     pub max_open_interest: u64,
     pub funding_rate: i64,
-    pub funding_interval: i64,
     pub last_funding_time: i64,
+    pub funding_interval: i64,
     pub insurance_fund: u64,
     pub total_positions: u64,
     pub total_trades: u64,
-    pub is_paused: bool,
     pub bump: u8,
+    pub is_paused: bool,
+}
+
+/// Anchor's 8-byte discriminator: the first 8 bytes of sha256("<namespace>:<name>").
+pub fn anchor_discriminator(namespace: &str, name: &str) -> [u8; 8] {
+    let hash = solana_sdk::hash::hash(format!("{}:{}", namespace, name).as_bytes());
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&hash.to_bytes()[..8]);
+    out
 }
 
 pub async fn run_liquidation_keeper(client: Arc<RpcClient>, config: Arc<KeeperConfig>) {
@@ -119,7 +128,7 @@ async fn check_and_liquidate(
 
     for (position_address, position) in open_positions {
         // Check if position is liquidatable
-        let margin_ratio = calculate_margin_ratio(&position, oracle_price);
+        let margin_ratio = calculate_margin_ratio(&position, oracle_price, market_data.funding_rate);
 
         if margin_ratio < market_data.maintenance_margin_ratio {
             info!(
@@ -151,11 +160,11 @@ fn fetch_oracle_price(
     let account = client.get_account(pyth_feed)?;
 
     // Parse Pyth price feed
-    let price_feed = pyth_sdk_solana::state::load_price_account(&account.data)
+    let price_feed = pyth_sdk_solana::state::load_price_account::<32, ()>(&account.data)
         .map_err(|e| format!("Failed to parse Pyth feed: {:?}", e))?;
 
     let price = price_feed.agg.price;
-    let expo = price_feed.exponent;
+    let expo = price_feed.expo;
 
     // Normalize to 6 decimals
     let normalized = if expo < 0 {
@@ -174,7 +183,7 @@ fn fetch_open_positions(
 ) -> Result<Vec<(Pubkey, PositionData)>, Box<dyn std::error::Error + Send + Sync>> {
     // Filter for position accounts with status = Open (0)
     let filters = vec![
-        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(0, POSITION_DISCRIMINATOR.to_vec())),
+        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(0, anchor_discriminator("account", "Position").to_vec())),
         // Status at offset 8 + 32 + 32 + 1 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 = 133
         RpcFilterType::Memcmp(Memcmp::new_raw_bytes(133, vec![0])), // Open status
     ];
@@ -203,7 +212,20 @@ fn fetch_open_positions(
     Ok(positions)
 }
 
-fn calculate_margin_ratio(position: &PositionData, current_price: u64) -> u32 {
+/// Funding owed to (+) or by (-) the position since it last settled, in USDC.
+/// Mirrors `Position::accrued_funding` in perps-core.
+fn accrued_funding(position: &PositionData, cumulative_funding_rate: i64, price: u64) -> i64 {
+    let rate_diff = cumulative_funding_rate as i128 - position.last_funding_payment as i128;
+    let notional = (position.size as i128) * (price as i128) / 1_000_000;
+    let payment = notional * rate_diff / 1_000_000;
+    let signed = if position.side == 0 { -payment } else { payment };
+    signed.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// Margin ratio in basis points. Mirrors `Position::margin_ratio` in perps-core
+/// (entry-price notional, funding included) so the keeper only submits
+/// liquidations the program will accept.
+fn calculate_margin_ratio(position: &PositionData, current_price: u64, cumulative_funding_rate: i64) -> u32 {
     let entry = position.entry_price as i128;
     let current = current_price as i128;
     let size = position.size as i128;
@@ -217,18 +239,19 @@ fn calculate_margin_ratio(position: &PositionData, current_price: u64) -> u32 {
     };
 
     let pnl = (size * price_diff) / 1_000_000;
-    let equity = (position.collateral as i128) + pnl;
+    let funding = accrued_funding(position, cumulative_funding_rate, current_price) as i128;
+    let equity = (position.collateral as i128) + pnl + funding;
 
     if equity <= 0 {
         return 0;
     }
 
-    let notional = (size * current) / 1_000_000;
+    let notional = (size * entry) / 1_000_000;
     if notional == 0 {
         return 0;
     }
 
-    ((equity * 10000) / notional) as u32
+    ((equity * 10000) / notional).min(u32::MAX as i128) as u32
 }
 
 async fn execute_liquidation(
@@ -250,8 +273,7 @@ async fn execute_liquidation(
     );
 
     // Build liquidate instruction
-    // Instruction discriminator for "liquidate" in Anchor
-    let discriminator: [u8; 8] = [223, 179, 226, 125, 48, 46, 39, 74];
+    let discriminator = anchor_discriminator("global", "liquidate");
 
     let instruction = Instruction {
         program_id: config.perps_program_id,
@@ -286,4 +308,76 @@ async fn execute_liquidation(
     info!("Liquidation tx: {}", signature);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oil_long() -> PositionData {
+        PositionData {
+            side: 0,
+            size: 100_000_000,        // 100 contracts
+            collateral: 750_000_000,  // $750
+            entry_price: 75_000_000,  // $75
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn discriminators_match_anchor() {
+        assert_eq!(anchor_discriminator("global", "liquidate"), [223, 179, 226, 125, 48, 46, 39, 74]);
+        assert_eq!(anchor_discriminator("global", "update_funding"), [224, 66, 9, 70, 75, 81, 94, 88]);
+        assert_eq!(anchor_discriminator("account", "Position"), [170, 188, 143, 228, 122, 64, 247, 208]);
+    }
+
+    #[test]
+    fn market_data_decodes_on_chain_layout() {
+        // Serialize fields in perps-core's Market order and check they land in
+        // the right MarketData fields.
+        let mut bytes = Vec::new();
+        for key in 1u8..=4 {
+            bytes.extend_from_slice(&[key; 32]); // authority, collateral_mint, vault, pyth_price_feed
+        }
+        bytes.extend_from_slice(b"OIL\0\0\0\0\0");
+        for v in [20_000u32, 500, 1_000, 5, 2, 100] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [11u64, 22, 33] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [-7i64, 1_700_000_000, 3_600] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [44u64, 55, 66] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.push(254); // bump
+        bytes.push(1); // is_paused
+        bytes.extend_from_slice(&[0u8; 56]); // padding
+
+        let m = MarketData::deserialize(&mut bytes.as_slice()).unwrap();
+        assert_eq!(m.vault, Pubkey::new_from_array([3; 32]));
+        assert_eq!(m.pyth_price_feed, Pubkey::new_from_array([4; 32]));
+        assert_eq!((m.maintenance_margin_ratio, m.initial_margin_ratio), (500, 1_000));
+        assert_eq!(m.funding_rate, -7);
+        assert_eq!((m.last_funding_time, m.funding_interval), (1_700_000_000, 3_600));
+        assert_eq!(m.insurance_fund, 44);
+        assert_eq!((m.bump, m.is_paused), (254, true));
+    }
+
+    #[test]
+    fn margin_ratio_matches_program() {
+        // $750 on $7,500 entry notional = 10%
+        assert_eq!(calculate_margin_ratio(&oil_long(), 75_000_000, 0), 1_000);
+        // $4 drop: $350 equity = 4.66%
+        assert_eq!(calculate_margin_ratio(&oil_long(), 71_000_000, 0), 466);
+    }
+
+    #[test]
+    fn margin_ratio_counts_unpaid_funding() {
+        // 0.53% cumulative funding on $7,500 = $39.75 owed by the long
+        assert_eq!(accrued_funding(&oil_long(), 5_300, 75_000_000), -39_750_000);
+        assert_eq!(calculate_margin_ratio(&oil_long(), 75_000_000, 5_300), 947);
+    }
 }
