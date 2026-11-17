@@ -5,6 +5,7 @@ import { useTrading } from '../hooks/useTrading';
 import { usePositions } from '../hooks/usePositions';
 import { useOnChainMarket } from '../hooks/useOnChainMarket';
 import type { OrderSide } from '../types';
+import { estimateLiquidationPrice, maxAllowedLeverage } from '../utils/leverage';
 
 // Maximum position size in USD value (per position)
 const MAX_POSITION_VALUE = 100_000; // $100k max per position
@@ -47,8 +48,8 @@ export function OrderEntry() {
     }
   }, [connected, checkMarketExists]);
 
-  // Generate leverage options based on commodity max leverage
-  const maxLev = selectedCommodity.maxLeverage;
+  // Leverage options, capped by the commodity limit and the on-chain margin rules
+  const maxLev = maxAllowedLeverage(selectedCommodity.maxLeverage, onChainMarket);
   const leverageOptions = [1, 2, 5, 10, 15, 20].filter(lev => lev <= maxLev);
 
   const calculateMargin = useCallback(() => {
@@ -85,9 +86,7 @@ export function OrderEntry() {
   const margin = calculateMargin();
   const insufficientMargin = margin > 0 && margin > availableCollateral;
   const liquidationPrice = market
-    ? side === 'long'
-      ? market.price * (1 - 1 / selectedLeverage * 0.95)
-      : market.price * (1 + 1 / selectedLeverage * 0.95)
+    ? estimateLiquidationPrice(market.price, selectedLeverage, side, onChainMarket?.maintenanceMarginRatio)
     : 0;
 
   // Position size validation
@@ -129,15 +128,15 @@ export function OrderEntry() {
     }
 
     // Check leverage doesn't exceed max
-    if (selectedLeverage > selectedCommodity.maxLeverage) {
+    if (selectedLeverage > maxLev) {
       return {
         valid: false,
-        error: `Max leverage for ${selectedCommodity.id} is ${selectedCommodity.maxLeverage}x`,
+        error: `Max leverage for ${selectedCommodity.id} is ${maxLev}x`,
       };
     }
 
     return { valid: true, error: null };
-  }, [size, market, selectedCommodity, selectedLeverage, side, onChainMarket]);
+  }, [size, market, selectedCommodity, selectedLeverage, side, onChainMarket, maxLev]);
 
   const formatPrice = (value: number) => value.toFixed(selectedCommodity.decimals);
 
