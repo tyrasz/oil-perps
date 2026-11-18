@@ -86,8 +86,8 @@ async fn update_market_funding(
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
 
-    let time_since_last_funding = current_time - market_data.last_funding_time;
-    let time_until_next = market_data.funding_interval - time_since_last_funding;
+    let time_since_last_funding = current_time.saturating_sub(market_data.last_funding_time);
+    let time_until_next = market_data.funding_interval.saturating_sub(time_since_last_funding);
 
     if time_until_next > 0 {
         debug!(

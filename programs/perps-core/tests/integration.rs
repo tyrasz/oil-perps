@@ -675,3 +675,46 @@ async fn market_fees_are_bounded() {
     let params = InitializeMarketParams { taker_fee: 1_000_000, ..oil_params("GOLD") };
     assert_eq!(custom_error(env.init_market_with("GOLD", params).await), code(PerpsError::InvalidMarketConfig));
 }
+
+#[tokio::test]
+async fn user_accounts_cannot_be_used_in_another_market() {
+    let mut env = Env::new().await.funded("OIL", 1_000 * USDC).await;
+    env.init_market("GOLD").await.unwrap();
+    let alice = env.alice.keypair.insecure_clone();
+    let oil_account = user_account(&alice.pubkey(), &env.oil.market);
+    let gold = env.gold;
+    let constraint_seeds: u32 = anchor_lang::error::ErrorCode::ConstraintSeeds.into();
+
+    // Depositing into GOLD's vault while crediting the OIL account
+    let deposit = perps_core::accounts::DepositCollateral {
+        owner: alice.pubkey(),
+        user_account: oil_account,
+        market: gold.market,
+        vault: gold.vault,
+        vault_token_account: gold.vault_token,
+        user_token_account: env.alice.token_account,
+        token_program: spl_token::ID,
+    };
+    let result = env.exec(deposit, perps_core::instruction::DepositCollateral { amount: 10 * USDC }, &[&alice]).await;
+    assert_eq!(custom_error(result), constraint_seeds);
+
+    // Opening a GOLD position paid for by OIL collateral
+    let (position, _) = Pubkey::find_program_address(
+        &[b"position", alice.pubkey().as_ref(), gold.market.as_ref(), &0u64.to_le_bytes()],
+        &perps_core::ID,
+    );
+    let open = perps_core::accounts::OpenPosition {
+        owner: alice.pubkey(),
+        user_account: oil_account,
+        market: gold.market,
+        position,
+        pyth_price_feed: gold.oracle,
+        system_program: system_program::ID,
+    };
+    let params = OpenPositionParams { side: 0, size: CONTRACT / 100, leverage: 5_000 };
+    let result = env.exec(open, perps_core::instruction::OpenPosition { params }, &[&alice]).await;
+    assert_eq!(custom_error(result), constraint_seeds);
+
+    assert_eq!(env.user("OIL").await.collateral_balance, 1_000 * USDC);
+    assert_eq!(env.token_balance(gold.vault_token).await, 0);
+}

@@ -229,11 +229,15 @@ async function applyRiskConfig(
 async function checkMarketExists(connection: Connection, commodity: string): Promise<boolean> {
   const [marketPda] = getMarketPDA(USDC_MINT, commodity);
   const accountInfo = await connection.getAccountInfo(marketPda);
-  return accountInfo !== null;
+  // Anyone can send lamports to the address; only an initialized program
+  // account counts as an existing market.
+  return !!accountInfo && accountInfo.owner.equals(PERPS_CORE_PROGRAM_ID) && accountInfo.data.length > 0;
 }
 
 async function main() {
-  const commodity = process.argv[2] || 'OIL';
+  const args = process.argv.slice(2);
+  const updateConfig = args.includes('--update-config');
+  const commodity = args.find((a) => !a.startsWith('--')) || 'OIL';
   const rpcUrl = process.env.RPC_URL || 'https://api.testnet.solana.com';
 
   console.log(`\n=== Initialize Market Script ===`);
@@ -280,9 +284,18 @@ async function main() {
     let isPaused = false;
     if (await checkMarketExists(connection, commodity)) {
       const [marketPda] = getMarketPDA(USDC_MINT, commodity);
-      const market = (await program.account.market.fetch(marketPda)) as { isPaused: boolean };
+      const market = (await program.account.market.fetch(marketPda)) as Record<string, unknown> & { isPaused: boolean };
       isPaused = market.isPaused;
       console.log(`Market already exists: ${marketPda.toString()} (paused: ${isPaused})`);
+      // Don't silently overwrite settings an operator may have tightened
+      if (!updateConfig) {
+        const current = ['sessionSchedule', 'preCloseWindowSecs', 'weekendInitialMarginRatio',
+          'weekendMaintenanceMarginRatio', 'maxConfidenceBps', 'minOraclePrice']
+          .map((k) => `  ${k}: ${String(market[k])}`).join('\n');
+        console.log(`Current risk settings:\n${current}`);
+        console.log(`Not changing them. Re-run with --update-config to apply this script's values:`, RISK_CONFIGS[commodity]);
+        return;
+      }
     } else {
       const signature = await initializeMarket(program, authority, commodity);
       console.log(`https://explorer.solana.com/tx/${signature}?cluster=testnet`);
