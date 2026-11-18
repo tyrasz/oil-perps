@@ -4,36 +4,20 @@ import { useMarketStore } from '../stores/marketStore';
 import { useTrading } from '../hooks/useTrading';
 import { useTriggerOrderStore } from '../stores/triggerOrderStore';
 import { TpSlManager } from './TpSlManager';
-import { useOnChainMarket } from '../hooks/useOnChainMarket';
-import { useMarketSession } from '../hooks/useMarketSession';
-import { WEEKEND_MARGIN_NOTICE_SECS } from '../utils/session';
 import type { Position } from '../types';
 
 const DEFAULT_MAINTENANCE_MARGIN_PCT = 5;
 
 export function PositionTable() {
   const { positions } = usePositions();
-  const { getCurrentMarket } = useMarketStore();
-  const market = getCurrentMarket();
+  const { markets } = useMarketStore();
   const { closePosition, error, clearError, getExplorerUrl } = useTrading();
   const { getTriggerOrdersForPosition } = useTriggerOrderStore();
-  const { marketData: onChainMarket } = useOnChainMarket();
-  const session = useMarketSession(onChainMarket);
 
-  // Liquidation thresholds follow the maintenance margin in force, which rises
-  // shortly before the weekly close.
-  const maintenanceBps = onChainMarket
-    ? session.state === 'pre-close'
-      ? Math.max(onChainMarket.maintenanceMarginRatio, onChainMarket.weekendMaintenanceMarginRatio)
-      : onChainMarket.maintenanceMarginRatio
-    : 0;
-  const LIQUIDATION_THRESHOLD = maintenanceBps > 0 ? maintenanceBps / 100 : DEFAULT_MAINTENANCE_MARGIN_PCT;
-  // Within a day of weekend margins, warn about positions that will fall below them.
-  const until = session.secondsUntilWeekendMargins;
-  const weekendSoon = until != null && until <= WEEKEND_MARGIN_NOTICE_SECS;
-  const weekendPct = (onChainMarket?.weekendMaintenanceMarginRatio ?? 0) / 100;
-  const WARNING_THRESHOLD = Math.max(LIQUIDATION_THRESHOLD * 2, weekendSoon ? weekendPct : 0);
-  const closeBlocked = session.state === 'closed';
+  // Thresholds, settlement and trading hours come from each position's own
+  // market (useOnChainPositions), since positions can span commodities.
+  const thresholdOf = (p: Position) => p.liquidationThreshold ?? DEFAULT_MAINTENANCE_MARGIN_PCT;
+  const warningOf = (p: Position) => p.warningThreshold ?? thresholdOf(p) * 2;
 
   const [closingPositionId, setClosingPositionId] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -42,10 +26,14 @@ export function PositionTable() {
 
   // Check for positions at risk of liquidation
   const { criticalPositions, warningPositions } = useMemo(() => {
-    const critical = positions.filter(p => p.marginRatio < LIQUIDATION_THRESHOLD);
-    const warning = positions.filter(p => p.marginRatio >= LIQUIDATION_THRESHOLD && p.marginRatio < WARNING_THRESHOLD);
+    // Settled positions can't be liquidated; they only close at the settlement price
+    const live = positions.filter(p => !p.settled);
+    const critical = live.filter(p => p.marginRatio < thresholdOf(p));
+    const warning = live.filter(p => p.marginRatio >= thresholdOf(p) && p.marginRatio < warningOf(p));
     return { criticalPositions: critical, warningPositions: warning };
-  }, [positions, LIQUIDATION_THRESHOLD, WARNING_THRESHOLD]);
+    // thresholdOf/warningOf only read the positions passed in
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [positions]);
 
   const handleClosePosition = async (position: Position) => {
     setClosingPositionId(position.address);
@@ -81,7 +69,7 @@ export function PositionTable() {
           <div className="alert-content">
             <strong>LIQUIDATION IMMINENT</strong>
             <p>
-              {criticalPositions.length} position{criticalPositions.length > 1 ? 's' : ''} below {LIQUIDATION_THRESHOLD}% margin ratio.
+              {criticalPositions.length} position{criticalPositions.length > 1 ? 's' : ''} below the liquidation margin ({criticalPositions.map(p => `${p.commodity} ${thresholdOf(p)}%`).join(', ')}).
               Add collateral or close position{criticalPositions.length > 1 ? 's' : ''} immediately to avoid liquidation.
             </p>
           </div>
@@ -119,7 +107,10 @@ export function PositionTable() {
         <tbody>
           {positions.map((position) => {
             const pnlClass = position.unrealizedPnl >= 0 ? 'positive' : 'negative';
-            const marginClass = position.marginRatio < 10 ? 'danger' : position.marginRatio < 20 ? 'warning' : '';
+            const marginClass = position.settled
+              ? ''
+              : position.marginRatio < thresholdOf(position) ? 'danger' : position.marginRatio < warningOf(position) ? 'warning' : '';
+            const markPrice = position.markPrice ?? markets[position.commodity]?.price;
             const triggerOrders = getTriggerOrdersForPosition(position.address);
             const activeTp = triggerOrders.find(o => o.type === 'take_profit' && o.status === 'active');
             const activeSl = triggerOrders.find(o => o.type === 'stop_loss' && o.status === 'active');
@@ -133,7 +124,10 @@ export function PositionTable() {
                   </td>
                   <td>{position.size.toFixed(4)}</td>
                   <td>${position.entryPrice.toFixed(2)}</td>
-                  <td>${market?.price.toFixed(2) || '-'}</td>
+                  <td title={position.settled ? 'Settlement price' : undefined}>
+                    {markPrice !== undefined ? `$${markPrice.toFixed(2)}` : '-'}
+                    {position.settled && ' (settled)'}
+                  </td>
                   <td>{position.leverage}x</td>
                   <td className={pnlClass}>
                     ${position.unrealizedPnl.toFixed(2)}
@@ -170,8 +164,8 @@ export function PositionTable() {
                     <button
                       className="action-btn close-btn"
                       onClick={() => handleClosePosition(position)}
-                      disabled={closingPositionId === position.address || closeBlocked}
-                      title={closeBlocked ? `Market closed. Trading resumes ${session.reopens}` : undefined}
+                      disabled={closingPositionId === position.address || !!position.closeBlockedReason}
+                      title={position.closeBlockedReason ?? undefined}
                     >
                       {closingPositionId === position.address ? '...' : 'Close'}
                     </button>

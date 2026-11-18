@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { estimateLiquidationPrice, maxAllowedLeverage } from './leverage';
+import { estimateLiquidationPrice, formatLeverage, maxAllowedLeverage } from './leverage';
 
 describe('maxAllowedLeverage', () => {
   it('uses the commodity limit when no on-chain market is loaded', () => {
@@ -41,5 +41,13 @@ describe('estimateLiquidationPrice', () => {
 
   it('never goes below zero', () => {
     expect(estimateLiquidationPrice(75, 0.5, 'long', 500)).toBe(0);
+  });
+});
+
+describe('formatLeverage', () => {
+  it('rounds caps that 1/initial margin leaves fractional', () => {
+    expect(formatLeverage(10)).toBe('10');
+    expect(formatLeverage(10_000 / 1_500)).toBe('6.66'); // NATGAS, 15% initial margin
+    expect(formatLeverage(10_000 / 2_400)).toBe('4.16'); // SILVER weekend
   });
 });

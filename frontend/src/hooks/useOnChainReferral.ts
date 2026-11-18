@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { usePerpsProgram } from './usePerpsProgram';
 import { getReferralCodePDA, getUserReferralPDA, codeToBytes, bytesToCode } from '../utils/pda';
-import { USDC_MINT, PRICE_DECIMALS } from '../config/program';
-import { getCommodityMarket, getVaultPDA, getVaultTokenAccountPDA } from '../utils/pda';
-import { useMarketStore } from '../stores/marketStore';
+import { PRICE_DECIMALS } from '../config/program';
 
 // On-chain referral code data
 interface OnChainReferralCode {
@@ -61,8 +59,6 @@ interface UserReferralAccount {
 
 export function useOnChainReferral() {
   const { program, publicKey, connected } = usePerpsProgram();
-  // Rewards are claimed from one market at a time; each pays what it holds
-  const selectedCommodity = useMarketStore((s) => s.selectedCommodity);
   const [myReferralCode, setMyReferralCode] = useState<OnChainReferralCode | null>(null);
   const [userReferral, setUserReferral] = useState<OnChainUserReferral | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -236,46 +232,6 @@ export function useOnChainReferral() {
   }, [program, publicKey, refresh]);
 
   // Claim pending rewards
-  const claimRewards = useCallback(async (): Promise<number> => {
-    if (!program || !publicKey || !myReferralCode) return 0;
-
-    try {
-      setIsLoading(true);
-      setError(null);
-
-      const [referralCodePda] = getReferralCodePDA(myReferralCode.code);
-      const marketPda = getCommodityMarket(selectedCommodity.id);
-      const [vaultPda] = getVaultPDA(marketPda);
-      const [vaultTokenPda] = getVaultTokenAccountPDA(marketPda);
-
-      // Get user's token account
-      const { getAssociatedTokenAddress } = await import('@solana/spl-token');
-      const ownerTokenAccount = await getAssociatedTokenAddress(USDC_MINT, publicKey);
-
-      const pendingAmount = myReferralCode.pendingRewards;
-
-      await program.methods
-        .claimReferralRewards()
-        .accounts({
-          owner: publicKey,
-          referralCode: referralCodePda,
-          market: marketPda,
-          vault: vaultPda,
-          vaultTokenAccount: vaultTokenPda,
-          ownerTokenAccount: ownerTokenAccount,
-        })
-        .rpc();
-
-      await refresh();
-      return pendingAmount;
-    } catch (err) {
-      console.error('Failed to claim rewards:', err);
-      setError('Failed to claim rewards');
-      return 0;
-    } finally {
-      setIsLoading(false);
-    }
-  }, [program, publicKey, myReferralCode, refresh, selectedCommodity.id]);
 
   // Check if a code exists
   const checkCodeExists = useCallback(async (code: string): Promise<boolean> => {
@@ -307,7 +263,6 @@ export function useOnChainReferral() {
     error,
     createReferralCode,
     applyReferralCode,
-    claimRewards,
     checkCodeExists,
     getDiscountBps,
     refresh,

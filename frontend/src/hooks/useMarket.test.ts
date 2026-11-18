@@ -125,6 +125,30 @@ describe('useMarketFeed', () => {
     expect(trades.OIL).toBeUndefined();
   });
 
+  it('attributes untagged messages to the default market, not the selected one', () => {
+    useMarketStore.setState({ markets: { OIL: market('OIL', 75), GOLD: market('GOLD', 2000) } });
+    act(() => useMarketStore.getState().setSelectedCommodity(GOLD));
+    renderHook(() => useMarketFeed());
+    const ws = MockWebSocket.instances[0];
+
+    act(() => ws.simulateMessage({ type: 'price', price: 76_000_000 }));
+
+    expect(useMarketStore.getState().markets.OIL.price).toBe(76);
+    expect(useMarketStore.getState().markets.GOLD.price).toBe(2000);
+  });
+
+  it('keeps polling prices for every commodity', async () => {
+    vi.useFakeTimers();
+    renderHook(() => useMarketFeed());
+    const callsFor = (id: string) =>
+      vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith(`/api/market/${id}`)).length;
+    expect(callsFor('GOLD')).toBe(1);
+
+    await act(async () => vi.advanceTimersByTime(5_000));
+    expect(callsFor('GOLD')).toBe(2);
+    expect(callsFor('COPPER')).toBe(2);
+  });
+
   it('ignores malformed messages', () => {
     renderHook(() => useMarketFeed());
     const ws = MockWebSocket.instances[0];

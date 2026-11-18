@@ -11,7 +11,6 @@ export function ReferralPanel() {
     error,
     createReferralCode,
     applyReferralCode,
-    claimRewards,
   } = useOnChainReferral();
 
   const [customCode, setCustomCode] = useState('');
@@ -63,17 +62,6 @@ export function ReferralPanel() {
       setApplyCode('');
     } else {
       setApplyError(error || 'Failed to apply referral code');
-    }
-  };
-
-  const handleClaimRewards = async () => {
-    if (isSubmitting) return;
-    setIsSubmitting(true);
-    const claimed = await claimRewards();
-    setIsSubmitting(false);
-
-    if (claimed > 0) {
-      alert(`Successfully claimed $${claimed.toFixed(2)} in referral rewards!`);
     }
   };
 
@@ -218,21 +206,12 @@ export function ReferralPanel() {
               <span className="stat-value">${myReferralCode.totalRewardsEarned.toFixed(2)}</span>
               <span className="stat-label">Total Earned</span>
             </div>
-            <div className="stat-item highlight">
-              <span className="stat-value">${myReferralCode.pendingRewards.toFixed(2)}</span>
-              <span className="stat-label">Pending Rewards</span>
-            </div>
           </div>
 
-          {myReferralCode.pendingRewards > 0 && (
-            <button
-              className="claim-btn"
-              onClick={handleClaimRewards}
-              disabled={isSubmitting}
-            >
-              {isSubmitting ? 'Claiming...' : `Claim $${myReferralCode.pendingRewards.toFixed(2)} Rewards`}
-            </button>
-          )}
+          <p className="referral-note">
+            Rewards are paid straight to your wallet's USDC account when traders you referred close
+            positions. Make sure that token account exists to receive them.
+          </p>
         </div>
       )}
 

@@ -85,6 +85,10 @@ export function useTriggerOrderMonitor() {
           continue;
         }
 
+        // Settled markets close at the settlement price, and closed markets
+        // reject closes, so the feed price can't trigger anything there.
+        if (position.settled || position.closeBlockedReason) continue;
+
         const marketPrice = markets[position.commodity]?.price;
         if (!marketPrice) continue;
 

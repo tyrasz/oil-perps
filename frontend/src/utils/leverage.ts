@@ -49,3 +49,8 @@ export function estimateLiquidationPrice(
   const price = side === 'long' ? entryPrice * (1 - buffer) : entryPrice * (1 + buffer);
   return Math.max(0, price);
 }
+
+/** Leverage for display: whole numbers as-is, otherwise rounded down to 2 decimals. */
+export function formatLeverage(leverage: number): string {
+  return Number.isInteger(leverage) ? String(leverage) : (Math.floor(leverage * 100) / 100).toFixed(2);
+}

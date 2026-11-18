@@ -10,6 +10,12 @@ export interface Position {
   unrealizedPnl: number;
   marginRatio: number;
   openedAt: number;
+  // From the position's own market (see utils/positionHealth.ts)
+  markPrice?: number;               // Price the position is valued at (settlement price if settled)
+  liquidationThreshold?: number;    // Margin ratio (%) below which it can be liquidated now
+  warningThreshold?: number;        // Margin ratio (%) to warn below
+  settled?: boolean;                // Market settled: closes at the settlement price
+  closeBlockedReason?: string | null; // Why it can't be closed right now
 }
 
 export interface ClosedPosition {

@@ -10,10 +10,12 @@ import {
   getVaultPDA,
   getVaultTokenAccountPDA,
   getPositionPDA,
+  getUserReferralPDA,
 } from '../utils/pda';
 import { parseAnchorError, getExplorerUrl } from '../utils/transaction';
 import { useMarketStore } from '../stores/marketStore';
 import {
+  PERPS_CORE_PROGRAM_ID,
   USDC_MINT,
   PYTH_PRICE_FEEDS,
   PRICE_DECIMALS,
@@ -24,6 +26,34 @@ export interface TradingState {
   isLoading: boolean;
   error: string | null;
   lastTxSignature: string | null;
+}
+
+interface ReferralCloseAccounts {
+  userReferral: PublicKey;
+  referralCode: PublicKey;
+  referrerTokenAccount: PublicKey;
+}
+
+/** Referral accounts for close_position, or null if the trader has no usable referral. */
+async function referralAccountsForClose(
+  program: NonNullable<ReturnType<typeof usePerpsProgram>['program']>,
+  connection: ReturnType<typeof useConnection>['connection'],
+  trader: PublicKey,
+  collateralMint: PublicKey
+): Promise<ReferralCloseAccounts | null> {
+  try {
+    const [userReferral] = getUserReferralPDA(trader);
+    const applied = (await program.account.userReferral.fetchNullable(userReferral)) as { referralCode: PublicKey } | null;
+    if (!applied) return null;
+    const code = (await program.account.referralCode.fetch(applied.referralCode)) as { owner: PublicKey; isActive: boolean };
+    if (!code.isActive) return null;
+    const referrerTokenAccount = await getAssociatedTokenAddress(collateralMint, code.owner);
+    if (!(await connection.getAccountInfo(referrerTokenAccount))) return null;
+    return { userReferral, referralCode: applied.referralCode, referrerTokenAccount };
+  } catch (err) {
+    console.warn('Referral lookup failed; closing without referral:', err);
+    return null;
+  }
 }
 
 export function useTrading() {
@@ -327,6 +357,16 @@ export function useTrading() {
           publicKey
         );
 
+        // With a referral, pass the referral accounts and the referrer's token
+        // account: the trader gets the discount and the program pays the
+        // referrer at close. Skipped if the referrer has no account for this mint.
+        const referral = await referralAccountsForClose(
+          program,
+          connection,
+          publicKey,
+          marketAccount.collateralMint as PublicKey
+        );
+
         console.log('Closing position:', positionAddress);
 
         const signature = await program.methods
@@ -341,6 +381,10 @@ export function useTrading() {
             userTokenAccount,
             pythPriceFeed: marketAccount.pythPriceFeed as PublicKey,
             tokenProgram: TOKEN_PROGRAM_ID,
+            // Anchor encodes an absent optional account as the program's own id
+            userReferral: referral?.userReferral ?? PERPS_CORE_PROGRAM_ID,
+            referralCode: referral?.referralCode ?? PERPS_CORE_PROGRAM_ID,
+            referrerTokenAccount: referral?.referrerTokenAccount ?? PERPS_CORE_PROGRAM_ID,
           })
           .rpc();
 
@@ -365,7 +409,7 @@ export function useTrading() {
         throw new Error(errorMessage);
       }
     },
-    [program, publicKey]
+    [program, publicKey, connection]
   );
 
   /**

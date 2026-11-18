@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { usePerpsProgram } from './usePerpsProgram';
 import { getCommodityMarket } from '../utils/pda';
 import { useMarketStore } from '../stores/marketStore';
@@ -72,7 +72,12 @@ export function useOnChainMarket() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Only the most recent request may update state: a slow fetch for the
+  // previously selected commodity must not overwrite the new one's data.
+  const latestRequest = useRef(0);
+
   const fetchMarket = useCallback(async () => {
+    const request = ++latestRequest.current;
     if (!program) {
       setMarketData(null);
       return;
@@ -84,6 +89,7 @@ export function useOnChainMarket() {
     try {
       const marketPda = getCommodityMarket(selectedCommodity.id);
       const market = await program.account.market.fetch(marketPda) as unknown as OnChainMarket;
+      if (request !== latestRequest.current) return;
 
       const lastFundingTime = market.lastFundingTime.toNumber();
       const fundingInterval = market.fundingInterval.toNumber();
@@ -122,15 +128,18 @@ export function useOnChainMarket() {
         settlementPrice: market.settlementPrice?.toNumber() ?? 0,
       });
     } catch (err) {
+      if (request !== latestRequest.current) return;
       console.error('Failed to fetch on-chain market:', err);
       setError('Market not found on-chain');
       setMarketData(null);
     } finally {
-      setIsLoading(false);
+      if (request === latestRequest.current) setIsLoading(false);
     }
   }, [program, selectedCommodity.id]);
 
   useEffect(() => {
+    // Don't show the previous commodity's market while the new one loads
+    setMarketData(null);
     fetchMarket();
 
     // Refresh every 30 seconds

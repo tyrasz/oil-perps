@@ -1,16 +1,28 @@
 import { formatDuration, WEEKEND_MARGIN_NOTICE_SECS, type MarketSession } from '../utils/session';
 import { PRICE_DECIMALS } from '../config/program';
+import { formatLeverage } from '../utils/leverage';
 
 interface Props {
   session: MarketSession;
   /** Leverage cap in force (already lowered for weekend margins). */
   maxLeverage: number;
+  maintenanceMarginRatio?: number;
   weekendMaintenanceMarginRatio?: number;
   settlementPrice?: number;
 }
 
 /** Explains trading-hour, weekend-margin and settlement restrictions. */
-export function SessionNotice({ session, maxLeverage, weekendMaintenanceMarginRatio = 0, settlementPrice = 0 }: Props) {
+export function SessionNotice({
+  session,
+  maxLeverage,
+  maintenanceMarginRatio = 0,
+  weekendMaintenanceMarginRatio = 0,
+  settlementPrice = 0,
+}: Props) {
+  // The program liquidates below max(maintenance, weekend maintenance); a lower
+  // weekend value changes nothing, so only mention it when it's stricter.
+  const weekendRatio = Math.max(maintenanceMarginRatio, weekendMaintenanceMarginRatio);
+  const weekendIsStricter = weekendRatio > maintenanceMarginRatio;
   switch (session.state) {
     case 'closed':
       return (
@@ -23,9 +35,9 @@ export function SessionNotice({ session, maxLeverage, weekendMaintenanceMarginRa
       return (
         <div className="warning-message session-notice">
           Weekend margins in force: market closes in {formatDuration(session.secondsUntilClose ?? 0)}.
-          Max leverage is {maxLeverage}x
-          {weekendMaintenanceMarginRatio > 0 &&
-            `, and positions below ${(weekendMaintenanceMarginRatio / 100).toFixed(1)}% margin can be liquidated`}
+          Max leverage is {formatLeverage(maxLeverage)}x
+          {weekendIsStricter &&
+            `, and positions below ${(weekendRatio / 100).toFixed(1)}% margin can be liquidated`}
           .
         </div>
       );
@@ -37,11 +49,11 @@ export function SessionNotice({ session, maxLeverage, weekendMaintenanceMarginRa
       );
     default: {
       const until = session.secondsUntilWeekendMargins;
-      if (until == null || until > WEEKEND_MARGIN_NOTICE_SECS || weekendMaintenanceMarginRatio <= 0) return null;
+      if (until == null || until > WEEKEND_MARGIN_NOTICE_SECS || !weekendIsStricter) return null;
       return (
         <div className="warning-message session-notice">
           Weekend margins start in {formatDuration(until)}: positions below{' '}
-          {(weekendMaintenanceMarginRatio / 100).toFixed(1)}% margin will become liquidatable. Add margin or
+          {(weekendRatio / 100).toFixed(1)}% margin will become liquidatable. Add margin or
           reduce leverage before then.
         </div>
       );

@@ -5,7 +5,7 @@ import { useTrading } from '../hooks/useTrading';
 import { usePositions } from '../hooks/usePositions';
 import { useOnChainMarket } from '../hooks/useOnChainMarket';
 import type { OrderSide } from '../types';
-import { estimateLiquidationPrice, maxAllowedLeverage } from '../utils/leverage';
+import { estimateLiquidationPrice, formatLeverage, maxAllowedLeverage } from '../utils/leverage';
 import { useMarketSession } from '../hooks/useMarketSession';
 import { SessionNotice } from './SessionNotice';
 
@@ -56,14 +56,17 @@ export function OrderEntry() {
   // Leverage options, capped by the commodity limit and the on-chain margin rules
   const maxLev = maxAllowedLeverage(selectedCommodity.maxLeverage, onChainMarket, preClose);
   const leverageOptions = [1, 2, 5, 10, 15, 20].filter(lev => lev <= maxLev);
+  // The stored choice can exceed this market's cap (e.g. 10x selected, NATGAS
+  // allows 6.67x); trade at the highest allowed option instead.
+  const leverage = selectedLeverage <= maxLev ? selectedLeverage : leverageOptions[leverageOptions.length - 1] ?? 1;
 
   const calculateMargin = useCallback(() => {
     if (!size || !market) return 0;
     const sizeNum = parseFloat(size);
     const priceNum = orderType === 'market' ? market.price : parseFloat(price) || market.price;
     const notional = sizeNum * priceNum;
-    return notional / selectedLeverage;
-  }, [size, price, market, selectedLeverage, orderType]);
+    return notional / leverage;
+  }, [size, price, market, leverage, orderType]);
 
   const handleSubmit = async () => {
     if (!connected || !publicKey || !size) return;
@@ -73,7 +76,7 @@ export function OrderEntry() {
     setSuccessMessage(null);
 
     try {
-      await openPosition(side, parseFloat(size), selectedLeverage);
+      await openPosition(side, parseFloat(size), leverage);
 
       // Reset form on success
       setSize('');
@@ -93,7 +96,7 @@ export function OrderEntry() {
   const liquidationPrice = market
     ? estimateLiquidationPrice(
         market.price,
-        selectedLeverage,
+        leverage,
         side,
         !onChainMarket
           ? undefined
@@ -142,15 +145,15 @@ export function OrderEntry() {
     }
 
     // Check leverage doesn't exceed max
-    if (selectedLeverage > maxLev) {
+    if (leverage > maxLev) {
       return {
         valid: false,
-        error: `Max leverage for ${selectedCommodity.id} is ${maxLev}x`,
+        error: `Max leverage for ${selectedCommodity.id} is ${formatLeverage(maxLev)}x`,
       };
     }
 
     return { valid: true, error: null };
-  }, [size, market, selectedCommodity, selectedLeverage, side, onChainMarket, maxLev]);
+  }, [size, market, selectedCommodity, leverage, side, onChainMarket, maxLev]);
 
   const formatPrice = (value: number) => value.toFixed(selectedCommodity.decimals);
 
@@ -218,7 +221,7 @@ export function OrderEntry() {
           {leverageOptions.map((lev) => (
             <button
               key={lev}
-              className={`leverage-btn ${selectedLeverage === lev ? 'active' : ''}`}
+              className={`leverage-btn ${leverage === lev ? 'active' : ''}`}
               onClick={() => setSelectedLeverage(lev)}
             >
               {lev}x
@@ -250,13 +253,14 @@ export function OrderEntry() {
         </div>
         <div className="summary-row">
           <span>Trading Fee</span>
-          <span>${(margin * selectedLeverage * 0.0005).toFixed(4)}</span>
+          <span>${(margin * leverage * 0.0005).toFixed(4)}</span>
         </div>
       </div>
 
       <SessionNotice
         session={session}
         maxLeverage={maxLev}
+        maintenanceMarginRatio={onChainMarket?.maintenanceMarginRatio}
         weekendMaintenanceMarginRatio={onChainMarket?.weekendMaintenanceMarginRatio}
         settlementPrice={onChainMarket?.settlementPrice}
       />

@@ -12,13 +12,13 @@ describe('SessionNotice', () => {
 
   it('warns a day ahead that weekend margins are coming', () => {
     const soon = { state: 'open' as const, secondsUntilClose: 30_000, secondsUntilWeekendMargins: 22_800, reopens: null };
-    render(<SessionNotice session={soon} maxLeverage={10} weekendMaintenanceMarginRatio={1_000} />);
+    render(<SessionNotice session={soon} maxLeverage={10} maintenanceMarginRatio={500} weekendMaintenanceMarginRatio={1_000} />);
     expect(screen.getByText(/Weekend margins start in 6h 20m/)).toHaveTextContent(/below 10\.0% margin will become liquidatable/);
   });
 
   it('stays quiet more than a day before weekend margins', () => {
     const far = { state: 'open' as const, secondsUntilClose: 200_000, secondsUntilWeekendMargins: 192_800, reopens: null };
-    const { container } = render(<SessionNotice session={far} maxLeverage={10} weekendMaintenanceMarginRatio={1_000} />);
+    const { container } = render(<SessionNotice session={far} maxLeverage={10} maintenanceMarginRatio={500} weekendMaintenanceMarginRatio={1_000} />);
     expect(container).toBeEmptyDOMElement();
   });
 
@@ -32,7 +32,7 @@ describe('SessionNotice', () => {
       <SessionNotice
         session={{ state: 'pre-close', secondsUntilClose: 5_400, reopens: null }}
         maxLeverage={5}
-        weekendMaintenanceMarginRatio={1_000}
+        maintenanceMarginRatio={500} weekendMaintenanceMarginRatio={1_000}
       />
     );
     expect(screen.getByText(/closes in 1h 30m/)).toHaveTextContent(
@@ -45,5 +45,18 @@ describe('SessionNotice', () => {
       <SessionNotice session={{ state: 'settled', secondsUntilClose: null, reopens: null }} maxLeverage={10} settlementPrice={12_340_000} />
     );
     expect(screen.getByText(/Market settled at \$12\.34/)).toBeInTheDocument();
+  });
+
+  it('says nothing about weekend margins that are not stricter than normal', () => {
+    const soon = { state: 'open' as const, secondsUntilClose: 30_000, secondsUntilWeekendMargins: 22_800, reopens: null };
+    const { container } = render(
+      <SessionNotice session={soon} maxLeverage={10} maintenanceMarginRatio={500} weekendMaintenanceMarginRatio={300} />
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('formats fractional leverage caps', () => {
+    render(<SessionNotice session={{ state: 'pre-close', secondsUntilClose: 600, reopens: null }} maxLeverage={10_000 / 2_400} />);
+    expect(screen.getByText(/Max leverage is 4\.16x/)).toBeInTheDocument();
   });
 });

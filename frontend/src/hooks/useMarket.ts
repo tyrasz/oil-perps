@@ -1,5 +1,5 @@
 import { useEffect, useCallback, useRef } from 'react';
-import { useMarketStore, COMMODITIES } from '../stores/marketStore';
+import { useMarketStore, COMMODITIES, DEFAULT_COMMODITY } from '../stores/marketStore';
 import type { CommodityConfig } from '../config/commodities';
 import type { Trade } from '../types';
 
@@ -148,7 +148,9 @@ export function useMarketFeed() {
         try {
           const data = JSON.parse(event.data);
           const state = useMarketStore.getState();
-          const commodityId = data.commodity || state.selectedCommodity.id;
+          // The backend's feed doesn't tag messages with a commodity; untagged
+          // messages are the original (default) market's, not the selected one.
+          const commodityId = data.commodity || DEFAULT_COMMODITY.id;
 
           switch (data.type) {
             case 'price': {
@@ -198,26 +200,19 @@ export function useMarketFeed() {
     };
   }, [setMarket, addTrade, subscribeToCommodity]);
 
-  // Fetch data for selected commodity when it changes
+  // Poll every commodity's market data (open positions can be in any of them)
+  // and the selected commodity's order book.
   useEffect(() => {
-    fetchMarket(selectedCommodity);
-    fetchOrderBook(selectedCommodity);
+    const refresh = () => {
+      COMMODITIES.forEach(commodity => fetchMarket(commodity));
+      fetchOrderBook(selectedCommodity);
+    };
+    refresh();
     subscribeToCommodity(selectedCommodity);
 
-    const interval = setInterval(() => {
-      fetchMarket(selectedCommodity);
-      fetchOrderBook(selectedCommodity);
-    }, 5000);
-
+    const interval = setInterval(refresh, 5000);
     return () => clearInterval(interval);
   }, [selectedCommodity, fetchMarket, fetchOrderBook, subscribeToCommodity]);
-
-  // Also fetch data for all commodities on initial mount
-  useEffect(() => {
-    COMMODITIES.forEach(commodity => {
-      fetchMarket(commodity);
-    });
-  }, [fetchMarket]);
 
 }
 

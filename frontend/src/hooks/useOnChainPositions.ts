@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { PublicKey } from '@solana/web3.js';
 import { usePerpsProgram } from './usePerpsProgram';
 import { commodityForMarket, getCommodityMarket, getUserAccountPDA } from '../utils/pda';
-import { accruedFunding, positionHealth } from '../utils/positionHealth';
+import { accruedFunding, positionHealth, positionMarketState, type PositionMarketParams } from '../utils/positionHealth';
 import { PRICE_DECIMALS, LEVERAGE_DECIMALS } from '../config/program';
 import { useMarketStore } from '../stores/marketStore';
 import type { Position, ClosedPosition, UserAccount } from '../types';
@@ -26,6 +26,15 @@ interface OnChainPosition {
     executionSource: { orderBook?: object; amm?: object };
     bump: number;
   };
+}
+
+interface OnChainMarketRisk {
+  cumulativeFunding?: { toNumber: () => number };
+  maintenanceMarginRatio: number;
+  weekendMaintenanceMarginRatio?: number;
+  sessionSchedule?: number;
+  preCloseWindowSecs?: number;
+  settlementPrice?: { toNumber: () => number };
 }
 
 interface OnChainUserAccount {
@@ -98,14 +107,27 @@ export function useOnChainPositions() {
 
       const open = accounts.filter((acc) => acc.account.status.open !== undefined);
 
-      // Each position's market funding index, to include unpaid funding
+      // Each position's own market: funding index, margins, session, settlement
       const marketKeys = [...new Set(open.map((acc) => acc.account.market.toBase58()))];
       const marketAccounts = marketKeys.length
-        ? ((await program.account.market.fetchMultiple(marketKeys)) as unknown as ({ cumulativeFunding?: { toNumber: () => number } } | null)[])
+        ? ((await program.account.market.fetchMultiple(marketKeys)) as unknown as (OnChainMarketRisk | null)[])
         : [];
       const cumulativeFunding = new Map(
         marketKeys.map((key, i) => [key, (marketAccounts[i]?.cumulativeFunding?.toNumber() ?? 0) / Math.pow(10, PRICE_DECIMALS)])
       );
+      const marketParams = new Map<string, PositionMarketParams | null>(
+        marketKeys.map((key, i) => {
+          const m = marketAccounts[i];
+          return [key, m ? {
+            maintenanceMarginRatio: m.maintenanceMarginRatio,
+            weekendMaintenanceMarginRatio: m.weekendMaintenanceMarginRatio ?? 0,
+            sessionSchedule: m.sessionSchedule ?? 0,
+            preCloseWindowSecs: m.preCloseWindowSecs ?? 0,
+            settlementPrice: m.settlementPrice?.toNumber() ?? 0,
+          } : null];
+        })
+      );
+      const now = Math.floor(Date.now() / 1000);
 
       // Transform to frontend format
       const openPositions: Position[] = open
@@ -117,8 +139,9 @@ export function useOnChainPositions() {
           const leverage = acc.account.leverage / Math.pow(10, LEVERAGE_DECIMALS);
 
           const commodity = commodityForMarket(acc.account.market) ?? selectedCommodity.id;
-          const currentMarket = markets[commodity];
-          const currentPrice = currentMarket?.price || entryPrice;
+          const state = positionMarketState(marketParams.get(acc.account.market.toBase58()), now);
+          // A settled market closes at its settlement price, whatever the feed says
+          const currentPrice = state.settlementPrice ?? (markets[commodity]?.price || entryPrice);
 
           // Same rule as the program: entry notional, unpaid funding included
           const funding = accruedFunding(
@@ -141,6 +164,11 @@ export function useOnChainPositions() {
             unrealizedPnl,
             marginRatio,
             openedAt: acc.account.openedAt.toNumber(),
+            markPrice: currentPrice,
+            liquidationThreshold: state.liquidationThreshold,
+            warningThreshold: state.warningThreshold,
+            settled: state.settlementPrice !== null,
+            closeBlockedReason: state.closeBlockedReason,
           } as Position;
         });
 
@@ -229,14 +257,25 @@ export function useOnChainPositions() {
   /**
    * Refresh all data
    */
+  // Latest selected commodity, so a slow refresh started for the previous
+  // market can't overwrite the new market's collateral balance.
+  const selectedIdRef = useRef(selectedCommodity.id);
+  useEffect(() => {
+    selectedIdRef.current = selectedCommodity.id;
+    setUserAccount(null);
+  }, [selectedCommodity.id]);
+
   const refresh = useCallback(async () => {
+    const requestedFor = selectedCommodity.id;
     const [account] = await Promise.all([
       fetchUserAccount(),
       fetchPositions(),
       fetchClosedPositions(),
     ]);
-    setUserAccount(account);
-  }, [fetchUserAccount, fetchPositions, fetchClosedPositions]);
+    if (selectedIdRef.current === requestedFor) {
+      setUserAccount(account);
+    }
+  }, [fetchUserAccount, fetchPositions, fetchClosedPositions, selectedCommodity.id]);
 
   // Fetch on mount and when wallet changes
   useEffect(() => {
