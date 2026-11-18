@@ -134,3 +134,12 @@ export function bytesToCode(bytes: number[]): string {
   }
   return result;
 }
+
+/**
+ * Whether an address holds an initialized program account. Anyone can send
+ * lamports to an address, so mere existence would make an uninitialized user
+ * account look created (initialize_user would then never be sent).
+ */
+export function isProgramAccount(info: { owner: PublicKey; data: { length: number } } | null): boolean {
+  return !!info && info.owner.equals(PERPS_CORE_PROGRAM_ID) && info.data.length > 0;
+}

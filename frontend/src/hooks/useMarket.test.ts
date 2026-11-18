@@ -188,6 +188,26 @@ describe('useMarketFeed', () => {
     expect(ws.sent.map((m) => JSON.parse(m).commodity)).toEqual(['GOLD', 'GOLD', 'GOLD']);
   });
 
+  it('keeps the last real price when a later fetch fails', async () => {
+    useMarketStore.setState({ markets: { GOLD: market('GOLD', 1_950) } });
+    renderHook(() => useMarketFeed()); // every fetch rejects in tests
+    await vi.waitFor(() => expect(useMarketStore.getState().markets.OIL).toBeDefined());
+    expect(useMarketStore.getState().markets.GOLD.price).toBe(1_950);
+  });
+
+  it("never stores the default market's legacy price under another commodity", async () => {
+    vi.mocked(fetch).mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.endsWith('/api/market/stats')) return new Response(JSON.stringify({ price: 75_000_000 }));
+      if (u.endsWith('/api/market')) return new Response(JSON.stringify({}));
+      return new Response('not found', { status: 404 });
+    });
+    useMarketStore.setState({ markets: { GOLD: market('GOLD', 1_950) } });
+    renderHook(() => useMarketFeed());
+    await vi.waitFor(() => expect(useMarketStore.getState().markets.OIL?.price).toBe(75));
+    expect(useMarketStore.getState().markets.GOLD.price).toBe(1_950);
+  });
+
   it('falls back to mock market data when the API is unreachable', async () => {
     renderHook(() => useMarketFeed());
     await vi.waitFor(() => {

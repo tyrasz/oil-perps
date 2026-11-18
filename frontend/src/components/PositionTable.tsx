@@ -5,6 +5,7 @@ import { useTrading } from '../hooks/useTrading';
 import { useTriggerOrderStore } from '../stores/triggerOrderStore';
 import { TpSlManager } from './TpSlManager';
 import type { Position } from '../types';
+import { formatLeverage } from '../utils/leverage';
 
 const DEFAULT_MAINTENANCE_MARGIN_PCT = 5;
 
@@ -120,7 +121,7 @@ export function PositionTable() {
               <>
                 <tr key={position.address} className={isExpanded ? 'expanded' : ''}>
                   <td className={position.side === 'long' ? 'long' : 'short'}>
-                    {position.side.toUpperCase()}
+                    {position.side.toUpperCase()} <span className="position-commodity">{position.commodity}</span>
                   </td>
                   <td>{position.size.toFixed(4)}</td>
                   <td>${position.entryPrice.toFixed(2)}</td>
@@ -128,7 +129,7 @@ export function PositionTable() {
                     {markPrice !== undefined ? `$${markPrice.toFixed(2)}` : '-'}
                     {position.settled && ' (settled)'}
                   </td>
-                  <td>{position.leverage}x</td>
+                  <td>{formatLeverage(position.leverage)}x</td>
                   <td className={pnlClass}>
                     ${position.unrealizedPnl.toFixed(2)}
                     <span className="pnl-percent">

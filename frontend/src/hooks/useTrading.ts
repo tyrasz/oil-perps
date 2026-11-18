@@ -11,6 +11,7 @@ import {
   getVaultTokenAccountPDA,
   getPositionPDA,
   getUserReferralPDA,
+  isProgramAccount,
 } from '../utils/pda';
 import { parseAnchorError, getExplorerUrl } from '../utils/transaction';
 import { useMarketStore } from '../stores/marketStore';
@@ -76,8 +77,7 @@ export function useTrading() {
     if (!publicKey || !connection) return false;
 
     const [userAccountPda] = getUserAccountPDA(publicKey, marketPda);
-    const accountInfo = await connection.getAccountInfo(userAccountPda);
-    return accountInfo !== null;
+    return isProgramAccount(await connection.getAccountInfo(userAccountPda));
   }, [publicKey, connection, marketPda]);
 
   /**
@@ -86,8 +86,7 @@ export function useTrading() {
   const checkMarketExists = useCallback(async (): Promise<boolean> => {
     if (!connection) return false;
 
-    const accountInfo = await connection.getAccountInfo(marketPda);
-    return accountInfo !== null;
+    return isProgramAccount(await connection.getAccountInfo(marketPda));
   }, [connection, marketPda]);
 
   /**

@@ -7,6 +7,12 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3003';
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3003/ws';
 const EMPTY_TRADES: Trade[] = [];
 
+async function fetchJson(url: string) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  return res.json();
+}
+
 /**
  * Owns the market data feed: REST polling plus one WebSocket connection.
  * Mount it exactly once (in App); components read the data via useMarket().
@@ -28,19 +34,24 @@ export function useMarketFeed() {
         fetch(`${API_URL}/api/market/${commodity.id}/stats`),
       ]);
 
-      // Fallback to old endpoints if new ones not available
+      // The legacy single-market endpoints serve the original (default) market
+      // only; using them for another commodity would store its price under
+      // the wrong market.
+      const legacy = commodity.id === DEFAULT_COMMODITY.id;
       const marketData = marketRes.ok
         ? await marketRes.json()
-        : await fetch(`${API_URL}/api/market`).then(r => r.json());
-
+        : legacy ? await fetchJson(`${API_URL}/api/market`) : null;
       const stats = statsRes.ok
         ? await statsRes.json()
-        : await fetch(`${API_URL}/api/market/stats`).then(r => r.json());
+        : legacy ? await fetchJson(`${API_URL}/api/market/stats`) : null;
+      if (!marketData || !stats?.price) {
+        throw new Error(`no price data for ${commodity.id}`);
+      }
 
       setMarket(commodity.id, {
         address: marketData.address || `${commodity.id}_market`,
         commodity: commodity.id,
-        price: (stats.price || commodity.basePrice * 1_000_000) / 1_000_000,
+        price: stats.price / 1_000_000,
         priceChange24h: stats.price_change_24h || 0,
         volume24h: (stats.volume_24h || 0) / 1_000_000,
         openInterest: (stats.open_interest || 0) / 1_000_000,
@@ -52,7 +63,10 @@ export function useMarketFeed() {
       });
     } catch (error) {
       console.error(`Failed to fetch market data for ${commodity.id}:`, error);
-      // Set mock data as fallback
+      // Keep the last real data: replacing a live price with a demo value
+      // could fire TP/SL orders or misstate margin. Demo data is only for a
+      // commodity that has never loaded (e.g. no backend running).
+      if (useMarketStore.getState().markets[commodity.id]) return;
       setMarket(commodity.id, {
         address: `${commodity.id}_market`,
         commodity: commodity.id,

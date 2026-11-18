@@ -10,8 +10,11 @@ interface TpSlManagerProps {
 
 export function TpSlManager({ position, onClose }: TpSlManagerProps) {
   const { addTriggerOrder, removeTriggerOrder, getTriggerOrdersForPosition } = useTriggerOrderStore();
-  const { getCurrentMarket } = useMarketStore();
-  const market = getCurrentMarket();
+  const markets = useMarketStore((s) => s.markets);
+  // The position's own price (settlement price if its market is settled)
+  const currentPrice = position.markPrice ?? markets[position.commodity]?.price;
+  // Settled positions only close at the settlement price, so triggers can't run
+  const triggersDisabled = !!position.settled;
 
   const [tpPrice, setTpPrice] = useState('');
   const [slPrice, setSlPrice] = useState('');
@@ -104,7 +107,7 @@ export function TpSlManager({ position, onClose }: TpSlManagerProps) {
   return (
     <div className="tpsl-manager">
       <div className="tpsl-header">
-        <h4>TP/SL for {position.side.toUpperCase()} Position</h4>
+        <h4>TP/SL for {position.side.toUpperCase()} {position.commodity} Position</h4>
         {onClose && (
           <button className="close-btn" onClick={onClose}>
             ×
@@ -119,7 +122,7 @@ export function TpSlManager({ position, onClose }: TpSlManagerProps) {
         </div>
         <div className="info-row">
           <span>Current Price</span>
-          <span>${market?.price.toFixed(2) || '-'}</span>
+          <span>{currentPrice !== undefined ? `$${currentPrice.toFixed(2)}` : '-'}</span>
         </div>
         <div className="info-row">
           <span>Unrealized PnL</span>
@@ -149,7 +152,7 @@ export function TpSlManager({ position, onClose }: TpSlManagerProps) {
           />
           <button
             onClick={handleSetTp}
-            disabled={!tpPrice || !tpValid}
+            disabled={!tpPrice || !tpValid || triggersDisabled}
             className="set-btn tp"
           >
             {existingTp ? 'Update' : 'Set'}
@@ -182,7 +185,7 @@ export function TpSlManager({ position, onClose }: TpSlManagerProps) {
           />
           <button
             onClick={handleSetSl}
-            disabled={!slPrice || !slValid}
+            disabled={!slPrice || !slValid || triggersDisabled}
             className="set-btn sl"
           >
             {existingSl ? 'Update' : 'Set'}

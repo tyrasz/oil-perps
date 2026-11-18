@@ -2,9 +2,9 @@
 // web3.js address derivation fails under jsdom (mixed Buffer/Uint8Array realms).
 import { describe, it, expect } from 'vitest';
 import { PublicKey } from '@solana/web3.js';
-import { commodityForMarket, getCommodityMarket, getMarketPDA, getUserAccountPDA } from './pda';
+import { commodityForMarket, getCommodityMarket, getMarketPDA, getUserAccountPDA, isProgramAccount } from './pda';
 import { COMMODITIES } from '../config/commodities';
-import { USDC_MINT } from '../config/program';
+import { PERPS_CORE_PROGRAM_ID, USDC_MINT } from '../config/program';
 
 // Pinned in programs/perps-core (state/market.rs) and the keeper too, so all
 // three derive the same addresses.
@@ -34,5 +34,14 @@ describe('market PDAs', () => {
     }
     expect(commodityForMarket(OIL_MARKET)).toBe('OIL');
     expect(commodityForMarket(PublicKey.default)).toBeUndefined();
+  });
+
+  it('only treats initialized program accounts as existing', () => {
+    const data = { length: 290 };
+    expect(isProgramAccount({ owner: PERPS_CORE_PROGRAM_ID, data })).toBe(true);
+    expect(isProgramAccount(null)).toBe(false);
+    // Lamports sent to an unused address: system-owned and empty
+    expect(isProgramAccount({ owner: PublicKey.default, data: { length: 0 } })).toBe(false);
+    expect(isProgramAccount({ owner: PERPS_CORE_PROGRAM_ID, data: { length: 0 } })).toBe(false);
   });
 });

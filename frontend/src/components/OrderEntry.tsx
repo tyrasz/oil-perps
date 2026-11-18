@@ -44,14 +44,18 @@ export function OrderEntry() {
   const [size, setSize] = useState('');
   const [price, setPrice] = useState('');
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [marketExists, setMarketExists] = useState<boolean | null>(null);
+  // Answer is tagged with its commodity; an answer for another commodity reads as unknown
+  const [marketCheck, setMarketCheck] = useState<{ id: string; exists: boolean } | null>(null);
+  const marketExists = marketCheck?.id === selectedCommodity.id ? marketCheck.exists : null;
 
   // Check if market is initialized on-chain
   useEffect(() => {
+    // Re-checked for each commodity (checkMarketExists changes with it)
+    const id = selectedCommodity.id;
     if (connected) {
-      checkMarketExists().then(setMarketExists);
+      checkMarketExists().then((exists) => setMarketCheck({ id, exists }));
     }
-  }, [connected, checkMarketExists]);
+  }, [connected, checkMarketExists, selectedCommodity.id]);
 
   // Leverage options, capped by the commodity limit and the on-chain margin rules
   const maxLev = maxAllowedLeverage(selectedCommodity.maxLeverage, onChainMarket, preClose);
@@ -310,7 +314,7 @@ export function OrderEntry() {
       <button
         className={`submit-btn ${side}`}
         onClick={handleSubmit}
-        disabled={!connected || !size || isTradingLoading || insufficientMargin || marketExists === false || !sizeValidation.valid || !canOpen}
+        disabled={!connected || !size || isTradingLoading || insufficientMargin || marketExists === false || !sizeValidation.valid || !canOpen || (marketExists === true && !onChainMarket)}
       >
         {!connected
           ? 'Connect Wallet'
