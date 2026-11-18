@@ -37,7 +37,7 @@ pub struct Position {
 
     // PnL tracking
     pub realized_pnl: i64,            // Cumulative realized PnL
-    pub last_funding_payment: i64,    // Last funding rate at settlement
+    pub last_funding_payment: i64,    // Market::cumulative_funding when funding was last settled
 
     // Timestamps
     pub opened_at: i64,
@@ -91,15 +91,13 @@ impl Position {
     /// Funding accrued since the position last settled, in collateral units
     /// (USDC, 6 decimals). Positive means the position is owed funding.
     ///
-    /// `cumulative_funding_rate` is the market's running sum of per-period
-    /// rates (6 decimals, 100 = 0.01%). The payment is that rate applied to the
-    /// position's notional at `price`, so it scales with the commodity's price.
-    pub fn accrued_funding(&self, cumulative_funding_rate: i64, price: u64) -> i64 {
-        let rate_diff = cumulative_funding_rate as i128 - self.last_funding_payment as i128;
-        let notional = (self.size as i128) * (price as i128) / 1_000_000;
-        let payment = notional * rate_diff / 1_000_000;
+    /// `cumulative_funding` is the market's running funding per whole
+    /// contract in USDC, accumulated at each period's price.
+    pub fn accrued_funding(&self, cumulative_funding: i64) -> i64 {
+        let per_contract = cumulative_funding as i128 - self.last_funding_payment as i128;
+        let payment = (self.size as i128) * per_contract / 1_000_000;
 
-        // Positive rate: longs pay shorts.
+        // Positive funding: longs pay shorts.
         let signed = match self.side {
             Side::Long => -payment,
             Side::Short => payment,
@@ -172,27 +170,36 @@ mod tests {
         }
     }
 
+    use crate::state::funding_per_contract;
+
     #[test]
     fn funding_scales_with_notional_not_contract_count() {
         // 0.01% on $7,500 notional = $0.75
         let long = oil_position(Side::Long);
-        assert_eq!(long.accrued_funding(100, 75_000_000), -750_000);
+        assert_eq!(long.accrued_funding(funding_per_contract(100, 75_000_000)), -750_000);
         // Same rate at $150 oil costs twice as much
-        assert_eq!(long.accrued_funding(100, 150_000_000), -1_500_000);
+        assert_eq!(long.accrued_funding(funding_per_contract(100, 150_000_000)), -1_500_000);
+    }
+
+    #[test]
+    fn each_period_is_charged_at_its_own_price() {
+        // 0.01% at $75, then 0.01% at $150: $0.75 + $1.50
+        let index = funding_per_contract(100, 75_000_000) + funding_per_contract(100, 150_000_000);
+        assert_eq!(oil_position(Side::Long).accrued_funding(index), -2_250_000);
     }
 
     #[test]
     fn funding_sign_depends_on_side_and_rate() {
-        assert_eq!(oil_position(Side::Short).accrued_funding(100, 75_000_000), 750_000);
-        assert_eq!(oil_position(Side::Long).accrued_funding(-100, 75_000_000), 750_000);
+        assert_eq!(oil_position(Side::Short).accrued_funding(7_500), 750_000);
+        assert_eq!(oil_position(Side::Long).accrued_funding(-7_500), 750_000);
     }
 
     #[test]
     fn funding_only_counts_since_last_settlement() {
         let mut long = oil_position(Side::Long);
-        long.last_funding_payment = 300;
-        assert_eq!(long.accrued_funding(400, 75_000_000), -750_000);
-        assert_eq!(long.accrued_funding(300, 75_000_000), 0);
+        long.last_funding_payment = 22_500;
+        assert_eq!(long.accrued_funding(30_000), -750_000);
+        assert_eq!(long.accrued_funding(22_500), 0);
     }
 
     #[test]

@@ -96,7 +96,7 @@ pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
     let pnl = position.unrealized_pnl(oracle_price);
 
     // Funding accrued since open, in collateral units
-    let funding_payment = position.accrued_funding(market.funding_rate, oracle_price);
+    let funding_payment = position.accrued_funding(market.cumulative_funding);
 
     // Calculate fees
     let notional = position.notional_value();

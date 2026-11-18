@@ -77,7 +77,7 @@ pub fn handler(ctx: Context<Liquidate>) -> Result<()> {
     let (_, maintenance_margin_ratio) = market.margin_ratios(current_time);
 
     // Unpaid funding counts against the position's equity
-    let funding_payment = position.accrued_funding(market.funding_rate, oracle_price);
+    let funding_payment = position.accrued_funding(market.cumulative_funding);
 
     // Check if position is liquidatable
     require!(

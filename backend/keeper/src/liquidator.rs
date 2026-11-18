@@ -52,7 +52,7 @@ pub struct MarketData {
     pub long_open_interest: u64,
     pub short_open_interest: u64,
     pub max_open_interest: u64,
-    pub funding_rate: i64,
+    pub cumulative_funding: i64,
     pub last_funding_time: i64,
     pub funding_interval: i64,
     pub insurance_fund: u64,
@@ -68,6 +68,7 @@ pub struct MarketData {
     pub min_oracle_price: u64,
     pub settlement_price: u64,
     pub referral_reserve: u64,
+    pub funding_rate: i64,
 }
 
 impl MarketData {
@@ -235,7 +236,7 @@ async fn check_market(
 
     for (position_address, position) in open_positions {
         // Check if position is liquidatable
-        let margin_ratio = calculate_margin_ratio(&position, oracle_price, market_data.funding_rate);
+        let margin_ratio = calculate_margin_ratio(&position, oracle_price, market_data.cumulative_funding);
 
         if margin_ratio < maintenance_margin_ratio {
             info!(
@@ -340,11 +341,11 @@ fn fetch_open_positions(
 }
 
 /// Funding owed to (+) or by (-) the position since it last settled, in USDC.
-/// Mirrors `Position::accrued_funding` in perps-core.
-fn accrued_funding(position: &PositionData, cumulative_funding_rate: i64, price: u64) -> i64 {
-    let rate_diff = cumulative_funding_rate as i128 - position.last_funding_payment as i128;
-    let notional = (position.size as i128) * (price as i128) / 1_000_000;
-    let payment = notional * rate_diff / 1_000_000;
+/// Mirrors `Position::accrued_funding` in perps-core: `cumulative_funding` is
+/// USDC per whole contract, accumulated at each funding period's price.
+fn accrued_funding(position: &PositionData, cumulative_funding: i64) -> i64 {
+    let per_contract = cumulative_funding as i128 - position.last_funding_payment as i128;
+    let payment = (position.size as i128) * per_contract / 1_000_000;
     let signed = if position.side == 0 { -payment } else { payment };
     signed.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
@@ -352,7 +353,7 @@ fn accrued_funding(position: &PositionData, cumulative_funding_rate: i64, price:
 /// Margin ratio in basis points. Mirrors `Position::margin_ratio` in perps-core
 /// (entry-price notional, funding included) so the keeper only submits
 /// liquidations the program will accept.
-fn calculate_margin_ratio(position: &PositionData, current_price: u64, cumulative_funding_rate: i64) -> u32 {
+fn calculate_margin_ratio(position: &PositionData, current_price: u64, cumulative_funding: i64) -> u32 {
     let entry = position.entry_price as i128;
     let current = current_price as i128;
     let size = position.size as i128;
@@ -366,7 +367,7 @@ fn calculate_margin_ratio(position: &PositionData, current_price: u64, cumulativ
     };
 
     let pnl = (size * price_diff) / 1_000_000;
-    let funding = accrued_funding(position, cumulative_funding_rate, current_price) as i128;
+    let funding = accrued_funding(position, cumulative_funding) as i128;
     let equity = (position.collateral as i128) + pnl + funding;
 
     if equity <= 0 {
@@ -488,14 +489,15 @@ mod tests {
         bytes.extend_from_slice(&5_000_000u64.to_le_bytes()); // min_oracle_price
         bytes.extend_from_slice(&0u64.to_le_bytes()); // settlement_price
         bytes.extend_from_slice(&77u64.to_le_bytes()); // referral_reserve
-        bytes.extend_from_slice(&[0u8; 15]); // padding
+        bytes.extend_from_slice(&(-3i64).to_le_bytes()); // funding_rate
+        bytes.extend_from_slice(&[0u8; 7]); // padding
         assert_eq!(8 + bytes.len(), 298); // Market::LEN
 
         let m = MarketData::deserialize(&mut bytes.as_slice()).unwrap();
         assert_eq!(m.vault, Pubkey::new_from_array([3; 32]));
         assert_eq!(m.pyth_price_feed, Pubkey::new_from_array([4; 32]));
         assert_eq!((m.maintenance_margin_ratio, m.initial_margin_ratio), (500, 1_000));
-        assert_eq!(m.funding_rate, -7);
+        assert_eq!((m.cumulative_funding, m.funding_rate), (-7, -3));
         assert_eq!((m.last_funding_time, m.funding_interval), (1_700_000_000, 3_600));
         assert_eq!(m.insurance_fund, 44);
         assert_eq!((m.bump, m.is_paused), (254, true));
@@ -568,8 +570,8 @@ mod tests {
 
     #[test]
     fn margin_ratio_counts_unpaid_funding() {
-        // 0.53% cumulative funding on $7,500 = $39.75 owed by the long
-        assert_eq!(accrued_funding(&oil_long(), 5_300, 75_000_000), -39_750_000);
-        assert_eq!(calculate_margin_ratio(&oil_long(), 75_000_000, 5_300), 947);
+        // $0.3975 per contract (0.53% of $75) on 100 contracts = $39.75 owed by the long
+        assert_eq!(accrued_funding(&oil_long(), 397_500), -39_750_000);
+        assert_eq!(calculate_margin_ratio(&oil_long(), 75_000_000, 397_500), 947);
     }
 }

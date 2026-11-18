@@ -85,6 +85,7 @@ pub fn handler(ctx: Context<InitializeMarket>, params: InitializeMarketParams) -
 
     market.long_open_interest = 0;
     market.short_open_interest = 0;
+    market.cumulative_funding = 0;
     market.funding_rate = 0;
     market.last_funding_time = Clock::get()?.unix_timestamp;
     market.insurance_fund = 0;

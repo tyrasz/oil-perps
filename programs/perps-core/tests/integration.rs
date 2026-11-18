@@ -545,3 +545,24 @@ async fn funding_is_charged_on_notional() {
     // $1,500 collateral - 0.01% of $7,500 funding ($0.75) - 0.05% fee ($3.75)
     assert_eq!(env.token_balance(env.alice.token_account).await - before, 1_495_500_000);
 }
+
+#[tokio::test]
+async fn each_funding_period_is_charged_at_its_own_price() {
+    let mut env = Env::new().await.funded("OIL", 10_000 * USDC).await;
+    let before = env.token_balance(env.alice.token_account).await;
+    let position = env.open("OIL", 0, 100, 5).await.unwrap();
+
+    // 0.01% at $75, then the price doubles and another 0.01% at $150
+    let t = env.now().await;
+    env.set_time(t + 3_600).await;
+    env.update_funding("OIL").await.unwrap();
+    env.set_price("OIL", dollars(150.0), 0).await;
+    env.set_time(t + 7_200).await;
+    env.update_funding("OIL").await.unwrap();
+    assert_eq!(env.market("OIL").await.funding_rate, 100); // latest period's rate, for display
+
+    env.close("OIL", position).await.unwrap();
+    // $1,500 collateral + $7,500 profit - funding ($0.75 + $1.50) - fee ($3.75).
+    // Charging both periods at the closing price would have cost $3.00.
+    assert_eq!(env.token_balance(env.alice.token_account).await - before, 8_994_000_000);
+}

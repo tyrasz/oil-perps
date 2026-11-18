@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use crate::oracle::read_price;
-use crate::state::Market;
+use crate::state::{funding_per_contract, Market};
 use crate::errors::PerpsError;
 
 #[derive(Accounts)]
@@ -53,7 +53,10 @@ pub fn handler(ctx: Context<UpdateFunding>) -> Result<()> {
     };
 
     // Update market
-    market.funding_rate = market.funding_rate.saturating_add(funding_rate);
+    market.funding_rate = funding_rate;
+    market.cumulative_funding = market
+        .cumulative_funding
+        .saturating_add(funding_per_contract(funding_rate, oracle_price));
     market.last_funding_time = current_time;
 
     msg!(

@@ -26,7 +26,7 @@ pub struct Market {
     pub max_open_interest: u64,         // Cap per side
 
     // Funding rate
-    pub funding_rate: i64,              // Current funding rate (can be negative)
+    pub cumulative_funding: i64,        // Running funding per whole contract, USDC (6 decimals); + = longs paid
     pub last_funding_time: i64,         // Unix timestamp
     pub funding_interval: i64,          // Seconds between funding (3600 = 1 hour)
 
@@ -50,6 +50,7 @@ pub struct Market {
     pub min_oracle_price: u64,                // 6 decimals; prices below halt the market; 0 = off
     pub settlement_price: u64,                // 6 decimals; non-zero once settle_market has run
     pub referral_reserve: u64,                // Referral rewards earned here and not yet claimed
+    pub funding_rate: i64,                    // Latest per-period funding rate (6 decimals, 100 = 0.01%)
 }
 
 impl Market {
@@ -68,7 +69,7 @@ impl Market {
         8 +   // long_open_interest
         8 +   // short_open_interest
         8 +   // max_open_interest
-        8 +   // funding_rate
+        8 +   // cumulative_funding
         8 +   // last_funding_time
         8 +   // funding_interval
         8 +   // insurance_fund
@@ -84,7 +85,8 @@ impl Market {
         8 +   // min_oracle_price
         8 +   // settlement_price
         8 +   // referral_reserve
-        15;   // padding for future use
+        8 +   // funding_rate
+        7;    // padding for future use
 
     /// Convert commodity bytes to string
     pub fn commodity_str(&self) -> String {
@@ -223,6 +225,14 @@ fn ceil_div(a: u128, b: u128) -> u128 {
     (a + b - 1) / b
 }
 
+/// Funding for one period per whole contract, in USDC (6 decimals): the
+/// period's rate (6 decimals) applied to that period's price. Accumulating
+/// this, rather than the bare rate, charges each period at its own price.
+pub fn funding_per_contract(rate: i64, price: u64) -> i64 {
+    let amount = rate as i128 * price as i128 / 1_000_000;
+    amount.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
 /// Returns `(new_fund, uncovered_deficit)`.
 pub fn apply_insurance(fund: u64, credit: u64, deficit: u64) -> (u64, u64) {
     let available = fund.saturating_add(credit);
@@ -349,7 +359,7 @@ mod tests {
     fn account_size_is_unchanged_so_existing_markets_still_load() {
         assert_eq!(Market::LEN, 298);
         let serialized = Market::default().try_to_vec().unwrap().len();
-        assert_eq!(8 + serialized + 15, Market::LEN);
+        assert_eq!(8 + serialized + 7, Market::LEN);
     }
 
     // Fri 2026-11-13: 22:00 UTC is the 17:00 ET weekly close.
@@ -425,6 +435,14 @@ mod tests {
     fn empty_fund_limits_reward_and_reports_bad_debt() {
         assert_eq!(liquidation_payout(0, 0, 25, 3), (0, 0, 25));
         assert_eq!(liquidation_payout(2, 0, 25, 3), (2, 0, 25));
+    }
+
+    #[test]
+    fn funding_per_contract_uses_the_period_price() {
+        // 0.01% of $75 = $0.0075 per contract
+        assert_eq!(funding_per_contract(100, 75_000_000), 7_500);
+        assert_eq!(funding_per_contract(100, 150_000_000), 15_000);
+        assert_eq!(funding_per_contract(-100, 75_000_000), -7_500);
     }
 
     #[test]

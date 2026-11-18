@@ -116,7 +116,7 @@ pub fn handler(ctx: Context<OpenPosition>, params: OpenPositionParams) -> Result
     position.entry_price = oracle_price;
     position.leverage = params.leverage;
     position.realized_pnl = 0;
-    position.last_funding_payment = market.funding_rate;
+    position.last_funding_payment = market.cumulative_funding;
     position.opened_at = current_time;
     position.last_updated_at = current_time;
     position.status = PositionStatus::Open;
