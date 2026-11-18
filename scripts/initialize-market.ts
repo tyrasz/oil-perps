@@ -239,8 +239,9 @@ async function applyRiskConfig(
 /**
  * One-time protocol setup. Must be signed by the program's upgrade authority,
  * which becomes the admin (hand over later with propose_admin/accept_admin).
- * The guardian (pause-only) comes from GUARDIAN; the Pyth program from
- * PYTH_PROGRAM_ID, or else the owner of this commodity's price feed account.
+ * The guardian (pause-only) comes from GUARDIAN; the Pyth oracle program from
+ * PYTH_PROGRAM_ID (required: it is what price feeds are checked against, so it
+ * must not be read off a feed account).
  */
 async function ensureProtocolConfig(
   program: Program,
@@ -261,14 +262,8 @@ async function ensureProtocolConfig(
     return;
   }
 
-  let oracleProgram: PublicKey;
-  if (process.env.PYTH_PROGRAM_ID) {
-    oracleProgram = new PublicKey(process.env.PYTH_PROGRAM_ID);
-  } else {
-    const feed = await connection.getAccountInfo(PYTH_PRICE_FEEDS[commodity]);
-    if (!feed) throw new Error(`Price feed for ${commodity} not found; set PYTH_PROGRAM_ID`);
-    oracleProgram = feed.owner;
-  }
+  const oracleProgram = requiredPythProgram();
+  await assertPythFeed(connection, PYTH_PRICE_FEEDS[commodity], oracleProgram);
   let guardian = authority.publicKey;
   if (process.env.GUARDIAN) {
     guardian = new PublicKey(process.env.GUARDIAN);
@@ -288,6 +283,27 @@ async function ensureProtocolConfig(
     .signers([authority])
     .rpc();
   console.log(`Protocol config created: ${tx}`);
+}
+
+const PYTH_MAGIC = 0xa1b2c3d4;
+
+function requiredPythProgram(): PublicKey {
+  if (!process.env.PYTH_PROGRAM_ID) {
+    throw new Error('Set PYTH_PROGRAM_ID to the Pyth oracle program for this cluster (see https://docs.pyth.network)');
+  }
+  return new PublicKey(process.env.PYTH_PROGRAM_ID);
+}
+
+/** Fail unless `feed` is a Pyth price account owned by `oracleProgram`. */
+async function assertPythFeed(connection: Connection, feed: PublicKey, oracleProgram: PublicKey): Promise<void> {
+  const info = await connection.getAccountInfo(feed);
+  if (!info) throw new Error(`Price feed ${feed} does not exist`);
+  if (!info.owner.equals(oracleProgram)) {
+    throw new Error(`Price feed ${feed} is owned by ${info.owner}, not the Pyth program ${oracleProgram}`);
+  }
+  if (info.data.length < 4 || info.data.readUInt32LE(0) !== PYTH_MAGIC) {
+    throw new Error(`Price feed ${feed} is not a Pyth price account`);
+  }
 }
 
 async function checkMarketExists(connection: Connection, commodity: string): Promise<boolean> {
@@ -360,6 +376,13 @@ async function main() {
       const market = (await program.account.market.fetch(marketPda)) as Record<string, unknown> & { isPaused: boolean };
       isPaused = market.isPaused;
       console.log(`Market already exists: ${marketPda.toString()} (paused: ${isPaused})`);
+      // Never adopt a market pointing at a different price feed (e.g. one
+      // created before admin-only market creation existed)
+      const feed = market.pythPriceFeed as PublicKey;
+      if (!feed.equals(PYTH_PRICE_FEEDS[commodity])) {
+        throw new Error(`Existing ${commodity} market uses price feed ${feed}, expected ${PYTH_PRICE_FEEDS[commodity]}. Pause or settle it instead of configuring it.`);
+      }
+      await assertPythFeed(connection, feed, requiredPythProgram());
       // Don't silently overwrite settings an operator may have tightened
       if (!updateConfig) {
         const current = ['sessionSchedule', 'preCloseWindowSecs', 'weekendInitialMarginRatio',
@@ -370,6 +393,7 @@ async function main() {
         return;
       }
     } else {
+      await assertPythFeed(connection, PYTH_PRICE_FEEDS[commodity], requiredPythProgram());
       const signature = await initializeMarket(program, authority, commodity);
       console.log(`https://explorer.solana.com/tx/${signature}?cluster=testnet`);
     }

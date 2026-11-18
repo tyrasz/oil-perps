@@ -1,0 +1,11 @@
+[package]
+name = "idlgen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anchor-syn = { version = "=0.28.0", features = ["idl", "init-if-needed"] }
+serde_json = "1"
+heck = "0.4"
+
+[workspace]

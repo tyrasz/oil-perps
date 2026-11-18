@@ -18,6 +18,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p perps-core -p prop-amm -p vamm
 
+  sbf:
+    name: SBF build, end-to-end on SBF, TypeScript suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Host toolchain for MSRV-aware resolution in build-sbf.sh (needs cargo >= 1.84)
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Solana 1.18 tools
+        run: |
+          curl -sSfL https://github.com/anza-xyz/agave/releases/download/v1.18.26/solana-release-x86_64-unknown-linux-gnu.tar.bz2 | tar xj -C "$HOME"
+          echo "$HOME/solana-release/bin" >> "$GITHUB_PATH"
+      - run: scripts/build-sbf.sh
+      # Native tests can't catch SBF-only failures (e.g. the 4 KB stack limit)
+      - run: SBF_OUT_DIR=$PWD/target/deploy cargo test -p perps-core -p prop-amm --test integration
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: solana-keygen new --no-bip39-passphrase --silent -o ~/.config/solana/id.json
+      - run: scripts/test-ts.sh
+
   keeper:
     name: Keeper
     runs-on: ubuntu-latest

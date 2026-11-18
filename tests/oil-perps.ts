@@ -1,6 +1,6 @@
-import * as anchor from "@project-serum/anchor";
-import { Program, BN } from "@project-serum/anchor";
-import { OilPerps } from "../target/types/oil_perps";
+import * as anchor from "@coral-xyz/anchor";
+import { Program, BN } from "@coral-xyz/anchor";
+import { PerpsCore } from "../target/types/perps_core";
 import {
   Keypair,
   PublicKey,
@@ -20,7 +20,7 @@ describe("oil-perps", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
-  const program = anchor.workspace.OilPerps as Program<OilPerps>;
+  const program = anchor.workspace.PerpsCore as Program<PerpsCore>;
 
   // Test accounts
   let authority: Keypair;
