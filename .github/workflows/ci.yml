@@ -10,7 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned: newer compilers reject code in solana-client 1.18 (never-type
+      # fallback). This is the version the tests are verified with.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p perps-core -p prop-amm -p vamm
 
@@ -19,7 +23,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned: newer compilers reject code in solana-client 1.18 (never-type
+      # fallback). This is the version the tests are verified with.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: backend/keeper
