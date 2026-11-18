@@ -10,14 +10,14 @@ pub struct WithdrawCollateral<'info> {
 
     #[account(
         mut,
-        seeds = [b"user", owner.key().as_ref()],
+        seeds = [b"user", owner.key().as_ref(), market.key().as_ref()],
         bump = user_account.bump,
         constraint = user_account.owner == owner.key()
     )]
     pub user_account: Account<'info, UserAccount>,
 
     #[account(
-        seeds = [b"market", market.collateral_mint.as_ref()],
+        seeds = [b"market", market.collateral_mint.as_ref(), market.commodity_seed()],
         bump = market.bump
     )]
     pub market: Account<'info, Market>,

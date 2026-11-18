@@ -17,6 +17,7 @@ pub struct InitializeMarketParams {
 }
 
 #[derive(Accounts)]
+#[instruction(params: InitializeMarketParams)]
 pub struct InitializeMarket<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -25,7 +26,7 @@ pub struct InitializeMarket<'info> {
         init,
         payer = authority,
         space = Market::LEN,
-        seeds = [b"market", collateral_mint.key().as_ref()],
+        seeds = [b"market", collateral_mint.key().as_ref(), params.commodity.as_bytes()],
         bump
     )]
     pub market: Account<'info, Market>,
@@ -60,7 +61,8 @@ pub struct InitializeMarket<'info> {
 }
 
 pub fn handler(ctx: Context<InitializeMarket>, params: InitializeMarketParams) -> Result<()> {
-    require!(!params.commodity.is_empty() && params.commodity.len() <= 8, PerpsError::InvalidMarketConfig);
+    // Also guarantees the PDA seed (the raw string) matches Market::commodity_seed()
+    require!(Market::is_valid_commodity(&params.commodity), PerpsError::InvalidMarketConfig);
     require!(params.max_leverage > 0 && params.max_leverage <= 100_000, PerpsError::InvalidMarketConfig);
     require!(params.maintenance_margin_ratio > 0, PerpsError::InvalidMarketConfig);
     require!(params.initial_margin_ratio > params.maintenance_margin_ratio, PerpsError::InvalidMarketConfig);

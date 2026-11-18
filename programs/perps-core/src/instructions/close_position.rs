@@ -11,7 +11,7 @@ pub struct ClosePosition<'info> {
 
     #[account(
         mut,
-        seeds = [b"user", owner.key().as_ref()],
+        seeds = [b"user", owner.key().as_ref(), market.key().as_ref()],
         bump = user_account.bump,
         constraint = user_account.owner == owner.key()
     )]
@@ -19,7 +19,7 @@ pub struct ClosePosition<'info> {
 
     #[account(
         mut,
-        seeds = [b"market", market.collateral_mint.as_ref()],
+        seeds = [b"market", market.collateral_mint.as_ref(), market.commodity_seed()],
         bump = market.bump
     )]
     pub market: Account<'info, Market>,
@@ -155,6 +155,8 @@ pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
     // Add fee to insurance fund (minus referral reward which stays for claiming),
     // then let the fund absorb any loss beyond the position's collateral.
     let insurance_fee = fee.saturating_sub(referral_reward);
+    // The reward stays in this market's vault until claimed
+    market.referral_reserve = market.referral_reserve.saturating_add(referral_reward);
     let uncovered = market.settle_insurance(insurance_fee, deficit);
     if deficit > 0 {
         msg!("Bad debt: deficit={}, uncovered={}", deficit, uncovered);

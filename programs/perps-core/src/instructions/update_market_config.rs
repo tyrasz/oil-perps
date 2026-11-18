@@ -38,7 +38,7 @@ pub struct UpdateMarketConfig<'info> {
 
     #[account(
         mut,
-        seeds = [b"market", market.collateral_mint.as_ref()],
+        seeds = [b"market", market.collateral_mint.as_ref(), market.commodity_seed()],
         bump = market.bump,
         constraint = market.authority == authority.key() @ PerpsError::Unauthorized,
     )]

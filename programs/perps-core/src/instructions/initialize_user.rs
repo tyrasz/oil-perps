@@ -1,16 +1,24 @@
 use anchor_lang::prelude::*;
-use crate::state::UserAccount;
+use crate::state::{Market, UserAccount};
 
 #[derive(Accounts)]
 pub struct InitializeUser<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
 
+    /// User accounts are per market: collateral deposited in one market's vault
+    /// can only be used and withdrawn there.
+    #[account(
+        seeds = [b"market", market.collateral_mint.as_ref(), market.commodity_seed()],
+        bump = market.bump
+    )]
+    pub market: Account<'info, Market>,
+
     #[account(
         init,
         payer = owner,
         space = UserAccount::LEN,
-        seeds = [b"user", owner.key().as_ref()],
+        seeds = [b"user", owner.key().as_ref(), market.key().as_ref()],
         bump
     )]
     pub user_account: Account<'info, UserAccount>,

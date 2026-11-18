@@ -18,7 +18,7 @@ pub struct OpenPosition<'info> {
 
     #[account(
         mut,
-        seeds = [b"user", owner.key().as_ref()],
+        seeds = [b"user", owner.key().as_ref(), market.key().as_ref()],
         bump = user_account.bump,
         constraint = user_account.owner == owner.key()
     )]
@@ -26,7 +26,7 @@ pub struct OpenPosition<'info> {
 
     #[account(
         mut,
-        seeds = [b"market", market.collateral_mint.as_ref()],
+        seeds = [b"market", market.collateral_mint.as_ref(), market.commodity_seed()],
         bump = market.bump,
         constraint = !market.is_paused @ PerpsError::MarketPaused
     )]

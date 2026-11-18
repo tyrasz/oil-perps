@@ -105,9 +105,10 @@ const RISK_CONFIGS: Record<string, {
 };
 
 // PDA derivation functions
-function getMarketPDA(collateralMint: PublicKey): [PublicKey, number] {
+// One market per (collateral mint, commodity)
+function getMarketPDA(collateralMint: PublicKey, commodity: string): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
-    [Buffer.from('market'), collateralMint.toBuffer()],
+    [Buffer.from('market'), collateralMint.toBuffer(), Buffer.from(commodity)],
     PERPS_CORE_PROGRAM_ID
   );
 }
@@ -149,7 +150,7 @@ async function initializeMarket(
     throw new Error(`No Pyth price feed for commodity: ${commodity}`);
   }
 
-  const [marketPda] = getMarketPDA(USDC_MINT);
+  const [marketPda] = getMarketPDA(USDC_MINT, commodity);
   const [vaultPda] = getVaultPDA(marketPda);
   const [vaultTokenAccountPda] = getVaultTokenAccountPDA(marketPda);
 
@@ -200,7 +201,7 @@ async function applyRiskConfig(
   if (!risk) {
     throw new Error(`No risk config for commodity: ${commodity}`);
   }
-  const [marketPda] = getMarketPDA(USDC_MINT);
+  const [marketPda] = getMarketPDA(USDC_MINT, commodity);
 
   const params = {
     isPaused: false,
@@ -223,8 +224,8 @@ async function applyRiskConfig(
   return tx;
 }
 
-async function checkMarketExists(connection: Connection): Promise<boolean> {
-  const [marketPda] = getMarketPDA(USDC_MINT);
+async function checkMarketExists(connection: Connection, commodity: string): Promise<boolean> {
+  const [marketPda] = getMarketPDA(USDC_MINT, commodity);
   const accountInfo = await connection.getAccountInfo(marketPda);
   return accountInfo !== null;
 }
@@ -274,8 +275,8 @@ async function main() {
   // Initialize the market if needed, then (re)apply its risk controls, so
   // markets created before those existed pick them up too.
   try {
-    if (await checkMarketExists(connection)) {
-      const [marketPda] = getMarketPDA(USDC_MINT);
+    if (await checkMarketExists(connection, commodity)) {
+      const [marketPda] = getMarketPDA(USDC_MINT, commodity);
       console.log(`Market already exists: ${marketPda.toString()}`);
     } else {
       const signature = await initializeMarket(program, authority, commodity);

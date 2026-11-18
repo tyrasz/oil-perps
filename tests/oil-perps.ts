@@ -94,8 +94,9 @@ describe("oil-perps", () => {
     );
 
     // Derive PDAs
+    // One market per (collateral mint, commodity)
     [marketPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("market"), collateralMint.toBuffer()],
+      [Buffer.from("market"), collateralMint.toBuffer(), Buffer.from(marketParams.commodity)],
       program.programId
     );
 
@@ -109,13 +110,14 @@ describe("oil-perps", () => {
       program.programId
     );
 
+    // User accounts are per market
     [user1AccountPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("user"), user1.publicKey.toBuffer()],
+      [Buffer.from("user"), user1.publicKey.toBuffer(), marketPda.toBuffer()],
       program.programId
     );
 
     [user2AccountPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("user"), user2.publicKey.toBuffer()],
+      [Buffer.from("user"), user2.publicKey.toBuffer(), marketPda.toBuffer()],
       program.programId
     );
 
@@ -192,6 +194,43 @@ describe("oil-perps", () => {
       expect(market.isPaused).to.equal(false);
     });
 
+    it("should create a separate GOLD market on the same collateral", async () => {
+      const [goldMarketPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("market"), collateralMint.toBuffer(), Buffer.from(goldMarketParams.commodity)],
+        program.programId
+      );
+      const [goldVaultPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("vault"), goldMarketPda.toBuffer()],
+        program.programId
+      );
+      const [goldVaultTokenPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("vault_token"), goldMarketPda.toBuffer()],
+        program.programId
+      );
+      expect(goldMarketPda.toBase58()).to.not.equal(marketPda.toBase58());
+
+      await program.methods
+        .initializeMarket(goldMarketParams)
+        .accounts({
+          authority: authority.publicKey,
+          market: goldMarketPda,
+          vault: goldVaultPda,
+          vaultTokenAccount: goldVaultTokenPda,
+          collateralMint: collateralMint,
+          pythPriceFeed: Keypair.generate().publicKey,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .signers([authority])
+        .rpc();
+
+      const gold = await program.account.market.fetch(goldMarketPda);
+      const oil = await program.account.market.fetch(marketPda);
+      expect(Buffer.from(gold.commodity).toString().replace(/\0+$/, "")).to.equal("GOLD");
+      expect(Buffer.from(oil.commodity).toString().replace(/\0+$/, "")).to.equal("OIL");
+    });
+
     it("should fail with invalid max leverage (0)", async () => {
       const invalidParams = { ...marketParams, maxLeverage: 0 };
       const newMint = await createMint(
@@ -203,7 +242,7 @@ describe("oil-perps", () => {
       );
 
       const [newMarketPda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("market"), newMint.toBuffer()],
+        [Buffer.from("market"), newMint.toBuffer(), Buffer.from(invalidParams.commodity)],
         program.programId
       );
 
@@ -254,7 +293,7 @@ describe("oil-perps", () => {
       );
 
       const [newMarketPda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("market"), newMint.toBuffer()],
+        [Buffer.from("market"), newMint.toBuffer(), Buffer.from(invalidParams.commodity)],
         program.programId
       );
 
@@ -297,6 +336,7 @@ describe("oil-perps", () => {
         .initializeUser()
         .accounts({
           owner: user1.publicKey,
+          market: marketPda,
           userAccount: user1AccountPda,
           systemProgram: SystemProgram.programId,
         })
@@ -317,6 +357,7 @@ describe("oil-perps", () => {
         .initializeUser()
         .accounts({
           owner: user2.publicKey,
+          market: marketPda,
           userAccount: user2AccountPda,
           systemProgram: SystemProgram.programId,
         })
@@ -334,6 +375,7 @@ describe("oil-perps", () => {
           .initializeUser()
           .accounts({
             owner: user1.publicKey,
+            market: marketPda,
             userAccount: user1AccountPda,
             systemProgram: SystemProgram.programId,
           })

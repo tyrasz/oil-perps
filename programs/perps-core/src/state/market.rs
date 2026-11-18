@@ -49,6 +49,7 @@ pub struct Market {
     pub max_confidence_bps: u32,              // Max Pyth confidence / price; 0 = oracle default (1%)
     pub min_oracle_price: u64,                // 6 decimals; prices below halt the market; 0 = off
     pub settlement_price: u64,                // 6 decimals; non-zero once settle_market has run
+    pub referral_reserve: u64,                // Referral rewards earned here and not yet claimed
 }
 
 impl Market {
@@ -82,13 +83,25 @@ impl Market {
         4 +   // max_confidence_bps
         8 +   // min_oracle_price
         8 +   // settlement_price
-        23;   // padding for future use
+        8 +   // referral_reserve
+        15;   // padding for future use
 
     /// Convert commodity bytes to string
     pub fn commodity_str(&self) -> String {
         String::from_utf8_lossy(&self.commodity)
             .trim_end_matches('\0')
             .to_string()
+    }
+
+    /// PDA seed for this market's commodity: the identifier without padding.
+    pub fn commodity_seed(&self) -> &[u8] {
+        let len = self.commodity.iter().position(|&b| b == 0).unwrap_or(self.commodity.len());
+        &self.commodity[..len]
+    }
+
+    /// 1-8 uppercase ASCII letters or digits, e.g. "OIL", "NATGAS".
+    pub fn is_valid_commodity(s: &str) -> bool {
+        !s.is_empty() && s.len() <= 8 && s.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
     }
 
     /// Create commodity bytes from string
@@ -284,10 +297,59 @@ mod tests {
     }
 
     #[test]
+    fn commodity_seed_is_the_unpadded_identifier() {
+        for id in ["OIL", "GOLD", "NATGAS", "COPPER12"] {
+            let m = Market { commodity: Market::commodity_from_str(id), ..Default::default() };
+            assert_eq!(m.commodity_seed(), id.as_bytes());
+        }
+    }
+
+    #[test]
+    fn market_and_user_addresses_match_off_chain_derivation() {
+        // Same values are pinned in frontend/src/utils/pda.test.ts and the keeper.
+        let mint: Pubkey = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".parse().unwrap();
+        let oil = Market { commodity: Market::commodity_from_str("OIL"), collateral_mint: mint, ..Default::default() };
+        let (market, _) = Pubkey::find_program_address(
+            &[b"market", oil.collateral_mint.as_ref(), oil.commodity_seed()],
+            &crate::ID,
+        );
+        assert_eq!(market.to_string(), "6Chy7k9ArMFQamqogr5jsYVoRTbnP9TaCxvDqRV6ntD9");
+
+        let owner: Pubkey = "11111111111111111111111111111112".parse().unwrap();
+        let (user, _) = Pubkey::find_program_address(&[b"user", owner.as_ref(), market.as_ref()], &crate::ID);
+        assert_eq!(user.to_string(), "4NBuxBaDE8SpGFiytjqTmkYqkyc628SAsGxrc51jkHso");
+    }
+
+    #[test]
+    fn validates_commodity_identifiers() {
+        assert!(Market::is_valid_commodity("OIL"));
+        assert!(Market::is_valid_commodity("NATGAS"));
+        for bad in ["", "oil", "OIL GAS", "TOOLONGID", "OIL\0", "ÖL"] {
+            assert!(!Market::is_valid_commodity(bad), "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn each_commodity_gets_its_own_market_address() {
+        let program = crate::ID;
+        let mint = Pubkey::new_unique();
+        let pda = |c: &str| Pubkey::find_program_address(&[b"market", mint.as_ref(), c.as_bytes()], &program).0;
+        let ids = ["OIL", "GOLD", "SILVER", "NATGAS", "COPPER"];
+        let addresses: std::collections::HashSet<_> = ids.iter().map(|c| pda(c)).collect();
+        assert_eq!(addresses.len(), ids.len());
+        // The init seed (raw string) matches the seed later instructions use
+        let oil = Market { commodity: Market::commodity_from_str("OIL"), collateral_mint: mint, ..Default::default() };
+        assert_eq!(
+            Pubkey::find_program_address(&[b"market", oil.collateral_mint.as_ref(), oil.commodity_seed()], &program).0,
+            pda("OIL")
+        );
+    }
+
+    #[test]
     fn account_size_is_unchanged_so_existing_markets_still_load() {
         assert_eq!(Market::LEN, 298);
         let serialized = Market::default().try_to_vec().unwrap().len();
-        assert_eq!(8 + serialized + 23, Market::LEN);
+        assert_eq!(8 + serialized + 15, Market::LEN);
     }
 
     // Fri 2026-11-13: 22:00 UTC is the 17:00 ET weekly close.
