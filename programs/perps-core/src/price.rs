@@ -1,6 +1,6 @@
-//! Pyth price conversion and validation, free of Anchor and program types so
-//! the keeper (backend/keeper) and prop-amm compile this same file via
-//! `#[path]`. Keep it dependency-free.
+// Pyth price conversion and validation, free of Anchor and program types so
+// the keeper (backend/keeper) and prop-amm compile this same file via
+// `#[path]` / `include!`. Keep it dependency-free.
 
 /// Number of decimals used for all prices inside the program.
 pub const PRICE_DECIMALS: i32 = 6;
