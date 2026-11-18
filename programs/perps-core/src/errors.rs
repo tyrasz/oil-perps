@@ -83,4 +83,16 @@ pub enum PerpsError {
 
     #[msg("Invalid referral parameters")]
     InvalidReferralParams,
+
+    #[msg("Market is outside trading hours")]
+    MarketClosed,
+
+    #[msg("Market has been settled; positions can only be closed")]
+    MarketSettled,
+
+    #[msg("Oracle confidence interval is too wide")]
+    OracleConfidenceTooWide,
+
+    #[msg("Oracle price is below the market's minimum price")]
+    OraclePriceBelowFloor,
 }

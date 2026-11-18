@@ -1,6 +1,5 @@
 use anchor_lang::prelude::*;
-use pyth_sdk_solana::load_price_feed_from_account_info;
-use crate::oracle::normalize_pyth_price;
+use crate::oracle::read_price;
 use crate::state::{Market, Position, UserAccount, Side, PositionStatus, ExecutionSource};
 use crate::errors::PerpsError;
 
@@ -60,20 +59,12 @@ pub fn handler(ctx: Context<OpenPosition>, params: OpenPositionParams) -> Result
         PerpsError::ExcessiveLeverage
     );
 
-    // Get oracle price
-    let price_feed = load_price_feed_from_account_info(&ctx.accounts.pyth_price_feed)
-        .map_err(|_| PerpsError::InvalidOraclePrice)?;
-
     let current_time = Clock::get()?.unix_timestamp;
-    let price_data = price_feed
-        .get_price_no_older_than(current_time, 60)
-        .ok_or(PerpsError::StaleOraclePrice)?;
+    require!(!market.is_settled(), PerpsError::MarketSettled);
+    require!(market.is_in_session(current_time), PerpsError::MarketClosed);
 
-    require!(price_data.price > 0, PerpsError::InvalidOraclePrice);
-
-    // Convert Pyth price to our format (6 decimals)
-    let oracle_price = normalize_pyth_price(price_data.price, price_data.expo)
-        .ok_or(PerpsError::InvalidOraclePrice)?;
+    // Validated oracle price (staleness, confidence, floor), 6 decimals
+    let oracle_price = read_price(&ctx.accounts.pyth_price_feed, market, current_time)?;
 
     // Calculate required collateral
     // notional = size * price / 1_000_000
@@ -84,7 +75,7 @@ pub fn handler(ctx: Context<OpenPosition>, params: OpenPositionParams) -> Result
         .ok_or(PerpsError::MathOverflow)? as u64;
 
     let required_collateral = market
-        .required_collateral(notional, params.leverage)
+        .required_collateral(notional, params.leverage, current_time)
         .ok_or(PerpsError::ExcessiveLeverage)?;
 
     require!(

@@ -1,3 +1,8 @@
+use anchor_lang::prelude::*;
+use pyth_sdk_solana::load_price_feed_from_account_info;
+use crate::errors::PerpsError;
+use crate::state::Market;
+
 /// Number of decimals used for all prices inside the program.
 pub const PRICE_DECIMALS: i32 = 6;
 
@@ -27,9 +32,107 @@ pub fn normalize_pyth_price(price: i64, expo: i32) -> Option<u64> {
     u64::try_from(normalized).ok()
 }
 
+/// Oracle prices older than this are rejected.
+pub const MAX_PRICE_AGE_SECS: u64 = 60;
+/// Confidence limit used when a market has none configured: 1% of the price.
+pub const DEFAULT_MAX_CONFIDENCE_BPS: u32 = 100;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PriceRejection {
+    /// Zero, negative, or not representable in 6 decimals.
+    Invalid,
+    /// Pyth's confidence interval is too wide relative to the price.
+    ConfidenceTooWide,
+    /// Below the market's configured minimum price.
+    BelowFloor,
+}
+
+/// Check a Pyth price and convert it to 6 decimals.
+///
+/// `conf` shares the price's exponent, so the confidence ratio is `conf / price`.
+/// `max_confidence_bps == 0` uses `DEFAULT_MAX_CONFIDENCE_BPS`;
+/// `min_price == 0` disables the floor.
+pub fn validate_price(
+    price: i64,
+    conf: u64,
+    expo: i32,
+    max_confidence_bps: u32,
+    min_price: u64,
+) -> core::result::Result<u64, PriceRejection> {
+    let normalized = normalize_pyth_price(price, expo).ok_or(PriceRejection::Invalid)?;
+
+    let limit = if max_confidence_bps == 0 { DEFAULT_MAX_CONFIDENCE_BPS } else { max_confidence_bps };
+    if (conf as u128) * 10_000 > (price as u128) * limit as u128 {
+        return Err(PriceRejection::ConfidenceTooWide);
+    }
+    if normalized < min_price {
+        return Err(PriceRejection::BelowFloor);
+    }
+    Ok(normalized)
+}
+
+/// Read the market's Pyth feed and return a validated 6-decimal price.
+pub fn read_price(feed: &AccountInfo, market: &Market, now: i64) -> Result<u64> {
+    let price_feed = load_price_feed_from_account_info(feed)
+        .map_err(|_| PerpsError::InvalidOraclePrice)?;
+    let price = price_feed
+        .get_price_no_older_than(now, MAX_PRICE_AGE_SECS)
+        .ok_or(PerpsError::StaleOraclePrice)?;
+
+    validate_price(price.price, price.conf, price.expo, market.max_confidence_bps, market.min_oracle_price)
+        .map_err(|rejection| {
+            msg!("Oracle price rejected: {:?} (price={}, conf={}, expo={})", rejection, price.price, price.conf, price.expo);
+            match rejection {
+                PriceRejection::Invalid => PerpsError::InvalidOraclePrice,
+                PriceRejection::ConfidenceTooWide => PerpsError::OracleConfidenceTooWide,
+                PriceRejection::BelowFloor => PerpsError::OraclePriceBelowFloor,
+            }
+            .into()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_tight_confidence() {
+        // $75.00 +/- $0.05 (0.07%)
+        assert_eq!(validate_price(7_500_000_000, 5_000_000, -8, 0, 0), Ok(75_000_000));
+    }
+
+    #[test]
+    fn rejects_wide_confidence_with_default_limit() {
+        // $75.00 +/- $0.75 is exactly 1%: allowed; one tick more is not
+        assert_eq!(validate_price(7_500_000_000, 75_000_000, -8, 0, 0), Ok(75_000_000));
+        assert_eq!(
+            validate_price(7_500_000_000, 75_000_001, -8, 0, 0),
+            Err(PriceRejection::ConfidenceTooWide)
+        );
+    }
+
+    #[test]
+    fn uses_configured_confidence_limit() {
+        // 2% band allowed under a 3% limit, rejected under 1%
+        assert!(validate_price(7_500_000_000, 150_000_000, -8, 300, 0).is_ok());
+        assert_eq!(
+            validate_price(7_500_000_000, 150_000_000, -8, 100, 0),
+            Err(PriceRejection::ConfidenceTooWide)
+        );
+    }
+
+    #[test]
+    fn enforces_price_floor() {
+        // $4.99 under a $5 floor
+        assert_eq!(validate_price(499_000_000, 0, -8, 0, 5_000_000), Err(PriceRejection::BelowFloor));
+        assert_eq!(validate_price(500_000_000, 0, -8, 0, 5_000_000), Ok(5_000_000));
+    }
+
+    #[test]
+    fn rejects_negative_prices_like_april_2020() {
+        // WTI May 2020 settled at -$37.63
+        assert_eq!(validate_price(-3_763_000_000, 1_000_000, -8, 0, 0), Err(PriceRejection::Invalid));
+    }
 
     #[test]
     fn scales_down_when_expo_below_minus_six() {

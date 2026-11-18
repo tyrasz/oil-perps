@@ -1,7 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
-use pyth_sdk_solana::load_price_feed_from_account_info;
-use crate::oracle::normalize_pyth_price;
+use crate::oracle::read_price;
 use crate::state::{split_equity, Market, Position, Vault, UserAccount, Side, PositionStatus, ReferralCode, UserReferral};
 use crate::errors::PerpsError;
 
@@ -81,19 +80,17 @@ pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {
     let position = &mut ctx.accounts.position;
     let user_account = &mut ctx.accounts.user_account;
 
-    // Get oracle price
-    let price_feed = load_price_feed_from_account_info(&ctx.accounts.pyth_price_feed)
-        .map_err(|_| PerpsError::InvalidOraclePrice)?;
-
     let current_time = Clock::get()?.unix_timestamp;
-    let price_data = price_feed
-        .get_price_no_older_than(current_time, 60)
-        .ok_or(PerpsError::StaleOraclePrice)?;
 
-    require!(price_data.price > 0, PerpsError::InvalidOraclePrice);
-
-    let oracle_price = normalize_pyth_price(price_data.price, price_data.expo)
-        .ok_or(PerpsError::InvalidOraclePrice)?;
+    // A settled market closes at its settlement price. Otherwise the market must
+    // be in session: closing at a stale weekend price would let traders pick
+    // off the reopening gap.
+    let oracle_price = if market.is_settled() {
+        market.settlement_price
+    } else {
+        require!(market.is_in_session(current_time), PerpsError::MarketClosed);
+        read_price(&ctx.accounts.pyth_price_feed, market, current_time)?
+    };
 
     // Calculate PnL
     let pnl = position.unrealized_pnl(oracle_price);

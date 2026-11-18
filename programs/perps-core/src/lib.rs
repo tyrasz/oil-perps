@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 
 pub mod errors;
 pub mod oracle;
+pub mod session;
 pub mod instructions;
 pub mod state;
 
@@ -50,6 +51,19 @@ pub mod perps_core {
 
     pub fn update_funding(ctx: Context<UpdateFunding>) -> Result<()> {
         instructions::update_funding::handler(ctx)
+    }
+
+    // Admin: risk controls (trading hours, weekend margins, oracle limits)
+    pub fn update_market_config(
+        ctx: Context<UpdateMarketConfig>,
+        params: MarketConfigParams,
+    ) -> Result<()> {
+        instructions::update_market_config::handler(ctx, params)
+    }
+
+    // Admin: final emergency settlement at a fixed price
+    pub fn settle_market(ctx: Context<SettleMarket>, settlement_price: u64) -> Result<()> {
+        instructions::settle_market::handler(ctx, settlement_price)
     }
 
     // Referral system instructions

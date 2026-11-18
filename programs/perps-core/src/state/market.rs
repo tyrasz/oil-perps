@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use crate::session;
 
 #[account]
 #[derive(Default)]
@@ -38,6 +39,16 @@ pub struct Market {
 
     pub bump: u8,
     pub is_paused: bool,
+
+    // Risk controls (set with update_market_config). These occupy what used to
+    // be padding, so markets created before they existed read them as zero.
+    pub session_schedule: u8,                 // crate::session::SCHEDULE_*; 0 = always open
+    pub pre_close_window_secs: u32,           // Weekend margins apply this long before the weekly close; 0 = off
+    pub weekend_initial_margin_ratio: u32,    // Basis points; 0 = use initial_margin_ratio
+    pub weekend_maintenance_margin_ratio: u32, // Basis points; 0 = use maintenance_margin_ratio
+    pub max_confidence_bps: u32,              // Max Pyth confidence / price; 0 = oracle default (1%)
+    pub min_oracle_price: u64,                // 6 decimals; prices below halt the market; 0 = off
+    pub settlement_price: u64,                // 6 decimals; non-zero once settle_market has run
 }
 
 impl Market {
@@ -64,7 +75,14 @@ impl Market {
         8 +   // total_trades
         1 +   // bump
         1 +   // is_paused
-        56;   // padding for future use (reduced by 8 for commodity)
+        1 +   // session_schedule
+        4 +   // pre_close_window_secs
+        4 +   // weekend_initial_margin_ratio
+        4 +   // weekend_maintenance_margin_ratio
+        4 +   // max_confidence_bps
+        8 +   // min_oracle_price
+        8 +   // settlement_price
+        23;   // padding for future use
 
     /// Convert commodity bytes to string
     pub fn commodity_str(&self) -> String {
@@ -105,16 +123,45 @@ impl Market {
 }
 
 impl Market {
-    /// Collateral to post for a position of `notional` at `leverage`
+    pub fn is_settled(&self) -> bool {
+        self.settlement_price > 0
+    }
+
+    /// Whether the market is within its trading session at `now`.
+    pub fn is_in_session(&self, now: i64) -> bool {
+        session::is_open(self.session_schedule, now)
+    }
+
+    /// Whether weekend margin requirements apply at `now`.
+    pub fn in_pre_close_window(&self, now: i64) -> bool {
+        session::in_pre_close_window(self.session_schedule, now, self.pre_close_window_secs)
+    }
+
+    /// `(initial, maintenance)` margin ratios in force at `now`, in basis points.
+    /// Before the weekly close they rise to the weekend values, so positions
+    /// are carried over the closure with enough margin to absorb a gap.
+    pub fn margin_ratios(&self, now: i64) -> (u32, u32) {
+        if self.in_pre_close_window(now) {
+            (
+                self.initial_margin_ratio.max(self.weekend_initial_margin_ratio),
+                self.maintenance_margin_ratio.max(self.weekend_maintenance_margin_ratio),
+            )
+        } else {
+            (self.initial_margin_ratio, self.maintenance_margin_ratio)
+        }
+    }
+
+    /// Collateral to post at `now` for a position of `notional` at `leverage`
     /// (3 decimals, 10x = 10_000): `notional / leverage`, rounded up.
-    /// Returns `None` if that is below the initial margin requirement, i.e.
-    /// the leverage is higher than the market's initial margin allows.
-    pub fn required_collateral(&self, notional: u64, leverage: u32) -> Option<u64> {
+    /// Returns `None` if that is below the initial margin in force, i.e. the
+    /// leverage is higher than the market currently allows.
+    pub fn required_collateral(&self, notional: u64, leverage: u32, now: i64) -> Option<u64> {
         if leverage == 0 {
             return None;
         }
+        let (initial_margin_ratio, _) = self.margin_ratios(now);
         let collateral = ceil_div(notional as u128 * 1_000, leverage as u128);
-        let initial_margin = ceil_div(notional as u128 * self.initial_margin_ratio as u128, 10_000);
+        let initial_margin = ceil_div(notional as u128 * initial_margin_ratio as u128, 10_000);
         if collateral < initial_margin {
             return None;
         }
@@ -215,25 +262,78 @@ mod tests {
     #[test]
     fn collateral_follows_chosen_leverage() {
         let m = oil_market();
-        assert_eq!(m.required_collateral(NOTIONAL, 2_000), Some(3_750_000_000)); // 2x
-        assert_eq!(m.required_collateral(NOTIONAL, 5_000), Some(1_500_000_000)); // 5x
-        assert_eq!(m.required_collateral(NOTIONAL, 10_000), Some(750_000_000)); // 10x
+        assert_eq!(m.required_collateral(NOTIONAL, 2_000, 0), Some(3_750_000_000)); // 2x
+        assert_eq!(m.required_collateral(NOTIONAL, 5_000, 0), Some(1_500_000_000)); // 5x
+        assert_eq!(m.required_collateral(NOTIONAL, 10_000, 0), Some(750_000_000)); // 10x
     }
 
     #[test]
     fn leverage_above_initial_margin_is_rejected() {
         // 10% initial margin caps leverage at 10x even though max_leverage is 20x
         let m = oil_market();
-        assert_eq!(m.required_collateral(NOTIONAL, 10_001), None);
-        assert_eq!(m.required_collateral(NOTIONAL, 20_000), None);
-        assert_eq!(m.required_collateral(NOTIONAL, 0), None);
+        assert_eq!(m.required_collateral(NOTIONAL, 10_001, 0), None);
+        assert_eq!(m.required_collateral(NOTIONAL, 20_000, 0), None);
+        assert_eq!(m.required_collateral(NOTIONAL, 0, 0), None);
     }
 
     #[test]
     fn collateral_rounds_up() {
         // $1 at 3x = 0.333334
         let m = Market { initial_margin_ratio: 1_000, ..Default::default() };
-        assert_eq!(m.required_collateral(1_000_000, 3_000), Some(333_334));
+        assert_eq!(m.required_collateral(1_000_000, 3_000, 0), Some(333_334));
+    }
+
+    #[test]
+    fn account_size_is_unchanged_so_existing_markets_still_load() {
+        assert_eq!(Market::LEN, 298);
+        let serialized = Market::default().try_to_vec().unwrap().len();
+        assert_eq!(8 + serialized + 23, Market::LEN);
+    }
+
+    // Fri 2026-11-13: 22:00 UTC is the 17:00 ET weekly close.
+    const FRIDAY_CLOSE: i64 = 1_794_607_200;
+    const WEDNESDAY_NOON_ET: i64 = 1_794_416_400; // 2026-11-11 17:00 UTC
+
+    fn oil_market_with_weekend_margins() -> Market {
+        Market {
+            session_schedule: session::SCHEDULE_CME_GLOBEX,
+            pre_close_window_secs: 7_200,
+            weekend_initial_margin_ratio: 2_000,
+            weekend_maintenance_margin_ratio: 1_000,
+            ..oil_market()
+        }
+    }
+
+    #[test]
+    fn weekend_margins_apply_only_before_weekly_close() {
+        let m = oil_market_with_weekend_margins();
+        assert_eq!(m.margin_ratios(WEDNESDAY_NOON_ET), (1_000, 500));
+        assert_eq!(m.margin_ratios(FRIDAY_CLOSE - 7_201), (1_000, 500));
+        assert_eq!(m.margin_ratios(FRIDAY_CLOSE - 7_200), (2_000, 1_000));
+        assert_eq!(m.margin_ratios(FRIDAY_CLOSE - 1), (2_000, 1_000));
+    }
+
+    #[test]
+    fn weekend_initial_margin_caps_leverage() {
+        let m = oil_market_with_weekend_margins();
+        assert_eq!(m.required_collateral(NOTIONAL, 10_000, WEDNESDAY_NOON_ET), Some(750_000_000));
+        // 20% weekend initial margin: 10x rejected, 5x allowed
+        assert_eq!(m.required_collateral(NOTIONAL, 10_000, FRIDAY_CLOSE - 60), None);
+        assert_eq!(m.required_collateral(NOTIONAL, 5_000, FRIDAY_CLOSE - 60), Some(1_500_000_000));
+    }
+
+    #[test]
+    fn weekend_margins_never_lower_requirements() {
+        let m = Market { weekend_initial_margin_ratio: 100, weekend_maintenance_margin_ratio: 0, ..oil_market_with_weekend_margins() };
+        assert_eq!(m.margin_ratios(FRIDAY_CLOSE - 60), (1_000, 500));
+    }
+
+    #[test]
+    fn session_follows_schedule() {
+        let m = oil_market_with_weekend_margins();
+        assert!(m.is_in_session(FRIDAY_CLOSE - 1));
+        assert!(!m.is_in_session(FRIDAY_CLOSE));
+        assert!(oil_market().is_in_session(FRIDAY_CLOSE)); // always-open default
     }
 
     #[test]
