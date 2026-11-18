@@ -195,7 +195,8 @@ async function initializeMarket(
 async function applyRiskConfig(
   program: Program,
   authority: Keypair,
-  commodity: string
+  commodity: string,
+  isPaused: boolean
 ): Promise<string> {
   const risk = RISK_CONFIGS[commodity];
   if (!risk) {
@@ -204,7 +205,8 @@ async function applyRiskConfig(
   const [marketPda] = getMarketPDA(USDC_MINT, commodity);
 
   const params = {
-    isPaused: false,
+    // update_market_config also sets the pause flag: keep whatever it is now
+    isPaused,
     sessionSchedule: SCHEDULE_CME_GLOBEX,
     preCloseWindowSecs: PRE_CLOSE_WINDOW_SECS,
     weekendInitialMarginRatio: risk.weekendInitialMarginRatio,
@@ -275,15 +277,18 @@ async function main() {
   // Initialize the market if needed, then (re)apply its risk controls, so
   // markets created before those existed pick them up too.
   try {
+    let isPaused = false;
     if (await checkMarketExists(connection, commodity)) {
       const [marketPda] = getMarketPDA(USDC_MINT, commodity);
-      console.log(`Market already exists: ${marketPda.toString()}`);
+      const market = (await program.account.market.fetch(marketPda)) as { isPaused: boolean };
+      isPaused = market.isPaused;
+      console.log(`Market already exists: ${marketPda.toString()} (paused: ${isPaused})`);
     } else {
       const signature = await initializeMarket(program, authority, commodity);
       console.log(`https://explorer.solana.com/tx/${signature}?cluster=testnet`);
     }
 
-    const signature = await applyRiskConfig(program, authority, commodity);
+    const signature = await applyRiskConfig(program, authority, commodity, isPaused);
     console.log(`\nSuccess! View transaction:`);
     console.log(`https://explorer.solana.com/tx/${signature}?cluster=testnet`);
   } catch (error) {
