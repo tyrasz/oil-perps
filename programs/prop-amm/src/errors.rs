@@ -46,4 +46,7 @@ pub enum PropAmmError {
 
     #[msg("Cannot withdraw with pending positions")]
     PendingPositions,
+
+    #[msg("Oracle confidence interval is too wide")]
+    OracleConfidenceTooWide,
 }

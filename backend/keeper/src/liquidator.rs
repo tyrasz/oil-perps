@@ -1,4 +1,4 @@
-use crate::session;
+use crate::{price, session};
 use crate::{KeeperConfig, get_market_pda, get_vault_pda, get_vault_token_pda, get_user_account_pda};
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_client::rpc_client::RpcClient;
@@ -224,7 +224,7 @@ async fn check_market(
     let maintenance_margin_ratio = market_data.maintenance_margin_ratio_at(now);
 
     // Fetch oracle price
-    let oracle_price = fetch_oracle_price(client, &market_data.pyth_price_feed)?;
+    let oracle_price = fetch_oracle_price(client, &market_data, now)?;
     debug!("Current oracle price: ${:.2}", oracle_price as f64 / 1_000_000.0);
 
     // Find all open positions
@@ -260,28 +260,43 @@ async fn check_market(
     Ok(liquidated_count)
 }
 
+/// Read the market's Pyth price with the same rules as `oracle::read_price` in
+/// perps-core (staleness, confidence, floor), so the keeper doesn't submit
+/// liquidations the program would reject.
 fn fetch_oracle_price(
     client: &RpcClient,
-    pyth_feed: &Pubkey,
+    market: &MarketData,
+    now: i64,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let account = client.get_account(pyth_feed)?;
-
-    // Parse Pyth price feed
-    let price_feed = pyth_sdk_solana::state::load_price_account::<32, ()>(&account.data)
+    let account = client.get_account(&market.pyth_price_feed)?;
+    let price_account = pyth_sdk_solana::state::load_price_account::<32, ()>(&account.data)
         .map_err(|e| format!("Failed to parse Pyth feed: {:?}", e))?;
-
-    let price = price_feed.agg.price;
-    let expo = price_feed.expo;
-
-    // Normalize to 6 decimals
-    let normalized = if expo < 0 {
-        let divisor = 10i64.pow((-expo) as u32);
-        (price * 1_000_000 / divisor) as u64
+    // Same selection as pyth-sdk's PriceFeed: the aggregate while trading,
+    // otherwise the previous price.
+    let (px, conf, publish_time) = if price_account.agg.status == pyth_sdk_solana::state::PriceStatus::Trading {
+        (price_account.agg.price, price_account.agg.conf, price_account.timestamp)
     } else {
-        (price * 1_000_000 * 10i64.pow(expo as u32)) as u64
+        (price_account.prev_price, price_account.prev_conf, price_account.prev_timestamp)
     };
+    if !is_fresh(publish_time, now) {
+        return Err("Oracle price is stale".into());
+    }
+    validated_price(px, conf, price_account.expo, market)
+}
 
-    Ok(normalized)
+/// pyth-sdk's get_price_no_older_than: |publish_time - now| <= max age.
+fn is_fresh(publish_time: i64, now: i64) -> bool {
+    publish_time.abs_diff(now) <= price::MAX_PRICE_AGE_SECS
+}
+
+fn validated_price(
+    price: i64,
+    conf: u64,
+    expo: i32,
+    market: &MarketData,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    price::validate_price(price, conf, expo, market.max_confidence_bps, market.min_oracle_price)
+        .map_err(|r| format!("Oracle price rejected: {:?} (price={}, conf={}, expo={})", r, price, conf, expo).into())
 }
 
 /// Offset of `Position::market` (after the discriminator and owner).
@@ -523,6 +538,24 @@ mod tests {
         let mut bytes = vec![0u8; 8];
         bytes.extend(borsh::to_vec(&p).unwrap());
         assert_eq!(&bytes[POSITION_MARKET_OFFSET..POSITION_MARKET_OFFSET + 32], market.as_ref());
+    }
+
+    #[test]
+    fn oracle_checks_match_program() {
+        let market = MarketData { min_oracle_price: 5_000_000, ..Default::default() };
+        // $75.00 +/- $0.05 passes; a 2% band fails the default 1% limit
+        assert_eq!(validated_price(7_500_000_000, 5_000_000, -8, &market).unwrap(), 75_000_000);
+        assert!(validated_price(7_500_000_000, 150_000_000, -8, &market).is_err());
+        // Below the $5 floor, and negative prices, are rejected
+        assert!(validated_price(499_000_000, 0, -8, &market).is_err());
+        assert!(validated_price(-3_763_000_000, 0, -8, &market).is_err());
+    }
+
+    #[test]
+    fn staleness_matches_pyth_sdk() {
+        assert!(is_fresh(1_000, 1_060));
+        assert!(!is_fresh(1_000, 1_061));
+        assert!(is_fresh(1_060, 1_000)); // pyth-sdk compares the absolute difference
     }
 
     #[test]

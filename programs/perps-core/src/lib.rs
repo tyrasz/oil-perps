@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 
 pub mod errors;
 pub mod oracle;
+pub mod price;
 pub mod session;
 pub mod instructions;
 pub mod state;

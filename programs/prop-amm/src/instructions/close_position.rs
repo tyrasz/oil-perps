@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use pyth_sdk_solana::load_price_feed_from_account_info;
-use crate::oracle::normalize_pyth_price;
+use crate::oracle::{validate_price, PriceRejection};
 use crate::state::LpVault;
 use crate::errors::PropAmmError;
 
@@ -71,8 +71,12 @@ pub fn handler(ctx: Context<ClosePositionAmm>, params: ClosePositionParams) -> R
 
     require!(price_data.price > 0, PropAmmError::InvalidOraclePrice);
 
-    let oracle_price = normalize_pyth_price(price_data.price, price_data.expo)
-        .ok_or(PropAmmError::InvalidOraclePrice)?;
+    // Same price rules as perps-core: 6 decimals, default 1% confidence limit
+    let oracle_price = validate_price(price_data.price, price_data.conf, price_data.expo, 0, 0)
+        .map_err(|r| match r {
+            PriceRejection::ConfidenceTooWide => PropAmmError::OracleConfidenceTooWide,
+            _ => PropAmmError::InvalidOraclePrice,
+        })?;
 
     // Calculate exit price with spread
     let exit_price = vault.calculate_exit_price(oracle_price, params.is_long);

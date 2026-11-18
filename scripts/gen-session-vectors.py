@@ -2,7 +2,6 @@
 
 Regenerate after changing the schedule logic:
   python3 scripts/gen-session-vectors.py rust > programs/perps-core/src/session_vectors.rs
-  cp programs/perps-core/src/session_vectors.rs backend/keeper/src/session_vectors.rs
   python3 scripts/gen-session-vectors.py json > frontend/src/utils/sessionVectors.json
 """
 import json, random, sys

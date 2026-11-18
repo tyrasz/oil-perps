@@ -9,8 +9,13 @@ use tracing::{info, error};
 
 mod funding;
 mod liquidator;
-#[allow(dead_code)] // shared verbatim with perps-core; not every helper is used here
+// Compiled from the program's sources so the keeper makes the same decisions.
+#[allow(dead_code)]
+#[path = "../../../programs/perps-core/src/session.rs"]
 mod session;
+#[allow(dead_code)]
+#[path = "../../../programs/perps-core/src/price.rs"]
+mod price;
 
 // Program configuration
 pub struct KeeperConfig {
@@ -51,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| shellexpand::tilde("~/.config/solana/id.json").to_string());
 
     let perps_program_id = std::env::var("PERPS_PROGRAM_ID")
-        .unwrap_or_else(|_| "Perp11111111111111111111111111111111111111".to_string());
+        .unwrap_or_else(|_| "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS".to_string()); // perps-core declare_id!
 
     let usdc_mint = std::env::var("USDC_MINT")
         .unwrap_or_else(|_| "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string());

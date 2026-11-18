@@ -3,6 +3,8 @@ use anchor_lang::prelude::*;
 pub mod state;
 pub mod instructions;
 pub mod errors;
+// Shared with perps-core (and the keeper) so price handling cannot drift.
+#[path = "../../perps-core/src/price.rs"]
 pub mod oracle;
 
 pub use state::*;
