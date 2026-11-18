@@ -3,6 +3,7 @@ import { useWallet } from '@solana/wallet-adapter-react';
 import { PublicKey } from '@solana/web3.js';
 import { usePerpsProgram } from './usePerpsProgram';
 import { commodityForMarket, getCommodityMarket, getUserAccountPDA } from '../utils/pda';
+import { accruedFunding, positionHealth } from '../utils/positionHealth';
 import { PRICE_DECIMALS, LEVERAGE_DECIMALS } from '../config/program';
 import { useMarketStore } from '../stores/marketStore';
 import type { Position, ClosedPosition, UserAccount } from '../types';
@@ -95,9 +96,19 @@ export function useOnChainPositions() {
         },
       ]) as unknown as OnChainPosition[];
 
-      // Filter for open positions and transform to frontend format
-      const openPositions: Position[] = accounts
-        .filter((acc) => acc.account.status.open !== undefined)
+      const open = accounts.filter((acc) => acc.account.status.open !== undefined);
+
+      // Each position's market funding index, to include unpaid funding
+      const marketKeys = [...new Set(open.map((acc) => acc.account.market.toBase58()))];
+      const marketAccounts = marketKeys.length
+        ? ((await program.account.market.fetchMultiple(marketKeys)) as unknown as ({ cumulativeFunding?: { toNumber: () => number } } | null)[])
+        : [];
+      const cumulativeFunding = new Map(
+        marketKeys.map((key, i) => [key, (marketAccounts[i]?.cumulativeFunding?.toNumber() ?? 0) / Math.pow(10, PRICE_DECIMALS)])
+      );
+
+      // Transform to frontend format
+      const openPositions: Position[] = open
         .map((acc) => {
           const isLong = acc.account.side.long !== undefined;
           const size = acc.account.size.toNumber() / Math.pow(10, PRICE_DECIMALS);
@@ -109,19 +120,14 @@ export function useOnChainPositions() {
           const currentMarket = markets[commodity];
           const currentPrice = currentMarket?.price || entryPrice;
 
-          // Calculate unrealized PnL based on current price
-          let unrealizedPnl = 0;
-          if (currentPrice > 0) {
-            const priceDiff = isLong
-              ? currentPrice - entryPrice
-              : entryPrice - currentPrice;
-            unrealizedPnl = size * priceDiff;
-          }
-
-          // Calculate margin ratio: (collateral + PnL) / notional * 100
-          const notional = size * currentPrice;
-          const equity = collateral + unrealizedPnl;
-          const marginRatio = notional > 0 ? (equity / notional) * 100 : 0;
+          // Same rule as the program: entry notional, unpaid funding included
+          const funding = accruedFunding(
+            isLong,
+            size,
+            cumulativeFunding.get(acc.account.market.toBase58()) ?? 0,
+            acc.account.lastFundingPayment.toNumber() / Math.pow(10, PRICE_DECIMALS)
+          );
+          const { unrealizedPnl, marginRatio } = positionHealth({ isLong, size, collateral, entryPrice }, currentPrice, funding);
 
           return {
             address: acc.publicKey.toString(),
