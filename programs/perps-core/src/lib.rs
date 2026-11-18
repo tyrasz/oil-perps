@@ -78,8 +78,4 @@ pub mod perps_core {
     pub fn apply_referral_code(ctx: Context<ApplyReferralCode>) -> Result<()> {
         instructions::apply_referral_code::handler(ctx)
     }
-
-    pub fn claim_referral_rewards(ctx: Context<ClaimReferralRewards>) -> Result<()> {
-        instructions::claim_referral_rewards::handler(ctx)
-    }
 }

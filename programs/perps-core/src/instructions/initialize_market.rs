@@ -66,6 +66,9 @@ pub fn handler(ctx: Context<InitializeMarket>, params: InitializeMarketParams) -
     require!(params.max_leverage > 0 && params.max_leverage <= 100_000, PerpsError::InvalidMarketConfig);
     require!(params.maintenance_margin_ratio > 0, PerpsError::InvalidMarketConfig);
     require!(params.initial_margin_ratio > params.maintenance_margin_ratio, PerpsError::InvalidMarketConfig);
+    // Fees in basis points: at most 10% per trade, liquidation fee at most 100%
+    require!(params.taker_fee <= 1_000 && params.maker_fee <= 1_000, PerpsError::InvalidMarketConfig);
+    require!(params.liquidation_fee <= 10_000, PerpsError::InvalidMarketConfig);
 
     let market = &mut ctx.accounts.market;
     market.authority = ctx.accounts.authority.key();

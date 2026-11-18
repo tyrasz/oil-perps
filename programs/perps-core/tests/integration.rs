@@ -66,6 +66,14 @@ fn market_keys(mint: &Pubkey, commodity: &str, oracle: Pubkey) -> MarketKeys {
     MarketKeys { market, vault, vault_token, oracle }
 }
 
+fn user_referral_pda(user: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"user_referral", user.as_ref()], &perps_core::ID).0
+}
+
+fn referral_code_pda(code: &[u8; 8]) -> Pubkey {
+    Pubkey::find_program_address(&[b"referral_code", code.as_ref()], &perps_core::ID).0
+}
+
 fn user_account(owner: &Pubkey, market: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"user", owner.as_ref(), market.as_ref()], &perps_core::ID).0
 }
@@ -224,6 +232,10 @@ impl Env {
     }
 
     async fn init_market(&mut self, commodity: &str) -> Result<(), BanksClientError> {
+        self.init_market_with(commodity, oil_params(commodity)).await
+    }
+
+    async fn init_market_with(&mut self, commodity: &str, params: InitializeMarketParams) -> Result<(), BanksClientError> {
         let k = *self.keys(commodity);
         let accounts = perps_core::accounts::InitializeMarket {
             authority: self.authority.pubkey(),
@@ -236,7 +248,7 @@ impl Env {
             token_program: spl_token::ID,
             rent: sysvar::rent::ID,
         };
-        let data = perps_core::instruction::InitializeMarket { params: oil_params(commodity) };
+        let data = perps_core::instruction::InitializeMarket { params };
         let authority = self.authority.insecure_clone();
         self.exec(accounts, data, &[&authority]).await
     }
@@ -317,6 +329,11 @@ impl Env {
     }
 
     async fn close(&mut self, commodity: &str, position: Pubkey) -> Result<(), BanksClientError> {
+        self.close_with_referral(commodity, position, None).await
+    }
+
+    /// Close passing (referral_code, referrer_token_account) when given.
+    async fn close_with_referral(&mut self, commodity: &str, position: Pubkey, referral: Option<(Pubkey, Pubkey)>) -> Result<(), BanksClientError> {
         let owner = self.alice.keypair.insecure_clone();
         let k = *self.keys(commodity);
         let accounts = perps_core::accounts::ClosePosition {
@@ -329,8 +346,9 @@ impl Env {
             user_token_account: self.alice.token_account,
             pyth_price_feed: k.oracle,
             token_program: spl_token::ID,
-            user_referral: None,
-            referral_code: None,
+            user_referral: referral.map(|_| user_referral_pda(&owner.pubkey())),
+            referral_code: referral.map(|(code, _)| code),
+            referrer_token_account: referral.map(|(_, account)| account),
         };
         self.exec(accounts, perps_core::instruction::ClosePosition {}, &[&owner]).await
     }
@@ -359,6 +377,29 @@ impl Env {
         let k = *self.keys(commodity);
         let accounts = perps_core::accounts::UpdateFunding { keeper: keeper.pubkey(), market: k.market, pyth_price_feed: k.oracle };
         self.exec(accounts, perps_core::instruction::UpdateFunding {}, &[&keeper]).await
+    }
+
+    /// The keeper wallet creates referral code KEEP; alice applies it.
+    async fn refer_alice(&mut self) -> Pubkey {
+        let code = *b"KEEP\0\0\0\0";
+        let referrer = self.keeper.keypair.insecure_clone();
+        let alice = self.alice.keypair.insecure_clone();
+        let code_pda = referral_code_pda(&code);
+        let accounts = perps_core::accounts::CreateReferralCode {
+            owner: referrer.pubkey(),
+            referral_code: code_pda,
+            system_program: system_program::ID,
+        };
+        let params = perps_core::instructions::CreateReferralCodeParams { code };
+        self.exec(accounts, perps_core::instruction::CreateReferralCode { params }, &[&referrer]).await.unwrap();
+        let accounts = perps_core::accounts::ApplyReferralCode {
+            user: alice.pubkey(),
+            referral_code: code_pda,
+            user_referral: user_referral_pda(&alice.pubkey()),
+            system_program: system_program::ID,
+        };
+        self.exec(accounts, perps_core::instruction::ApplyReferralCode {}, &[&alice]).await.unwrap();
+        code_pda
     }
 
     async fn exec(&mut self, accounts: impl ToAccountMetas, data: impl InstructionData, signers: &[&Keypair]) -> Result<(), BanksClientError> {
@@ -421,11 +462,18 @@ async fn collateral_is_isolated_per_market() {
     let mut env = Env::new().await.funded("OIL", 1_000 * USDC).await;
     env.init_market("GOLD").await.unwrap();
     env.init_user("GOLD").await.unwrap();
+    // GOLD's vault holds someone else's money: send tokens straight to it
+    let payer = env.ctx.payer.insecure_clone();
+    let ix = spl_token::instruction::mint_to(&spl_token::ID, &env.mint, &env.gold.vault_token, &payer.pubkey(), &[], 5_000 * USDC).unwrap();
+    send(&mut env.ctx, &[ix], &[&payer]).await.unwrap();
 
-    // GOLD account holds nothing, so GOLD's vault can't be drained with OIL deposits
+    // Alice's GOLD account holds nothing
     assert_eq!(custom_error(env.withdraw_via("GOLD", "GOLD", 100 * USDC).await), code(PerpsError::InsufficientCollateral));
-    // Passing the OIL user account against GOLD's market fails the PDA check
-    assert!(env.withdraw_via("GOLD", "OIL", 100 * USDC).await.is_err());
+    // Her OIL account can't be used against GOLD's vault: the user-account PDA check rejects it
+    let constraint_seeds: u32 = anchor_lang::error::ErrorCode::ConstraintSeeds.into();
+    assert_eq!(custom_error(env.withdraw_via("GOLD", "OIL", 100 * USDC).await), constraint_seeds);
+    assert_eq!(env.token_balance(env.gold.vault_token).await, 5_000 * USDC);
+    assert_eq!(env.user("OIL").await.collateral_balance, 1_000 * USDC);
 
     env.withdraw_via("OIL", "OIL", 100 * USDC).await.unwrap();
     assert_eq!(env.user("OIL").await.collateral_balance, 900 * USDC);
@@ -478,6 +526,7 @@ async fn closed_market_blocks_price_dependent_actions() {
     assert_eq!(custom_error(env.open("OIL", 0, 10, 5).await.map(|_| ())), code(PerpsError::MarketClosed));
     assert_eq!(custom_error(env.close("OIL", position).await), code(PerpsError::MarketClosed));
     assert_eq!(custom_error(env.liquidate("OIL", position).await), code(PerpsError::MarketClosed));
+    assert_eq!(custom_error(env.update_funding("OIL").await), code(PerpsError::MarketClosed));
     // Moving collateral doesn't need a price
     env.deposit("OIL", 10 * USDC).await.unwrap();
 
@@ -522,6 +571,8 @@ async fn settlement_closes_positions_when_the_oracle_breaks() {
     let authority = env.authority.insecure_clone();
     env.settle("OIL", &authority, 70 * USDC).await.unwrap();
 
+    assert_eq!(custom_error(env.liquidate("OIL", position).await), code(PerpsError::MarketSettled));
+
     // Closes at $70: $150 - $50 loss - $0.375 fee
     env.close("OIL", position).await.unwrap();
     assert_eq!(env.token_balance(env.alice.token_account).await - before, 99_625_000);
@@ -565,4 +616,62 @@ async fn each_funding_period_is_charged_at_its_own_price() {
     // $1,500 collateral + $7,500 profit - funding ($0.75 + $1.50) - fee ($3.75).
     // Charging both periods at the closing price would have cost $3.00.
     assert_eq!(env.token_balance(env.alice.token_account).await - before, 8_994_000_000);
+}
+
+#[tokio::test]
+async fn referral_reward_is_paid_to_the_referrer_at_close() {
+    let mut env = Env::new().await.funded("OIL", 1_000 * USDC).await;
+    let referral_code = env.refer_alice().await;
+    let before = env.token_balance(env.alice.token_account).await;
+    let position = env.open("OIL", 0, 10, 5).await.unwrap();
+
+    // Someone else's token account can't be passed as the referrer's
+    let wrong = env.alice.token_account;
+    assert_eq!(custom_error(env.close_with_referral("OIL", position, Some((referral_code, wrong))).await), code(PerpsError::InvalidReferralParams));
+
+    let referrer = env.keeper.token_account;
+    env.close_with_referral("OIL", position, Some((referral_code, referrer))).await.unwrap();
+    // Fee $0.375 on $750, 10% discount -> $0.3375; referrer gets 20% -> $0.0675
+    assert_eq!(env.token_balance(env.alice.token_account).await - before, 150 * USDC - 337_500);
+    assert_eq!(env.token_balance(referrer).await, 67_500);
+    assert_eq!(env.market("OIL").await.insurance_fund, 337_500 - 67_500);
+}
+
+#[tokio::test]
+async fn underwater_close_pays_no_referral_reward() {
+    let mut env = Env::new().await.funded("OIL", 1_000 * USDC).await;
+    let referral_code = env.refer_alice().await;
+    let position = env.open("OIL", 0, 10, 10).await.unwrap();
+    // -20%: a $150 loss on $75 collateral
+    env.set_price("OIL", dollars(60.0), 0).await;
+    let referrer = env.keeper.token_account;
+    env.close_with_referral("OIL", position, Some((referral_code, referrer))).await.unwrap();
+    assert_eq!(env.token_balance(referrer).await, 0);
+}
+
+#[tokio::test]
+async fn liquidation_feeds_and_draws_on_the_insurance_fund() {
+    let mut env = Env::new().await.funded("OIL", 1_000 * USDC).await;
+    // Build up an insurance fund from fees: $750 notional at 0.05% = $0.375 per close
+    for _ in 0..4 {
+        let p = env.open("OIL", 0, 10, 5).await.unwrap();
+        env.close("OIL", p).await.unwrap();
+    }
+    assert_eq!(env.market("OIL").await.insurance_fund, 1_500_000);
+
+    // 10x long ($75 collateral) gapped 15% down: $112.50 loss, $37.50 bad debt
+    let position = env.open("OIL", 0, 10, 10).await.unwrap();
+    env.set_price("OIL", dollars(63.75), 0).await;
+    env.liquidate("OIL", position).await.unwrap();
+
+    // Reward $0.375 is paid from the fund, which also absorbs as much bad debt as it can
+    assert_eq!(env.token_balance(env.keeper.token_account).await, 375_000);
+    assert_eq!(env.market("OIL").await.insurance_fund, 0);
+}
+
+#[tokio::test]
+async fn market_fees_are_bounded() {
+    let mut env = Env::new().await;
+    let params = InitializeMarketParams { taker_fee: 1_000_000, ..oil_params("GOLD") };
+    assert_eq!(custom_error(env.init_market_with("GOLD", params).await), code(PerpsError::InvalidMarketConfig));
 }

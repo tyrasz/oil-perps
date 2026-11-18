@@ -637,29 +637,31 @@ describe("oil-perps", () => {
   });
 
   describe("Funding calculations", () => {
-    // payment = size * price / 1e6 (notional, USDC) * rate_diff / 1e6
+    // Mirrors programs/perps-core: each funding period adds
+    // funding_per_contract = rate * that period's price / 1e6 (USDC per contract)
+    // to Market.cumulative_funding; a position pays size * index_diff / 1e6.
     const size = 100_000_000; // 100 contracts
-    const price = 75_000_000; // $75
-    const fundingRate = 100; // cumulative 0.01%
-    const lastFundingPayment = 50;
-    const notional = (size * price) / 1_000_000; // $7,500
-    const fundingDiff = fundingRate - lastFundingPayment; // 0.005%
+    const fundingPerContract = (rate: number, price: number) => (rate * price) / 1_000_000;
+    const accrued = (isLong: boolean, indexDiff: number) => {
+      const payment = (size * indexDiff) / 1_000_000;
+      return isLong ? -payment : payment;
+    };
 
     it("should calculate funding payment for long position", () => {
-      // Long pays funding when funding_rate is positive
-      const fundingPayment = -(notional * fundingDiff) / 1_000_000;
-      expect(fundingPayment).to.equal(-375_000); // Pays $0.375
+      // 0.01% at $75 = $0.0075 per contract; 100 contracts pay $0.75
+      const index = fundingPerContract(100, 75_000_000);
+      expect(index).to.equal(7_500);
+      expect(accrued(true, index)).to.equal(-750_000);
     });
 
     it("should calculate funding payment for short position", () => {
-      // Short receives funding when funding_rate is positive
-      const fundingPayment = (notional * fundingDiff) / 1_000_000;
-      expect(fundingPayment).to.equal(375_000); // Receives $0.375
+      expect(accrued(false, fundingPerContract(100, 75_000_000))).to.equal(750_000);
     });
 
-    it("should scale funding with price", () => {
-      const notionalAt150 = (size * 150_000_000) / 1_000_000;
-      expect((notionalAt150 * fundingDiff) / 1_000_000).to.equal(750_000);
+    it("should charge each period at its own price", () => {
+      // 0.01% at $75 then 0.01% at $150: $0.75 + $1.50
+      const index = fundingPerContract(100, 75_000_000) + fundingPerContract(100, 150_000_000);
+      expect(accrued(true, index)).to.equal(-2_250_000);
     });
   });
 
@@ -696,17 +698,29 @@ describe("oil-perps", () => {
   });
 
   describe("Liquidation calculations", () => {
-    it("should calculate liquidation amounts correctly", () => {
-      const collateral = 500_000_000; // $500
-      const pnl = -400_000_000; // -$400
-      const remainingCollateral = Math.max(0, collateral + pnl); // $100
-      const liquidationFee = 250; // 2.5%
+    // Mirrors Market::liquidation_reward_target and liquidation_payout:
+    // reward = notional * maintenance margin * liquidation fee, paid from the
+    // remaining collateral first, then topped up from the insurance fund.
+    const reward = (notional: number, mmrBps: number, feeBps: number) =>
+      (notional * mmrBps * feeBps) / 100_000_000;
 
-      const liquidatorReward = (remainingCollateral * liquidationFee) / 10000;
+    it("should calculate liquidation amounts correctly", () => {
+      const notional = 10_000_000_000; // $10,000
+      const remainingCollateral = 100_000_000; // $500 collateral - $400 loss
+      const liquidatorReward = reward(notional, 500, 250); // 2.5% of the 5% margin
       const toInsurance = remainingCollateral - liquidatorReward;
 
-      expect(liquidatorReward).to.equal(2_500_000); // $2.50
-      expect(toInsurance).to.equal(97_500_000); // $97.50
+      expect(liquidatorReward).to.equal(12_500_000); // $12.50
+      expect(toInsurance).to.equal(87_500_000); // $87.50
+    });
+
+    it("should pay the reward from the insurance fund when underwater", () => {
+      const insuranceFund = 50_000_000;
+      const liquidatorReward = reward(10_000_000_000, 500, 250);
+      const remainingCollateral = 0;
+      const topUp = Math.min(liquidatorReward - remainingCollateral, insuranceFund);
+      expect(topUp).to.equal(12_500_000);
+      expect(insuranceFund - topUp).to.equal(37_500_000);
     });
 
     it("should handle complete wipeout", () => {

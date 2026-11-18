@@ -30,7 +30,7 @@ pub struct ReferralCode {
     pub total_rewards_earned: u64,
 
     /// Pending rewards available to claim (6 decimals)
-    pub pending_rewards: u64,
+    pub pending_rewards: u64,         // Unused: rewards are now paid out at close
 
     /// Timestamp when the code was created
     pub created_at: i64,

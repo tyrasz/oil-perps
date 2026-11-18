@@ -49,7 +49,6 @@ pub struct Market {
     pub max_confidence_bps: u32,              // Max Pyth confidence / price; 0 = oracle default (1%)
     pub min_oracle_price: u64,                // 6 decimals; prices below halt the market; 0 = off
     pub settlement_price: u64,                // 6 decimals; non-zero once settle_market has run
-    pub referral_reserve: u64,                // Referral rewards earned here and not yet claimed
     pub funding_rate: i64,                    // Latest per-period funding rate (6 decimals, 100 = 0.01%)
 }
 
@@ -84,9 +83,8 @@ impl Market {
         4 +   // max_confidence_bps
         8 +   // min_oracle_price
         8 +   // settlement_price
-        8 +   // referral_reserve
         8 +   // funding_rate
-        7;    // padding for future use
+        15;   // padding for future use
 
     /// Convert commodity bytes to string
     pub fn commodity_str(&self) -> String {
@@ -359,7 +357,7 @@ mod tests {
     fn account_size_is_unchanged_so_existing_markets_still_load() {
         assert_eq!(Market::LEN, 298);
         let serialized = Market::default().try_to_vec().unwrap().len();
-        assert_eq!(8 + serialized + 7, Market::LEN);
+        assert_eq!(8 + serialized + 15, Market::LEN);
     }
 
     // Fri 2026-11-13: 22:00 UTC is the 17:00 ET weekly close.
