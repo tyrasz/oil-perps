@@ -67,6 +67,7 @@ pub struct MarketData {
     pub max_confidence_bps: u32,
     pub min_oracle_price: u64,
     pub settlement_price: u64,
+    pub referral_reserve: u64,
 }
 
 impl MarketData {
@@ -134,16 +135,77 @@ pub async fn run_liquidation_keeper(client: Arc<RpcClient>, config: Arc<KeeperCo
     }
 }
 
-async fn check_and_liquidate(
+type KeeperResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Fetch and decode a commodity's market, or `None` if it isn't initialized.
+pub fn fetch_market(client: &RpcClient, config: &KeeperConfig, commodity: &str) -> KeeperResult<Option<(Pubkey, MarketData)>> {
+    let (market_pda, _) = get_market_pda(&config.perps_program_id, &config.usdc_mint, commodity);
+    let Some(account) = client.get_account_with_commitment(&market_pda, client.commitment())?.value else {
+        return Ok(None);
+    };
+    let market: MarketData = BorshDeserialize::deserialize(&mut &account.data[8..])?;
+    Ok(Some((market_pda, market)))
+}
+
+/// Run `f` for every configured market. Errors in one market are logged and
+/// don't stop the others; the call fails only if every market failed.
+pub fn for_each_market<T: Default + std::ops::AddAssign>(
     client: &RpcClient,
     config: &KeeperConfig,
-) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    // Get market PDA
-    let (market_pda, _) = get_market_pda(&config.perps_program_id, &config.usdc_mint);
+    mut f: impl FnMut(&str, Pubkey, MarketData) -> KeeperResult<T>,
+) -> KeeperResult<T> {
+    let mut total = T::default();
+    let mut failures = 0;
+    let mut last_error = None;
+    for commodity in &config.commodities {
+        let result = fetch_market(client, config, commodity).and_then(|found| match found {
+            Some((pda, market)) => f(commodity, pda, market),
+            None => {
+                debug!("{} market not initialized, skipping", commodity);
+                Ok(T::default())
+            }
+        });
+        match result {
+            Ok(v) => total += v,
+            Err(e) => {
+                error!("{} market: {}", commodity, e);
+                failures += 1;
+                last_error = Some(e);
+            }
+        }
+    }
+    match last_error {
+        Some(e) if failures == config.commodities.len() => Err(e),
+        _ => Ok(total),
+    }
+}
 
-    // Fetch market data
-    let market_account = client.get_account(&market_pda)?;
-    let market_data: MarketData = BorshDeserialize::deserialize(&mut &market_account.data[8..])?;
+async fn check_and_liquidate(client: &RpcClient, config: &KeeperConfig) -> KeeperResult<u32> {
+    let mut work = Vec::new();
+    let found = for_each_market(client, config, |commodity, pda, market| {
+        work.push((commodity.to_string(), pda, market));
+        Ok(0u32)
+    });
+    found?;
+
+    let mut liquidated = 0;
+    for (commodity, market_pda, market_data) in work {
+        match check_market(client, config, &commodity, market_pda, market_data).await {
+            Ok(n) => liquidated += n,
+            Err(e) => error!("{} liquidation check failed: {}", commodity, e),
+        }
+    }
+    Ok(liquidated)
+}
+
+async fn check_market(
+    client: &RpcClient,
+    config: &KeeperConfig,
+    commodity: &str,
+    market_pda: Pubkey,
+    market_data: MarketData,
+) -> KeeperResult<u32> {
+    debug!("Checking {} market {}", commodity, market_pda);
 
     if market_data.is_paused {
         debug!("Market is paused, skipping liquidation check");
@@ -166,7 +228,7 @@ async fn check_and_liquidate(
     debug!("Current oracle price: ${:.2}", oracle_price as f64 / 1_000_000.0);
 
     // Find all open positions
-    let open_positions = fetch_open_positions(client, &config.perps_program_id)?;
+    let open_positions = fetch_open_positions(client, &config.perps_program_id, &market_pda)?;
     debug!("Found {} open positions", open_positions.len());
 
     let mut liquidated_count = 0;
@@ -222,13 +284,18 @@ fn fetch_oracle_price(
     Ok(normalized)
 }
 
+/// Offset of `Position::market` (after the discriminator and owner).
+const POSITION_MARKET_OFFSET: usize = 8 + 32;
+
 fn fetch_open_positions(
     client: &RpcClient,
     program_id: &Pubkey,
+    market: &Pubkey,
 ) -> Result<Vec<(Pubkey, PositionData)>, Box<dyn std::error::Error + Send + Sync>> {
-    // Filter for position accounts with status = Open (0)
+    // Open positions in this market only
     let filters = vec![
         RpcFilterType::Memcmp(Memcmp::new_raw_bytes(0, anchor_discriminator("account", "Position").to_vec())),
+        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(POSITION_MARKET_OFFSET, market.to_bytes().to_vec())),
         // Status at offset 8 + 32 + 32 + 1 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 = 133
         RpcFilterType::Memcmp(Memcmp::new_raw_bytes(133, vec![0])), // Open status
     ];
@@ -309,7 +376,7 @@ async fn execute_liquidation(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (vault_pda, _) = get_vault_pda(&config.perps_program_id, market_pda);
     let (vault_token_pda, _) = get_vault_token_pda(&config.perps_program_id, market_pda);
-    let (user_account_pda, _) = get_user_account_pda(&config.perps_program_id, &position.owner);
+    let (user_account_pda, _) = get_user_account_pda(&config.perps_program_id, &position.owner, market_pda);
 
     // Get liquidator's token account
     let liquidator_token_account = get_associated_token_address(
@@ -405,7 +472,8 @@ mod tests {
         }
         bytes.extend_from_slice(&5_000_000u64.to_le_bytes()); // min_oracle_price
         bytes.extend_from_slice(&0u64.to_le_bytes()); // settlement_price
-        bytes.extend_from_slice(&[0u8; 23]); // padding
+        bytes.extend_from_slice(&77u64.to_le_bytes()); // referral_reserve
+        bytes.extend_from_slice(&[0u8; 15]); // padding
         assert_eq!(8 + bytes.len(), 298); // Market::LEN
 
         let m = MarketData::deserialize(&mut bytes.as_slice()).unwrap();
@@ -419,6 +487,7 @@ mod tests {
         assert_eq!(m.session_schedule, 1);
         assert_eq!((m.weekend_initial_margin_ratio, m.weekend_maintenance_margin_ratio), (2_000, 1_000));
         assert_eq!((m.max_confidence_bps, m.min_oracle_price, m.settlement_price), (150, 5_000_000, 0));
+        assert_eq!(m.referral_reserve, 77);
     }
 
     #[test]
@@ -445,6 +514,15 @@ mod tests {
         assert_eq!(m.maintenance_margin_ratio_at(friday_close - 7_201), 500);
         assert_eq!(m.maintenance_margin_ratio_at(friday_close - 60), 1_000);
         assert!(!m.is_in_session(friday_close));
+    }
+
+    #[test]
+    fn position_market_offset_matches_layout() {
+        let market = Pubkey::new_unique();
+        let p = PositionData { owner: Pubkey::new_unique(), market, ..Default::default() };
+        let mut bytes = vec![0u8; 8];
+        bytes.extend(borsh::to_vec(&p).unwrap());
+        assert_eq!(&bytes[POSITION_MARKET_OFFSET..POSITION_MARKET_OFFSET + 32], market.as_ref());
     }
 
     #[test]

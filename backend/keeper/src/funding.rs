@@ -1,6 +1,5 @@
-use crate::{KeeperConfig, get_market_pda};
-use crate::liquidator::{anchor_discriminator, MarketData};
-use borsh::BorshDeserialize;
+use crate::KeeperConfig;
+use crate::liquidator::{anchor_discriminator, for_each_market, MarketData};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
@@ -49,12 +48,30 @@ async fn check_and_update_funding(
     client: &RpcClient,
     config: &KeeperConfig,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    // Get market PDA
-    let (market_pda, _) = get_market_pda(&config.perps_program_id, &config.usdc_mint);
+    let mut due = Vec::new();
+    for_each_market(client, config, |commodity, pda, market| {
+        due.push((commodity.to_string(), pda, market));
+        Ok(0u32)
+    })?;
 
-    // Fetch market data
-    let market_account = client.get_account(&market_pda)?;
-    let market_data: MarketData = BorshDeserialize::deserialize(&mut &market_account.data[8..])?;
+    let mut updated = false;
+    for (commodity, market_pda, market_data) in due {
+        match update_market_funding(client, config, &commodity, market_pda, market_data).await {
+            Ok(u) => updated |= u,
+            Err(e) => error!("{} funding update failed: {}", commodity, e),
+        }
+    }
+    Ok(updated)
+}
+
+async fn update_market_funding(
+    client: &RpcClient,
+    config: &KeeperConfig,
+    commodity: &str,
+    market_pda: Pubkey,
+    market_data: MarketData,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    debug!("Checking funding for {} market {}", commodity, market_pda);
 
     if market_data.is_paused {
         debug!("Market is paused, skipping funding update");

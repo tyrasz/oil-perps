@@ -17,7 +17,18 @@ pub struct KeeperConfig {
     pub rpc_url: String,
     pub perps_program_id: Pubkey,
     pub usdc_mint: Pubkey,
+    /// Commodities to keep, one market each (MARKETS env, comma-separated).
+    pub commodities: Vec<String>,
     pub keypair: Keypair,
+}
+
+pub const DEFAULT_MARKETS: &str = "OIL,GOLD,SILVER,NATGAS,COPPER";
+
+pub fn parse_markets(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|c| c.trim().to_ascii_uppercase())
+        .filter(|c| !c.is_empty())
+        .collect()
 }
 
 #[tokio::main]
@@ -45,11 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let usdc_mint = std::env::var("USDC_MINT")
         .unwrap_or_else(|_| "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string());
 
+    let commodities = parse_markets(&std::env::var("MARKETS").unwrap_or_else(|_| DEFAULT_MARKETS.to_string()));
+
     info!("========================================");
     info!("   Oil Perps Keeper Bot Starting");
     info!("========================================");
     info!("RPC URL: {}", rpc_url);
     info!("Program ID: {}", perps_program_id);
+    info!("Markets: {}", commodities.join(", "));
 
     let client = Arc::new(RpcClient::new_with_commitment(
         rpc_url.clone(),
@@ -71,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rpc_url,
         perps_program_id: Pubkey::from_str(&perps_program_id)?,
         usdc_mint: Pubkey::from_str(&usdc_mint)?,
+        commodities,
         keypair,
     };
 
@@ -111,10 +126,12 @@ fn load_keypair(path: &str) -> Result<Keypair, Box<dyn std::error::Error>> {
     Ok(Keypair::from_bytes(&bytes)?)
 }
 
-// Helper to derive PDAs
-pub fn get_market_pda(program_id: &Pubkey, collateral_mint: &Pubkey) -> (Pubkey, u8) {
+// Helpers to derive PDAs (must match the seeds in programs/perps-core)
+
+/// One market per (collateral mint, commodity), e.g. "OIL".
+pub fn get_market_pda(program_id: &Pubkey, collateral_mint: &Pubkey, commodity: &str) -> (Pubkey, u8) {
     Pubkey::find_program_address(
-        &[b"market", collateral_mint.as_ref()],
+        &[b"market", collateral_mint.as_ref(), commodity.as_bytes()],
         program_id,
     )
 }
@@ -133,9 +150,51 @@ pub fn get_vault_token_pda(program_id: &Pubkey, market: &Pubkey) -> (Pubkey, u8)
     )
 }
 
-pub fn get_user_account_pda(program_id: &Pubkey, owner: &Pubkey) -> (Pubkey, u8) {
+/// User accounts are per market.
+pub fn get_user_account_pda(program_id: &Pubkey, owner: &Pubkey, market: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
-        &[b"user", owner.as_ref()],
+        &[b"user", owner.as_ref(), market.as_ref()],
         program_id,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_commodity_has_its_own_market_and_user_accounts() {
+        let program = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let markets: Vec<_> = parse_markets(DEFAULT_MARKETS)
+            .iter()
+            .map(|c| get_market_pda(&program, &mint, c).0)
+            .collect();
+        let unique: std::collections::HashSet<_> = markets.iter().collect();
+        assert_eq!(unique.len(), 5);
+
+        let users: std::collections::HashSet<_> =
+            markets.iter().map(|m| get_user_account_pda(&program, &owner, m).0).collect();
+        assert_eq!(users.len(), 5);
+    }
+
+    #[test]
+    fn addresses_match_program_derivation() {
+        // Same values are pinned in perps-core (state/market.rs) and the frontend.
+        let program = Pubkey::from_str("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS").unwrap();
+        let mint = Pubkey::from_str("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU").unwrap();
+        let (oil, _) = get_market_pda(&program, &mint, "OIL");
+        assert_eq!(oil.to_string(), "6Chy7k9ArMFQamqogr5jsYVoRTbnP9TaCxvDqRV6ntD9");
+        let owner = Pubkey::from_str("11111111111111111111111111111112").unwrap();
+        assert_eq!(
+            get_user_account_pda(&program, &owner, &oil).0.to_string(),
+            "4NBuxBaDE8SpGFiytjqTmkYqkyc628SAsGxrc51jkHso"
+        );
+    }
+
+    #[test]
+    fn parses_market_list() {
+        assert_eq!(parse_markets(" oil, GOLD ,,natgas "), vec!["OIL", "GOLD", "NATGAS"]);
+    }
 }
