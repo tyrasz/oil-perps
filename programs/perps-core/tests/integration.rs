@@ -4,13 +4,14 @@
 
 use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
 use perps_core::errors::PerpsError;
-use perps_core::instructions::{InitializeMarketParams, MarketConfigParams, OpenPositionParams};
+use perps_core::instructions::{InitializeMarketParams, MarketConfigParams, OpenPositionParams, ProtocolRolesParams};
 use perps_core::session::SCHEDULE_CME_GLOBEX;
 use perps_core::state::{Market, Position, PositionStatus, UserAccount};
 use pyth_sdk_solana::state::{AccountType, PriceAccount, PriceInfo, PriceStatus, MAGIC, VERSION_2};
 use solana_program_test::{processor, BanksClientError, ProgramTest, ProgramTestContext};
 use solana_sdk::{
     account::{Account, AccountSharedData},
+    bpf_loader_upgradeable::{self, UpgradeableLoaderState},
     clock::Clock,
     instruction::{Instruction, InstructionError},
     program_pack::Pack,
@@ -21,6 +22,8 @@ use solana_sdk::{
 };
 
 const USDC: u64 = 1_000_000;
+/// Stands in for the Pyth program: owner of every test price feed.
+const PYTH_PROGRAM: Pubkey = Pubkey::new_from_array([0x50; 32]);
 const CONTRACT: u64 = 1_000_000;
 
 // Fri 2026-11-13 17:00 ET (22:00 UTC) is a weekly close.
@@ -50,7 +53,9 @@ struct Trader {
 
 struct Env {
     ctx: ProgramTestContext,
+    /// Upgrade authority, and so the initial admin
     authority: Keypair,
+    guardian: Keypair,
     mint: Pubkey,
     oil: MarketKeys,
     gold: MarketKeys,
@@ -95,7 +100,7 @@ fn pyth_account(price: i64, conf: u64, expo: i32, timestamp: i64) -> Account {
     Account {
         lamports: 1_000_000_000,
         data: bytemuck::bytes_of(&acct).to_vec(),
-        owner: Pubkey::new_unique(),
+        owner: PYTH_PROGRAM,
         executable: false,
         rent_epoch: 0,
     }
@@ -142,21 +147,46 @@ fn custom_error(result: Result<(), BanksClientError>) -> u32 {
     }
 }
 
+fn config_pda() -> Pubkey {
+    Pubkey::find_program_address(&[b"config"], &perps_core::ID).0
+}
+
 impl Env {
+    /// Admin config created by the upgrade authority, and an OIL market.
     async fn new() -> Env {
+        let mut env = Env::bare().await;
+        let authority = env.authority.insecure_clone();
+        env.init_config(&authority).await.unwrap();
+        env.init_market("OIL").await.unwrap();
+        env
+    }
+
+    /// No protocol config and no markets yet.
+    async fn bare() -> Env {
+        let authority = Keypair::new();
         let mut pt = ProgramTest::new("perps_core", perps_core::ID, processor!(process));
+        // The program's ProgramData account, naming `authority` as upgrade authority
+        let (program_data, _) = Pubkey::find_program_address(&[perps_core::ID.as_ref()], &bpf_loader_upgradeable::id());
+        let state = UpgradeableLoaderState::ProgramData { slot: 0, upgrade_authority_address: Some(authority.pubkey()) };
+        pt.add_account(program_data, Account {
+            lamports: 1_000_000_000,
+            data: bincode::serialize(&state).unwrap(),
+            owner: bpf_loader_upgradeable::id(),
+            executable: false,
+            rent_epoch: 0,
+        });
         let oil_oracle = Pubkey::new_unique();
         let gold_oracle = Pubkey::new_unique();
         pt.add_account(oil_oracle, pyth_account(dollars(75.0), 0, -8, WEDNESDAY));
         pt.add_account(gold_oracle, pyth_account(dollars(2_000.0), 0, -8, WEDNESDAY));
         let mut ctx = pt.start_with_context().await;
 
-        let authority = Keypair::new();
+        let guardian = Keypair::new();
         let mint = Keypair::new();
         let alice = Keypair::new();
         let keeper = Keypair::new();
         let payer = ctx.payer.insecure_clone();
-        for who in [&authority, &alice, &keeper] {
+        for who in [&authority, &guardian, &alice, &keeper] {
             let ix = system_instruction::transfer(&payer.pubkey(), &who.pubkey(), 10_000_000_000);
             send(&mut ctx, &[ix], &[&payer]).await.unwrap();
         }
@@ -176,14 +206,48 @@ impl Env {
             keeper: Trader { token_account: Pubkey::default(), keypair: keeper },
             mint: mint.pubkey(),
             authority,
+            guardian,
             ctx,
         };
         env.alice.token_account = env.token_account(&env.alice.keypair.pubkey(), 10_000 * USDC).await;
         env.keeper.token_account = env.token_account(&env.keeper.keypair.pubkey(), 0).await;
 
         env.set_time(WEDNESDAY).await;
-        env.init_market("OIL").await.unwrap();
         env
+    }
+
+    async fn funded_keypair(&mut self) -> Keypair {
+        let k = Keypair::new();
+        let payer = self.ctx.payer.insecure_clone();
+        let ix = system_instruction::transfer(&payer.pubkey(), &k.pubkey(), 10_000_000_000);
+        send(&mut self.ctx, &[ix], &[]).await.unwrap();
+        k
+    }
+
+    async fn init_config(&mut self, signer: &Keypair) -> Result<(), BanksClientError> {
+        let accounts = perps_core::accounts::InitializeConfig {
+            upgrade_authority: signer.pubkey(),
+            config: config_pda(),
+            program_data: Pubkey::find_program_address(&[perps_core::ID.as_ref()], &bpf_loader_upgradeable::id()).0,
+            system_program: system_program::ID,
+        };
+        let params = ProtocolRolesParams { guardian: self.guardian.pubkey(), oracle_program: PYTH_PROGRAM };
+        self.exec(accounts, perps_core::instruction::InitializeConfig { params }, &[signer]).await
+    }
+
+    async fn pause(&mut self, commodity: &str, signer: &Keypair) -> Result<(), BanksClientError> {
+        let accounts = perps_core::accounts::PauseMarket { signer: signer.pubkey(), config: config_pda(), market: self.keys(commodity).market };
+        self.exec(accounts, perps_core::instruction::PauseMarket {}, &[signer]).await
+    }
+
+    async fn propose_admin(&mut self, signer: &Keypair, new_admin: Pubkey) -> Result<(), BanksClientError> {
+        let accounts = perps_core::accounts::AdminOnly { admin: signer.pubkey(), config: config_pda() };
+        self.exec(accounts, perps_core::instruction::ProposeAdmin { new_admin }, &[signer]).await
+    }
+
+    async fn accept_admin(&mut self, signer: &Keypair) -> Result<(), BanksClientError> {
+        let accounts = perps_core::accounts::AcceptAdmin { new_admin: signer.pubkey(), config: config_pda() };
+        self.exec(accounts, perps_core::instruction::AcceptAdmin {}, &[signer]).await
     }
 
     async fn token_account(&mut self, owner: &Pubkey, amount: u64) -> Pubkey {
@@ -236,31 +300,41 @@ impl Env {
     }
 
     async fn init_market_with(&mut self, commodity: &str, params: InitializeMarketParams) -> Result<(), BanksClientError> {
+        let authority = self.authority.insecure_clone();
+        let oracle = self.keys(commodity).oracle;
+        self.init_market_as(&authority, commodity, params, oracle).await
+    }
+
+    async fn init_market_as(&mut self, signer: &Keypair, commodity: &str, params: InitializeMarketParams, oracle: Pubkey) -> Result<(), BanksClientError> {
         let k = *self.keys(commodity);
         let accounts = perps_core::accounts::InitializeMarket {
-            authority: self.authority.pubkey(),
+            authority: signer.pubkey(),
+            config: config_pda(),
             market: k.market,
             vault: k.vault,
             vault_token_account: k.vault_token,
             collateral_mint: self.mint,
-            pyth_price_feed: k.oracle,
+            pyth_price_feed: oracle,
             system_program: system_program::ID,
             token_program: spl_token::ID,
             rent: sysvar::rent::ID,
         };
         let data = perps_core::instruction::InitializeMarket { params };
-        let authority = self.authority.insecure_clone();
-        self.exec(accounts, data, &[&authority]).await
+        self.exec(accounts, data, &[signer]).await
     }
 
     async fn configure(&mut self, commodity: &str, params: MarketConfigParams) -> Result<(), BanksClientError> {
-        let accounts = perps_core::accounts::UpdateMarketConfig { authority: self.authority.pubkey(), market: self.keys(commodity).market };
         let authority = self.authority.insecure_clone();
-        self.exec(accounts, perps_core::instruction::UpdateMarketConfig { params }, &[&authority]).await
+        self.configure_as(&authority, commodity, params).await
+    }
+
+    async fn configure_as(&mut self, signer: &Keypair, commodity: &str, params: MarketConfigParams) -> Result<(), BanksClientError> {
+        let accounts = perps_core::accounts::UpdateMarketConfig { authority: signer.pubkey(), config: config_pda(), market: self.keys(commodity).market };
+        self.exec(accounts, perps_core::instruction::UpdateMarketConfig { params }, &[signer]).await
     }
 
     async fn settle(&mut self, commodity: &str, signer: &Keypair, price: u64) -> Result<(), BanksClientError> {
-        let accounts = perps_core::accounts::SettleMarket { authority: signer.pubkey(), market: self.keys(commodity).market };
+        let accounts = perps_core::accounts::SettleMarket { authority: signer.pubkey(), config: config_pda(), market: self.keys(commodity).market };
         self.exec(accounts, perps_core::instruction::SettleMarket { settlement_price: price }, &[signer]).await
     }
 
@@ -717,4 +791,85 @@ async fn user_accounts_cannot_be_used_in_another_market() {
 
     assert_eq!(env.user("OIL").await.collateral_balance, 1_000 * USDC);
     assert_eq!(env.token_balance(gold.vault_token).await, 0);
+}
+
+// --- protocol roles ----------------------------------------------------------
+
+fn unpaused() -> MarketConfigParams {
+    MarketConfigParams { is_paused: false, ..Default::default() }
+}
+
+#[tokio::test]
+async fn only_the_upgrade_authority_can_set_up_the_protocol() {
+    let mut env = Env::bare().await;
+    let stranger = env.funded_keypair().await;
+    assert_eq!(custom_error(env.init_config(&stranger).await), code(PerpsError::Unauthorized));
+
+    let authority = env.authority.insecure_clone();
+    env.init_config(&authority).await.unwrap();
+    assert!(env.init_config(&authority).await.is_err(), "config can only be created once");
+}
+
+#[tokio::test]
+async fn only_the_admin_creates_markets_with_a_genuine_feed() {
+    let mut env = Env::new().await;
+    let stranger = env.funded_keypair().await;
+    let gold_oracle = env.gold.oracle;
+    assert_eq!(
+        custom_error(env.init_market_as(&stranger, "GOLD", oil_params("GOLD"), gold_oracle).await),
+        code(PerpsError::Unauthorized)
+    );
+
+    // A feed account not owned by the configured oracle program is refused
+    let fake_feed = Pubkey::new_unique();
+    let mut fake = pyth_account(dollars(2_000.0), 0, -8, WEDNESDAY);
+    fake.owner = Pubkey::new_unique();
+    env.ctx.set_account(&fake_feed, &AccountSharedData::from(fake));
+    let authority = env.authority.insecure_clone();
+    assert_eq!(
+        custom_error(env.init_market_as(&authority, "GOLD", oil_params("GOLD"), fake_feed).await),
+        code(PerpsError::InvalidOracleAccount)
+    );
+
+    env.init_market("GOLD").await.unwrap();
+}
+
+#[tokio::test]
+async fn guardian_can_pause_but_not_unpause_or_settle() {
+    let mut env = Env::new().await.funded("OIL", 1_000 * USDC).await;
+    let guardian = env.guardian.insecure_clone();
+    let stranger = env.funded_keypair().await;
+
+    assert_eq!(custom_error(env.pause("OIL", &stranger).await), code(PerpsError::Unauthorized));
+    env.pause("OIL", &guardian).await.unwrap();
+    assert!(env.market("OIL").await.is_paused);
+    assert_eq!(custom_error(env.open("OIL", 0, 1, 5).await.map(|_| ())), code(PerpsError::MarketPaused));
+
+    assert_eq!(custom_error(env.configure_as(&guardian, "OIL", unpaused()).await), code(PerpsError::Unauthorized));
+    assert_eq!(custom_error(env.settle("OIL", &guardian, 70 * USDC).await), code(PerpsError::Unauthorized));
+
+    env.configure("OIL", unpaused()).await.unwrap();
+    env.open("OIL", 0, 1, 5).await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_handover_takes_two_steps_and_covers_existing_markets() {
+    let mut env = Env::new().await;
+    let old_admin = env.authority.insecure_clone();
+    let new_admin = env.funded_keypair().await;
+    let stranger = env.funded_keypair().await;
+
+    env.propose_admin(&old_admin, new_admin.pubkey()).await.unwrap();
+    assert_eq!(custom_error(env.accept_admin(&stranger).await), code(PerpsError::Unauthorized));
+    // Until accepted, the old admin is still in charge
+    env.configure_as(&old_admin, "OIL", unpaused()).await.unwrap();
+
+    env.accept_admin(&new_admin).await.unwrap();
+    assert_eq!(custom_error(env.configure_as(&old_admin, "OIL", unpaused()).await), code(PerpsError::Unauthorized));
+    assert_eq!(custom_error(env.propose_admin(&old_admin, old_admin.pubkey()).await), code(PerpsError::Unauthorized));
+
+    // The new admin controls the market the old admin created, and can create markets
+    env.configure_as(&new_admin, "OIL", unpaused()).await.unwrap();
+    let gold_oracle = env.gold.oracle;
+    env.init_market_as(&new_admin, "GOLD", oil_params("GOLD"), gold_oracle).await.unwrap();
 }

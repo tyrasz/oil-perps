@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
-use crate::state::{Market, Vault};
+use crate::state::{Market, ProtocolConfig, Vault};
 use crate::errors::PerpsError;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
@@ -19,8 +19,16 @@ pub struct InitializeMarketParams {
 #[derive(Accounts)]
 #[instruction(params: InitializeMarketParams)]
 pub struct InitializeMarket<'info> {
+    /// Must be the protocol admin; nobody else can create markets.
     #[account(mut)]
     pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [ProtocolConfig::SEED],
+        bump = config.bump,
+        constraint = config.admin == authority.key() @ PerpsError::Unauthorized
+    )]
+    pub config: Account<'info, ProtocolConfig>,
 
     #[account(
         init,
@@ -52,7 +60,8 @@ pub struct InitializeMarket<'info> {
 
     pub collateral_mint: Account<'info, Mint>,
 
-    /// CHECK: Pyth price feed account, validated by Pyth SDK
+    /// CHECK: Pyth price feed; must be owned by the configured oracle program
+    #[account(constraint = *pyth_price_feed.owner == config.oracle_program @ PerpsError::InvalidOracleAccount)]
     pub pyth_price_feed: AccountInfo<'info>,
 
     pub system_program: Program<'info, System>,

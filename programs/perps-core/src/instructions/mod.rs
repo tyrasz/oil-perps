@@ -9,6 +9,8 @@ pub mod liquidate;
 pub mod update_funding;
 pub mod update_market_config;
 pub mod settle_market;
+pub mod protocol_config;
+pub mod pause_market;
 pub mod create_referral_code;
 pub mod apply_referral_code;
 
@@ -23,5 +25,7 @@ pub use liquidate::*;
 pub use update_funding::*;
 pub use update_market_config::*;
 pub use settle_market::*;
+pub use protocol_config::*;
+pub use pause_market::*;
 pub use create_referral_code::*;
 pub use apply_referral_code::*;

@@ -30,3 +30,4 @@ solana-sdk = "~1.16"
 spl-token = { version = "3.5", features = ["no-entrypoint"] }
 bytemuck = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+bincode = "1"

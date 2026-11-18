@@ -95,4 +95,7 @@ pub enum PerpsError {
 
     #[msg("Oracle price is below the market's minimum price")]
     OraclePriceBelowFloor,
+
+    #[msg("Price feed is not owned by the configured oracle program")]
+    InvalidOracleAccount,
 }

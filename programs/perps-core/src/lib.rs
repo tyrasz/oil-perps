@@ -62,6 +62,28 @@ pub mod perps_core {
         instructions::update_market_config::handler(ctx, params)
     }
 
+    // Protocol roles: set up once by the upgrade authority (who becomes admin)
+    pub fn initialize_config(ctx: Context<InitializeConfig>, params: ProtocolRolesParams) -> Result<()> {
+        instructions::protocol_config::initialize_config(ctx, params)
+    }
+
+    pub fn propose_admin(ctx: Context<AdminOnly>, new_admin: Pubkey) -> Result<()> {
+        instructions::protocol_config::propose_admin(ctx, new_admin)
+    }
+
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        instructions::protocol_config::accept_admin(ctx)
+    }
+
+    pub fn update_roles(ctx: Context<AdminOnly>, params: ProtocolRolesParams) -> Result<()> {
+        instructions::protocol_config::update_roles(ctx, params)
+    }
+
+    // Admin or guardian: stop new positions in a market
+    pub fn pause_market(ctx: Context<PauseMarket>) -> Result<()> {
+        instructions::pause_market::handler(ctx)
+    }
+
     // Admin: final emergency settlement at a fixed price
     pub fn settle_market(ctx: Context<SettleMarket>, settlement_price: u64) -> Result<()> {
         instructions::settle_market::handler(ctx, settlement_price)

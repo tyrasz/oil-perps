@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use crate::errors::PerpsError;
 use crate::session;
-use crate::state::Market;
+use crate::state::{Market, ProtocolConfig};
 
 /// Authority-controlled risk settings. See the field docs on `Market`.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,11 +36,19 @@ impl MarketConfigParams {
 pub struct UpdateMarketConfig<'info> {
     pub authority: Signer<'info>,
 
+    // Checked against the protocol admin (not the market's creator), so an
+    // admin handover covers existing markets.
+    #[account(
+        seeds = [ProtocolConfig::SEED],
+        bump = config.bump,
+        constraint = config.admin == authority.key() @ PerpsError::Unauthorized
+    )]
+    pub config: Account<'info, ProtocolConfig>,
+
     #[account(
         mut,
         seeds = [b"market", market.collateral_mint.as_ref(), market.commodity_seed()],
         bump = market.bump,
-        constraint = market.authority == authority.key() @ PerpsError::Unauthorized,
     )]
     pub market: Account<'info, Market>,
 }
