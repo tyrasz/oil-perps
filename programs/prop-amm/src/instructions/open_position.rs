@@ -18,10 +18,15 @@ pub struct OpenPositionAmm<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
 
+    // Operator-only until positions are program-owned accounts. The trade
+    // params (size, side, entry price) are taken on trust and no collateral
+    // is posted, so a public caller could open phantom exposure or close a
+    // position that never existed and be paid PnL from the LP vault.
     #[account(
         mut,
         seeds = [b"lp_vault", vault.collateral_mint.as_ref()],
-        bump = vault.bump
+        bump = vault.bump,
+        constraint = vault.authority == trader.key() @ PropAmmError::Unauthorized
     )]
     pub vault: Account<'info, LpVault>,
 
