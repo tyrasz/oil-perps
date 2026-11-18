@@ -28,7 +28,7 @@ pub struct InitializeMarket<'info> {
         bump = config.bump,
         constraint = config.admin == authority.key() @ PerpsError::Unauthorized
     )]
-    pub config: Account<'info, ProtocolConfig>,
+    pub config: Box<Account<'info, ProtocolConfig>>,
 
     #[account(
         init,
@@ -37,7 +37,7 @@ pub struct InitializeMarket<'info> {
         seeds = [b"market", collateral_mint.key().as_ref(), params.commodity.as_bytes()],
         bump
     )]
-    pub market: Account<'info, Market>,
+    pub market: Box<Account<'info, Market>>,
 
     #[account(
         init,
@@ -46,7 +46,7 @@ pub struct InitializeMarket<'info> {
         seeds = [b"vault", market.key().as_ref()],
         bump
     )]
-    pub vault: Account<'info, Vault>,
+    pub vault: Box<Account<'info, Vault>>,
 
     #[account(
         init,
@@ -56,9 +56,9 @@ pub struct InitializeMarket<'info> {
         seeds = [b"vault_token", market.key().as_ref()],
         bump
     )]
-    pub vault_token_account: Account<'info, TokenAccount>,
+    pub vault_token_account: Box<Account<'info, TokenAccount>>,
 
-    pub collateral_mint: Account<'info, Mint>,
+    pub collateral_mint: Box<Account<'info, Mint>>,
 
     /// CHECK: Pyth price feed; must be owned by the configured oracle program
     #[account(constraint = *pyth_price_feed.owner == config.oracle_program @ PerpsError::InvalidOracleAccount)]

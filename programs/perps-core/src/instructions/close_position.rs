@@ -15,14 +15,14 @@ pub struct ClosePosition<'info> {
         bump = user_account.bump,
         constraint = user_account.owner == owner.key()
     )]
-    pub user_account: Account<'info, UserAccount>,
+    pub user_account: Box<Account<'info, UserAccount>>,
 
     #[account(
         mut,
         seeds = [b"market", market.collateral_mint.as_ref(), market.commodity_seed()],
         bump = market.bump
     )]
-    pub market: Account<'info, Market>,
+    pub market: Box<Account<'info, Market>>,
 
     #[account(
         mut,
@@ -30,28 +30,28 @@ pub struct ClosePosition<'info> {
         constraint = position.market == market.key(),
         constraint = position.status == PositionStatus::Open @ PerpsError::PositionAlreadyClosed
     )]
-    pub position: Account<'info, Position>,
+    pub position: Box<Account<'info, Position>>,
 
     #[account(
         mut,
         seeds = [b"vault", market.key().as_ref()],
         bump = vault.bump
     )]
-    pub vault: Account<'info, Vault>,
+    pub vault: Box<Account<'info, Vault>>,
 
     #[account(
         mut,
         seeds = [b"vault_token", market.key().as_ref()],
         bump
     )]
-    pub vault_token_account: Account<'info, TokenAccount>,
+    pub vault_token_account: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
         constraint = user_token_account.owner == owner.key(),
         constraint = user_token_account.mint == market.collateral_mint
     )]
-    pub user_token_account: Account<'info, TokenAccount>,
+    pub user_token_account: Box<Account<'info, TokenAccount>>,
 
     /// CHECK: Pyth price feed, validated below
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
@@ -65,19 +65,19 @@ pub struct ClosePosition<'info> {
         seeds = [b"user_referral", owner.key().as_ref()],
         bump = user_referral.bump,
     )]
-    pub user_referral: Option<Account<'info, UserReferral>>,
+    pub user_referral: Option<Box<Account<'info, UserReferral>>>,
 
     #[account(
         mut,
         seeds = [b"referral_code", referral_code.code.as_ref()],
         bump = referral_code.bump,
     )]
-    pub referral_code: Option<Account<'info, ReferralCode>>,
+    pub referral_code: Option<Box<Account<'info, ReferralCode>>>,
 
     /// The referrer's token account; the reward is paid here at close.
     /// Validated in the handler (owner = referral code owner, market's mint).
     #[account(mut)]
-    pub referrer_token_account: Option<Account<'info, TokenAccount>>,
+    pub referrer_token_account: Option<Box<Account<'info, TokenAccount>>>,
 }
 
 pub fn handler(ctx: Context<ClosePosition>) -> Result<()> {

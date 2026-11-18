@@ -17,14 +17,14 @@ pub struct Liquidate<'info> {
         seeds = [b"user", position_owner.key().as_ref(), market.key().as_ref()],
         bump = user_account.bump
     )]
-    pub user_account: Account<'info, UserAccount>,
+    pub user_account: Box<Account<'info, UserAccount>>,
 
     #[account(
         mut,
         seeds = [b"market", market.collateral_mint.as_ref(), market.commodity_seed()],
         bump = market.bump
     )]
-    pub market: Account<'info, Market>,
+    pub market: Box<Account<'info, Market>>,
 
     #[account(
         mut,
@@ -32,28 +32,28 @@ pub struct Liquidate<'info> {
         constraint = position.market == market.key(),
         constraint = position.status == PositionStatus::Open @ PerpsError::PositionAlreadyClosed
     )]
-    pub position: Account<'info, Position>,
+    pub position: Box<Account<'info, Position>>,
 
     #[account(
         mut,
         seeds = [b"vault", market.key().as_ref()],
         bump = vault.bump
     )]
-    pub vault: Account<'info, Vault>,
+    pub vault: Box<Account<'info, Vault>>,
 
     #[account(
         mut,
         seeds = [b"vault_token", market.key().as_ref()],
         bump
     )]
-    pub vault_token_account: Account<'info, TokenAccount>,
+    pub vault_token_account: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
         constraint = liquidator_token_account.owner == liquidator.key(),
         constraint = liquidator_token_account.mint == market.collateral_mint
     )]
-    pub liquidator_token_account: Account<'info, TokenAccount>,
+    pub liquidator_token_account: Box<Account<'info, TokenAccount>>,
 
     /// CHECK: Pyth price feed
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
