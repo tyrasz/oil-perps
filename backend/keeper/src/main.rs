@@ -9,6 +9,8 @@ use tracing::{info, error};
 
 mod funding;
 mod liquidator;
+#[allow(dead_code)] // shared verbatim with perps-core; not every helper is used here
+mod session;
 
 // Program configuration
 pub struct KeeperConfig {

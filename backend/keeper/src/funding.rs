@@ -61,6 +61,11 @@ async fn check_and_update_funding(
         return Ok(false);
     }
 
+    if market_data.is_settled() || !market_data.is_in_session(crate::liquidator::unix_now()) {
+        debug!("Market is settled or outside trading hours, skipping funding update");
+        return Ok(false);
+    }
+
     // Check if enough time has passed since last funding update
     let current_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?

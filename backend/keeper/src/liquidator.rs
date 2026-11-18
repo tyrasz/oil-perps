@@ -1,3 +1,4 @@
+use crate::session;
 use crate::{KeeperConfig, get_market_pda, get_vault_pda, get_vault_token_pda, get_user_account_pda};
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_client::rpc_client::RpcClient;
@@ -59,6 +60,39 @@ pub struct MarketData {
     pub total_trades: u64,
     pub bump: u8,
     pub is_paused: bool,
+    pub session_schedule: u8,
+    pub pre_close_window_secs: u32,
+    pub weekend_initial_margin_ratio: u32,
+    pub weekend_maintenance_margin_ratio: u32,
+    pub max_confidence_bps: u32,
+    pub min_oracle_price: u64,
+    pub settlement_price: u64,
+}
+
+impl MarketData {
+    pub fn is_settled(&self) -> bool {
+        self.settlement_price > 0
+    }
+
+    pub fn is_in_session(&self, now: i64) -> bool {
+        session::is_open(self.session_schedule, now)
+    }
+
+    /// Maintenance margin the program applies at `now` (mirrors Market::margin_ratios).
+    pub fn maintenance_margin_ratio_at(&self, now: i64) -> u32 {
+        if session::in_pre_close_window(self.session_schedule, now, self.pre_close_window_secs) {
+            self.maintenance_margin_ratio.max(self.weekend_maintenance_margin_ratio)
+        } else {
+            self.maintenance_margin_ratio
+        }
+    }
+}
+
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Anchor's 8-byte discriminator: the first 8 bytes of sha256("<namespace>:<name>").
@@ -116,6 +150,17 @@ async fn check_and_liquidate(
         return Ok(0);
     }
 
+    let now = unix_now();
+    if market_data.is_settled() {
+        debug!("Market is settled, no liquidations");
+        return Ok(0);
+    }
+    if !market_data.is_in_session(now) {
+        debug!("Market is outside trading hours, skipping liquidation check");
+        return Ok(0);
+    }
+    let maintenance_margin_ratio = market_data.maintenance_margin_ratio_at(now);
+
     // Fetch oracle price
     let oracle_price = fetch_oracle_price(client, &market_data.pyth_price_feed)?;
     debug!("Current oracle price: ${:.2}", oracle_price as f64 / 1_000_000.0);
@@ -130,12 +175,12 @@ async fn check_and_liquidate(
         // Check if position is liquidatable
         let margin_ratio = calculate_margin_ratio(&position, oracle_price, market_data.funding_rate);
 
-        if margin_ratio < market_data.maintenance_margin_ratio {
+        if margin_ratio < maintenance_margin_ratio {
             info!(
                 "Found liquidatable position: {} (margin: {}%, required: {}%)",
                 position_address,
                 margin_ratio as f64 / 100.0,
-                market_data.maintenance_margin_ratio as f64 / 100.0
+                maintenance_margin_ratio as f64 / 100.0
             );
 
             match execute_liquidation(client, config, &market_pda, &market_data, &position_address, &position).await {
@@ -354,7 +399,14 @@ mod tests {
         }
         bytes.push(254); // bump
         bytes.push(1); // is_paused
-        bytes.extend_from_slice(&[0u8; 56]); // padding
+        bytes.push(1); // session_schedule
+        for v in [7_200u32, 2_000, 1_000, 150] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&5_000_000u64.to_le_bytes()); // min_oracle_price
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // settlement_price
+        bytes.extend_from_slice(&[0u8; 23]); // padding
+        assert_eq!(8 + bytes.len(), 298); // Market::LEN
 
         let m = MarketData::deserialize(&mut bytes.as_slice()).unwrap();
         assert_eq!(m.vault, Pubkey::new_from_array([3; 32]));
@@ -364,6 +416,35 @@ mod tests {
         assert_eq!((m.last_funding_time, m.funding_interval), (1_700_000_000, 3_600));
         assert_eq!(m.insurance_fund, 44);
         assert_eq!((m.bump, m.is_paused), (254, true));
+        assert_eq!(m.session_schedule, 1);
+        assert_eq!((m.weekend_initial_margin_ratio, m.weekend_maintenance_margin_ratio), (2_000, 1_000));
+        assert_eq!((m.max_confidence_bps, m.min_oracle_price, m.settlement_price), (150, 5_000_000, 0));
+    }
+
+    #[test]
+    fn markets_created_before_risk_fields_decode_as_defaults() {
+        // A market created before the risk fields existed has zeros there.
+        let mut bytes = vec![0u8; 298 - 8];
+        bytes[4 * 32 + 8..4 * 32 + 12].copy_from_slice(&20_000u32.to_le_bytes());
+        let m = MarketData::deserialize(&mut bytes.as_slice()).unwrap();
+        assert_eq!(m.max_leverage, 20_000);
+        assert_eq!((m.session_schedule, m.settlement_price), (0, 0));
+        assert!(m.is_in_session(1_794_607_200)); // always open
+    }
+
+    #[test]
+    fn keeper_uses_weekend_maintenance_margin_before_close() {
+        let m = MarketData {
+            maintenance_margin_ratio: 500,
+            session_schedule: session::SCHEDULE_CME_GLOBEX,
+            pre_close_window_secs: 7_200,
+            weekend_maintenance_margin_ratio: 1_000,
+            ..Default::default()
+        };
+        let friday_close = 1_794_607_200; // 2026-11-13 17:00 ET
+        assert_eq!(m.maintenance_margin_ratio_at(friday_close - 7_201), 500);
+        assert_eq!(m.maintenance_margin_ratio_at(friday_close - 60), 1_000);
+        assert!(!m.is_in_session(friday_close));
     }
 
     #[test]
