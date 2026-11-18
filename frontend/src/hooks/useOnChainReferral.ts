@@ -2,7 +2,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { usePerpsProgram } from './usePerpsProgram';
 import { getReferralCodePDA, getUserReferralPDA, codeToBytes, bytesToCode } from '../utils/pda';
 import { USDC_MINT, PRICE_DECIMALS } from '../config/program';
-import { getMarketPDA, getVaultPDA, getVaultTokenAccountPDA } from '../utils/pda';
+import { getCommodityMarket, getVaultPDA, getVaultTokenAccountPDA } from '../utils/pda';
+import { useMarketStore } from '../stores/marketStore';
 
 // On-chain referral code data
 interface OnChainReferralCode {
@@ -60,6 +61,8 @@ interface UserReferralAccount {
 
 export function useOnChainReferral() {
   const { program, publicKey, connected } = usePerpsProgram();
+  // Rewards are claimed from one market at a time; each pays what it holds
+  const selectedCommodity = useMarketStore((s) => s.selectedCommodity);
   const [myReferralCode, setMyReferralCode] = useState<OnChainReferralCode | null>(null);
   const [userReferral, setUserReferral] = useState<OnChainUserReferral | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -241,7 +244,7 @@ export function useOnChainReferral() {
       setError(null);
 
       const [referralCodePda] = getReferralCodePDA(myReferralCode.code);
-      const [marketPda] = getMarketPDA(USDC_MINT);
+      const marketPda = getCommodityMarket(selectedCommodity.id);
       const [vaultPda] = getVaultPDA(marketPda);
       const [vaultTokenPda] = getVaultTokenAccountPDA(marketPda);
 
@@ -272,7 +275,7 @@ export function useOnChainReferral() {
     } finally {
       setIsLoading(false);
     }
-  }, [program, publicKey, myReferralCode, refresh]);
+  }, [program, publicKey, myReferralCode, refresh, selectedCommodity.id]);
 
   // Check if a code exists
   const checkCodeExists = useCallback(async (code: string): Promise<boolean> => {

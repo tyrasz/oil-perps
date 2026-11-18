@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useConnection } from '@solana/wallet-adapter-react';
 import { PublicKey, SystemProgram } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddress } from '@solana/spl-token';
@@ -6,7 +6,7 @@ import { BN } from '@project-serum/anchor';
 import { usePerpsProgram } from './usePerpsProgram';
 import {
   getUserAccountPDA,
-  getMarketPDA,
+  getCommodityMarket,
   getVaultPDA,
   getVaultTokenAccountPDA,
   getPositionPDA,
@@ -30,6 +30,8 @@ export function useTrading() {
   const { connection } = useConnection();
   const { program, publicKey, connected } = usePerpsProgram();
   const { selectedCommodity } = useMarketStore();
+  // Deposits, withdrawals and new positions go to the selected commodity's market
+  const marketPda = useMemo(() => getCommodityMarket(selectedCommodity.id), [selectedCommodity.id]);
 
   const [state, setState] = useState<TradingState>({
     isLoading: false,
@@ -43,10 +45,10 @@ export function useTrading() {
   const checkUserAccountExists = useCallback(async (): Promise<boolean> => {
     if (!publicKey || !connection) return false;
 
-    const [userAccountPda] = getUserAccountPDA(publicKey);
+    const [userAccountPda] = getUserAccountPDA(publicKey, marketPda);
     const accountInfo = await connection.getAccountInfo(userAccountPda);
     return accountInfo !== null;
-  }, [publicKey, connection]);
+  }, [publicKey, connection, marketPda]);
 
   /**
    * Check if market exists on-chain
@@ -54,10 +56,9 @@ export function useTrading() {
   const checkMarketExists = useCallback(async (): Promise<boolean> => {
     if (!connection) return false;
 
-    const [marketPda] = getMarketPDA(USDC_MINT);
     const accountInfo = await connection.getAccountInfo(marketPda);
     return accountInfo !== null;
-  }, [connection]);
+  }, [connection, marketPda]);
 
   /**
    * Initialize user account if it doesn't exist
@@ -74,19 +75,20 @@ export function useTrading() {
     }
 
     console.log('Creating user account...');
-    const [userAccountPda] = getUserAccountPDA(publicKey);
+    const [userAccountPda] = getUserAccountPDA(publicKey, marketPda);
 
     await program.methods
       .initializeUser()
       .accounts({
         owner: publicKey,
+        market: marketPda,
         userAccount: userAccountPda,
         systemProgram: SystemProgram.programId,
       })
       .rpc();
 
     console.log('User account created');
-  }, [program, publicKey, checkUserAccountExists]);
+  }, [program, publicKey, marketPda, checkUserAccountExists]);
 
   /**
    * Deposit collateral (USDC) to user account
@@ -102,8 +104,7 @@ export function useTrading() {
       try {
         await initializeUserIfNeeded();
 
-        const [userAccountPda] = getUserAccountPDA(publicKey);
-        const [marketPda] = getMarketPDA(USDC_MINT);
+        const [userAccountPda] = getUserAccountPDA(publicKey, marketPda);
         const [vaultPda] = getVaultPDA(marketPda);
         const [vaultTokenAccountPda] = getVaultTokenAccountPDA(marketPda);
 
@@ -147,7 +148,7 @@ export function useTrading() {
         throw new Error(errorMessage);
       }
     },
-    [program, publicKey, initializeUserIfNeeded]
+    [program, publicKey, marketPda, initializeUserIfNeeded]
   );
 
   /**
@@ -162,8 +163,7 @@ export function useTrading() {
       setState(prev => ({ ...prev, isLoading: true, error: null }));
 
       try {
-        const [userAccountPda] = getUserAccountPDA(publicKey);
-        const [marketPda] = getMarketPDA(USDC_MINT);
+        const [userAccountPda] = getUserAccountPDA(publicKey, marketPda);
         const [vaultPda] = getVaultPDA(marketPda);
         const [vaultTokenAccountPda] = getVaultTokenAccountPDA(marketPda);
 
@@ -207,7 +207,7 @@ export function useTrading() {
         throw new Error(errorMessage);
       }
     },
-    [program, publicKey]
+    [program, publicKey, marketPda]
   );
 
   /**
@@ -230,8 +230,7 @@ export function useTrading() {
         await initializeUserIfNeeded();
 
         // Get PDAs
-        const [userAccountPda] = getUserAccountPDA(publicKey);
-        const [marketPda] = getMarketPDA(USDC_MINT);
+        const [userAccountPda] = getUserAccountPDA(publicKey, marketPda);
 
         // Fetch market to get total_positions for position PDA
         const marketAccount = await program.account.market.fetch(marketPda);
@@ -294,7 +293,7 @@ export function useTrading() {
         throw new Error(errorMessage);
       }
     },
-    [program, publicKey, selectedCommodity, initializeUserIfNeeded]
+    [program, publicKey, selectedCommodity, marketPda, initializeUserIfNeeded]
   );
 
   /**
@@ -318,7 +317,7 @@ export function useTrading() {
         // Fetch market for pyth feed and collateral mint
         const marketAccount = await program.account.market.fetch(marketPda);
 
-        const [userAccountPda] = getUserAccountPDA(publicKey);
+        const [userAccountPda] = getUserAccountPDA(publicKey, marketPda);
         const [vaultPda] = getVaultPDA(marketPda);
         const [vaultTokenAccountPda] = getVaultTokenAccountPDA(marketPda);
 

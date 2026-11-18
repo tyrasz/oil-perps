@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { PublicKey } from '@solana/web3.js';
 import { usePerpsProgram } from './usePerpsProgram';
-import { getUserAccountPDA } from '../utils/pda';
+import { commodityForMarket, getCommodityMarket, getUserAccountPDA } from '../utils/pda';
 import { PRICE_DECIMALS, LEVERAGE_DECIMALS } from '../config/program';
 import { useMarketStore } from '../stores/marketStore';
 import type { Position, ClosedPosition, UserAccount } from '../types';
@@ -54,7 +54,8 @@ export function useOnChainPositions() {
     if (!program || !publicKey) return null;
 
     try {
-      const [userAccountPda] = getUserAccountPDA(publicKey);
+      // Account (free collateral) for the selected commodity's market
+      const [userAccountPda] = getUserAccountPDA(publicKey, getCommodityMarket(selectedCommodity.id));
       const account = await program.account.userAccount.fetch(userAccountPda) as unknown as OnChainUserAccount;
 
       return {
@@ -68,7 +69,7 @@ export function useOnChainPositions() {
       console.log('User account not found (not created yet)');
       return null;
     }
-  }, [program, publicKey]);
+  }, [program, publicKey, selectedCommodity.id]);
 
   /**
    * Fetch all positions for the connected wallet using getProgramAccounts
@@ -104,9 +105,7 @@ export function useOnChainPositions() {
           const entryPrice = acc.account.entryPrice.toNumber() / Math.pow(10, PRICE_DECIMALS);
           const leverage = acc.account.leverage / Math.pow(10, LEVERAGE_DECIMALS);
 
-          // TODO: Map market address to commodity properly
-          // For now, use selected commodity's current price
-          const commodity = selectedCommodity.id;
+          const commodity = commodityForMarket(acc.account.market) ?? selectedCommodity.id;
           const currentMarket = markets[commodity];
           const currentPrice = currentMarket?.price || entryPrice;
 
@@ -198,7 +197,7 @@ export function useOnChainPositions() {
           return {
             address: acc.publicKey.toString(),
             owner: acc.account.owner.toString(),
-            commodity: selectedCommodity.id,
+            commodity: commodityForMarket(acc.account.market) ?? selectedCommodity.id,
             side: isLong ? 'long' : 'short',
             size,
             collateral,

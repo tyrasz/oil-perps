@@ -1,26 +1,41 @@
 import { PublicKey } from '@solana/web3.js';
-import { PERPS_CORE_PROGRAM_ID } from '../config/program';
+import { PERPS_CORE_PROGRAM_ID, USDC_MINT } from '../config/program';
+import { COMMODITIES } from '../config/commodities';
 
 /**
- * Derive User Account PDA
- * Seeds: ["user", owner_pubkey]
+ * Derive User Account PDA. User accounts are per market: collateral deposited
+ * in one market can only be used and withdrawn there.
+ * Seeds: ["user", owner_pubkey, market_pubkey]
  */
-export function getUserAccountPDA(owner: PublicKey): [PublicKey, number] {
+export function getUserAccountPDA(owner: PublicKey, market: PublicKey): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
-    [Buffer.from('user'), owner.toBuffer()],
+    [Buffer.from('user'), owner.toBuffer(), market.toBuffer()],
     PERPS_CORE_PROGRAM_ID
   );
 }
 
 /**
- * Derive Market PDA
- * Seeds: ["market", collateral_mint_pubkey]
+ * Derive Market PDA: one market per collateral mint and commodity.
+ * Seeds: ["market", collateral_mint_pubkey, commodity] (e.g. "OIL", unpadded)
  */
-export function getMarketPDA(collateralMint: PublicKey): [PublicKey, number] {
+export function getMarketPDA(collateralMint: PublicKey, commodity: string): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
-    [Buffer.from('market'), collateralMint.toBuffer()],
+    [Buffer.from('market'), collateralMint.toBuffer(), Buffer.from(commodity)],
     PERPS_CORE_PROGRAM_ID
   );
+}
+
+/** Market address for a commodity (USDC collateral). */
+export function getCommodityMarket(commodity: string): PublicKey {
+  return getMarketPDA(USDC_MINT, commodity)[0];
+}
+
+let marketToCommodity: Map<string, string> | null = null;
+
+/** Commodity id ("OIL", ...) for a market address, or undefined if unknown. */
+export function commodityForMarket(market: PublicKey | string): string | undefined {
+  marketToCommodity ??= new Map(COMMODITIES.map((c) => [getCommodityMarket(c.id).toBase58(), c.id]));
+  return marketToCommodity.get(typeof market === 'string' ? market : market.toBase58());
 }
 
 /**

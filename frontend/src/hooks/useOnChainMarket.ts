@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { usePerpsProgram } from './usePerpsProgram';
-import { getMarketPDA } from '../utils/pda';
-import { USDC_MINT, PRICE_DECIMALS } from '../config/program';
+import { getCommodityMarket } from '../utils/pda';
+import { useMarketStore } from '../stores/marketStore';
+import { PRICE_DECIMALS } from '../config/program';
 
 interface OnChainMarketData {
   address: string;
@@ -66,6 +67,7 @@ interface OnChainMarket {
 
 export function useOnChainMarket() {
   const { program } = usePerpsProgram();
+  const selectedCommodity = useMarketStore((s) => s.selectedCommodity);
   const [marketData, setMarketData] = useState<OnChainMarketData | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -80,7 +82,7 @@ export function useOnChainMarket() {
     setError(null);
 
     try {
-      const [marketPda] = getMarketPDA(USDC_MINT);
+      const marketPda = getCommodityMarket(selectedCommodity.id);
       const market = await program.account.market.fetch(marketPda) as unknown as OnChainMarket;
 
       const lastFundingTime = market.lastFundingTime.toNumber();
@@ -126,7 +128,7 @@ export function useOnChainMarket() {
     } finally {
       setIsLoading(false);
     }
-  }, [program]);
+  }, [program, selectedCommodity.id]);
 
   useEffect(() => {
     fetchMarket();
