@@ -7,6 +7,15 @@ import * as path from 'path';
 
 // Program ID
 const PERPS_CORE_PROGRAM_ID = new PublicKey('Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS');
+const BPF_LOADER_UPGRADEABLE = new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111');
+
+function getConfigPDA(): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync([Buffer.from('config')], PERPS_CORE_PROGRAM_ID);
+}
+
+function getProgramDataPDA(): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync([PERPS_CORE_PROGRAM_ID.toBuffer()], BPF_LOADER_UPGRADEABLE);
+}
 
 // USDC Mint (Testnet)
 const USDC_MINT = new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU');
@@ -176,6 +185,7 @@ async function initializeMarket(
     .initializeMarket(params)
     .accounts({
       authority: authority.publicKey,
+      config: getConfigPDA()[0],
       market: marketPda,
       vault: vaultPda,
       vaultTokenAccount: vaultTokenAccountPda,
@@ -218,12 +228,66 @@ async function applyRiskConfig(
 
   const tx = await program.methods
     .updateMarketConfig(params)
-    .accounts({ authority: authority.publicKey, market: marketPda })
+    .accounts({ authority: authority.publicKey, config: getConfigPDA()[0], market: marketPda })
     .signers([authority])
     .rpc();
 
   console.log(`Risk config applied! Transaction: ${tx}`);
   return tx;
+}
+
+/**
+ * One-time protocol setup. Must be signed by the program's upgrade authority,
+ * which becomes the admin (hand over later with propose_admin/accept_admin).
+ * The guardian (pause-only) comes from GUARDIAN; the Pyth program from
+ * PYTH_PROGRAM_ID, or else the owner of this commodity's price feed account.
+ */
+async function ensureProtocolConfig(
+  program: Program,
+  connection: Connection,
+  authority: Keypair,
+  commodity: string
+): Promise<void> {
+  const [configPda] = getConfigPDA();
+  const existing = await connection.getAccountInfo(configPda);
+  if (existing && existing.owner.equals(PERPS_CORE_PROGRAM_ID)) {
+    const config = (await program.account.protocolConfig.fetch(configPda)) as {
+      admin: PublicKey; guardian: PublicKey; oracleProgram: PublicKey;
+    };
+    console.log(`Protocol config: admin ${config.admin}, guardian ${config.guardian}, oracle program ${config.oracleProgram}`);
+    if (!config.admin.equals(authority.publicKey)) {
+      throw new Error(`This wallet (${authority.publicKey}) is not the protocol admin (${config.admin})`);
+    }
+    return;
+  }
+
+  let oracleProgram: PublicKey;
+  if (process.env.PYTH_PROGRAM_ID) {
+    oracleProgram = new PublicKey(process.env.PYTH_PROGRAM_ID);
+  } else {
+    const feed = await connection.getAccountInfo(PYTH_PRICE_FEEDS[commodity]);
+    if (!feed) throw new Error(`Price feed for ${commodity} not found; set PYTH_PROGRAM_ID`);
+    oracleProgram = feed.owner;
+  }
+  let guardian = authority.publicKey;
+  if (process.env.GUARDIAN) {
+    guardian = new PublicKey(process.env.GUARDIAN);
+  } else {
+    console.warn('GUARDIAN not set: using the admin as guardian. Set a separate pause key later with update_roles.');
+  }
+
+  console.log(`Creating protocol config: admin ${authority.publicKey}, guardian ${guardian}, oracle program ${oracleProgram}`);
+  const tx = await program.methods
+    .initializeConfig({ guardian, oracleProgram })
+    .accounts({
+      upgradeAuthority: authority.publicKey,
+      config: configPda,
+      programData: getProgramDataPDA()[0],
+      systemProgram: anchor.web3.SystemProgram.programId,
+    })
+    .signers([authority])
+    .rpc();
+  console.log(`Protocol config created: ${tx}`);
 }
 
 async function checkMarketExists(connection: Connection, commodity: string): Promise<boolean> {
@@ -277,6 +341,15 @@ async function main() {
 
   const idl = JSON.parse(fs.readFileSync(idlPath, 'utf-8'));
   const program = new Program(idl, PERPS_CORE_PROGRAM_ID, provider);
+
+  // Only the upgrade authority can create the config, and only the admin can
+  // create markets: do this right after deploying.
+  try {
+    await ensureProtocolConfig(program, connection, authority, commodity);
+  } catch (error) {
+    console.error('Protocol config setup failed (is this wallet the upgrade authority / admin?):', error);
+    process.exit(1);
+  }
 
   // Initialize the market if needed, then (re)apply its risk controls, so
   // markets created before those existed pick them up too.

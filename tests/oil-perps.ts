@@ -28,6 +28,7 @@ describe("oil-perps", () => {
   let user2: Keypair;
   let collateralMint: PublicKey;
   let pythPriceFeed: Keypair;
+  const [configPda] = PublicKey.findProgramAddressSync([Buffer.from("config")], program.programId);
 
   // PDAs
   let marketPda: PublicKey;
@@ -154,6 +155,33 @@ describe("oil-perps", () => {
       authority,
       mintAmount
     );
+
+    // Protocol roles: the provider wallet deployed the program, so it is the
+    // upgrade authority and creates the config (becoming admin), then hands
+    // the admin role to `authority`, which creates the markets below.
+    // The test price feed account doesn't exist, so its owner is the system program.
+    const [programData] = PublicKey.findProgramAddressSync(
+      [program.programId.toBuffer()],
+      new PublicKey("BPFLoaderUpgradeab1e11111111111111111111111")
+    );
+    await program.methods
+      .initializeConfig({ guardian: provider.wallet.publicKey, oracleProgram: SystemProgram.programId })
+      .accounts({
+        upgradeAuthority: provider.wallet.publicKey,
+        config: configPda,
+        programData,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+    await program.methods
+      .proposeAdmin(authority.publicKey)
+      .accounts({ admin: provider.wallet.publicKey, config: configPda })
+      .rpc();
+    await program.methods
+      .acceptAdmin()
+      .accounts({ newAdmin: authority.publicKey, config: configPda })
+      .signers([authority])
+      .rpc();
   });
 
   describe("initialize_market", () => {
@@ -162,6 +190,7 @@ describe("oil-perps", () => {
         .initializeMarket(marketParams)
         .accounts({
           authority: authority.publicKey,
+          config: configPda,
           market: marketPda,
           vault: vaultPda,
           vaultTokenAccount: vaultTokenPda,
@@ -213,6 +242,7 @@ describe("oil-perps", () => {
         .initializeMarket(goldMarketParams)
         .accounts({
           authority: authority.publicKey,
+          config: configPda,
           market: goldMarketPda,
           vault: goldVaultPda,
           vaultTokenAccount: goldVaultTokenPda,
@@ -261,6 +291,7 @@ describe("oil-perps", () => {
           .initializeMarket(invalidParams)
           .accounts({
             authority: authority.publicKey,
+            config: configPda,
             market: newMarketPda,
             vault: newVaultPda,
             vaultTokenAccount: newVaultTokenPda,
@@ -312,6 +343,7 @@ describe("oil-perps", () => {
           .initializeMarket(invalidParams)
           .accounts({
             authority: authority.publicKey,
+            config: configPda,
             market: newMarketPda,
             vault: newVaultPda,
             vaultTokenAccount: newVaultTokenPda,
