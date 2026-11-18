@@ -6,6 +6,8 @@ import { usePositions } from '../hooks/usePositions';
 import { useOnChainMarket } from '../hooks/useOnChainMarket';
 import type { OrderSide } from '../types';
 import { estimateLiquidationPrice, maxAllowedLeverage } from '../utils/leverage';
+import { useMarketSession } from '../hooks/useMarketSession';
+import { SessionNotice } from './SessionNotice';
 
 // Maximum position size in USD value (per position)
 const MAX_POSITION_VALUE = 100_000; // $100k max per position
@@ -31,6 +33,9 @@ export function OrderEntry() {
   } = useTrading();
   const { userAccount } = usePositions();
   const { marketData: onChainMarket } = useOnChainMarket();
+  const session = useMarketSession(onChainMarket);
+  const preClose = session.state === 'pre-close';
+  const canOpen = session.state === 'open' || preClose;
 
   const market = markets[selectedCommodity.id];
   const availableCollateral = userAccount?.collateralBalance ?? 0;
@@ -49,7 +54,7 @@ export function OrderEntry() {
   }, [connected, checkMarketExists]);
 
   // Leverage options, capped by the commodity limit and the on-chain margin rules
-  const maxLev = maxAllowedLeverage(selectedCommodity.maxLeverage, onChainMarket);
+  const maxLev = maxAllowedLeverage(selectedCommodity.maxLeverage, onChainMarket, preClose);
   const leverageOptions = [1, 2, 5, 10, 15, 20].filter(lev => lev <= maxLev);
 
   const calculateMargin = useCallback(() => {
@@ -86,7 +91,16 @@ export function OrderEntry() {
   const margin = calculateMargin();
   const insufficientMargin = margin > 0 && margin > availableCollateral;
   const liquidationPrice = market
-    ? estimateLiquidationPrice(market.price, selectedLeverage, side, onChainMarket?.maintenanceMarginRatio)
+    ? estimateLiquidationPrice(
+        market.price,
+        selectedLeverage,
+        side,
+        !onChainMarket
+          ? undefined
+          : preClose
+          ? Math.max(onChainMarket.maintenanceMarginRatio, onChainMarket.weekendMaintenanceMarginRatio)
+          : onChainMarket.maintenanceMarginRatio
+      )
     : 0;
 
   // Position size validation
@@ -240,6 +254,13 @@ export function OrderEntry() {
         </div>
       </div>
 
+      <SessionNotice
+        session={session}
+        maxLeverage={maxLev}
+        weekendMaintenanceMarginRatio={onChainMarket?.weekendMaintenanceMarginRatio}
+        settlementPrice={onChainMarket?.settlementPrice}
+      />
+
       {/* Market not initialized warning */}
       {connected && marketExists === false && (
         <div className="error-message">
@@ -285,10 +306,14 @@ export function OrderEntry() {
       <button
         className={`submit-btn ${side}`}
         onClick={handleSubmit}
-        disabled={!connected || !size || isTradingLoading || insufficientMargin || marketExists === false || !sizeValidation.valid}
+        disabled={!connected || !size || isTradingLoading || insufficientMargin || marketExists === false || !sizeValidation.valid || !canOpen}
       >
         {!connected
           ? 'Connect Wallet'
+          : session.state === 'closed'
+          ? 'Market Closed'
+          : session.state === 'settled'
+          ? 'Market Settled'
           : marketExists === false
           ? 'Market Not Initialized'
           : isTradingLoading

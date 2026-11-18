@@ -33,11 +33,11 @@ const MARKET_CONFIGS: Record<string, {
 }> = {
   OIL: {
     maxLeverage: 20000, // 20x (3 decimals)
-    maintenanceMarginRatio: 500, // 0.5% (3 decimals)
-    initialMarginRatio: 1000, // 1% (3 decimals)
-    takerFee: 50, // 0.05% (3 decimals)
-    makerFee: 20, // 0.02% (3 decimals)
-    liquidationFee: 100, // 0.1% (3 decimals)
+    maintenanceMarginRatio: 500, // 5% (basis points)
+    initialMarginRatio: 1000, // 10% (basis points) -> 10x effective max leverage
+    takerFee: 50, // 0.5% (basis points)
+    makerFee: 20, // 0.2% (basis points)
+    liquidationFee: 100, // 1% of maintenance margin (basis points)
     maxOpenInterest: 10_000_000_000_000, // 10M USDC (6 decimals)
     fundingInterval: 3600, // 1 hour
   },
@@ -81,6 +81,27 @@ const MARKET_CONFIGS: Record<string, {
     maxOpenInterest: 5_000_000_000_000,
     fundingInterval: 3600,
   },
+};
+
+// Risk controls applied with update_market_config (see programs/perps-core/src/state/market.rs).
+// Margin ratios are basis points (1000 = 10%); prices are 6 decimals.
+const SCHEDULE_CME_GLOBEX = 1; // Sun 18:00 - Fri 17:00 ET, daily break 17:00-18:00 ET
+const PRE_CLOSE_WINDOW_SECS = 2 * 3600; // weekend margins apply 2h before Friday's close
+const MAX_CONFIDENCE_BPS = 100; // reject oracle prices with confidence wider than 1%
+
+const RISK_CONFIGS: Record<string, {
+  weekendInitialMarginRatio: number;
+  weekendMaintenanceMarginRatio: number;
+  minOraclePrice: number;
+}> = {
+  // Weekend margins are double the normal ones. The price floor (~10% of a
+  // typical price) halts trading for review before prices approach zero, as
+  // WTI did in April 2020; the authority can then settle the market.
+  OIL: { weekendInitialMarginRatio: 2000, weekendMaintenanceMarginRatio: 1000, minOraclePrice: 7_500_000 },
+  GOLD: { weekendInitialMarginRatio: 2000, weekendMaintenanceMarginRatio: 1000, minOraclePrice: 200_000_000 },
+  SILVER: { weekendInitialMarginRatio: 2400, weekendMaintenanceMarginRatio: 1200, minOraclePrice: 2_400_000 },
+  NATGAS: { weekendInitialMarginRatio: 3000, weekendMaintenanceMarginRatio: 1600, minOraclePrice: 250_000 },
+  COPPER: { weekendInitialMarginRatio: 2400, weekendMaintenanceMarginRatio: 1200, minOraclePrice: 420_000 },
 };
 
 // PDA derivation functions
@@ -170,6 +191,38 @@ async function initializeMarket(
   return tx;
 }
 
+async function applyRiskConfig(
+  program: Program,
+  authority: Keypair,
+  commodity: string
+): Promise<string> {
+  const risk = RISK_CONFIGS[commodity];
+  if (!risk) {
+    throw new Error(`No risk config for commodity: ${commodity}`);
+  }
+  const [marketPda] = getMarketPDA(USDC_MINT);
+
+  const params = {
+    isPaused: false,
+    sessionSchedule: SCHEDULE_CME_GLOBEX,
+    preCloseWindowSecs: PRE_CLOSE_WINDOW_SECS,
+    weekendInitialMarginRatio: risk.weekendInitialMarginRatio,
+    weekendMaintenanceMarginRatio: risk.weekendMaintenanceMarginRatio,
+    maxConfidenceBps: MAX_CONFIDENCE_BPS,
+    minOraclePrice: new anchor.BN(risk.minOraclePrice),
+  };
+  console.log(`Applying risk config for ${commodity}:`, { ...params, minOraclePrice: risk.minOraclePrice });
+
+  const tx = await program.methods
+    .updateMarketConfig(params)
+    .accounts({ authority: authority.publicKey, market: marketPda })
+    .signers([authority])
+    .rpc();
+
+  console.log(`Risk config applied! Transaction: ${tx}`);
+  return tx;
+}
+
 async function checkMarketExists(connection: Connection): Promise<boolean> {
   const [marketPda] = getMarketPDA(USDC_MINT);
   const accountInfo = await connection.getAccountInfo(marketPda);
@@ -207,15 +260,6 @@ async function main() {
     process.exit(1);
   }
 
-  // Check if market already exists
-  const marketExists = await checkMarketExists(connection);
-  if (marketExists) {
-    console.log('Market already exists!');
-    const [marketPda] = getMarketPDA(USDC_MINT);
-    console.log(`Market address: ${marketPda.toString()}`);
-    process.exit(0);
-  }
-
   // Load IDL
   const idlPath = path.join(__dirname, '../target/idl/perps_core.json');
   if (!fs.existsSync(idlPath)) {
@@ -227,13 +271,22 @@ async function main() {
   const idl = JSON.parse(fs.readFileSync(idlPath, 'utf-8'));
   const program = new Program(idl, PERPS_CORE_PROGRAM_ID, provider);
 
-  // Initialize market
+  // Initialize the market if needed, then (re)apply its risk controls, so
+  // markets created before those existed pick them up too.
   try {
-    const signature = await initializeMarket(program, authority, commodity);
+    if (await checkMarketExists(connection)) {
+      const [marketPda] = getMarketPDA(USDC_MINT);
+      console.log(`Market already exists: ${marketPda.toString()}`);
+    } else {
+      const signature = await initializeMarket(program, authority, commodity);
+      console.log(`https://explorer.solana.com/tx/${signature}?cluster=testnet`);
+    }
+
+    const signature = await applyRiskConfig(program, authority, commodity);
     console.log(`\nSuccess! View transaction:`);
     console.log(`https://explorer.solana.com/tx/${signature}?cluster=testnet`);
   } catch (error) {
-    console.error('Failed to initialize market:', error);
+    console.error('Failed to set up market:', error);
     process.exit(1);
   }
 }

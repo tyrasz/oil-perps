@@ -16,6 +16,13 @@ describe('maxAllowedLeverage', () => {
     expect(maxAllowedLeverage(20, { maxLeverage: 5_000, initialMarginRatio: 500 })).toBe(5);
   });
 
+  it('uses the weekend initial margin before the weekly close', () => {
+    const market = { maxLeverage: 20_000, initialMarginRatio: 1_000, weekendInitialMarginRatio: 2_000 };
+    expect(maxAllowedLeverage(20, market)).toBe(10);
+    expect(maxAllowedLeverage(20, market, true)).toBe(5);
+    expect(maxAllowedLeverage(20, { ...market, weekendInitialMarginRatio: 0 }, true)).toBe(10);
+  });
+
   it('ignores unset on-chain values', () => {
     expect(maxAllowedLeverage(15, { maxLeverage: 0, initialMarginRatio: 0 })).toBe(15);
   });

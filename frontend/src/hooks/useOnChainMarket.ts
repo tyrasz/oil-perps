@@ -22,6 +22,14 @@ interface OnChainMarketData {
   makerFee: number;
   liquidationFee: number;
   insuranceFund: number;
+  // Risk controls (zero when unset, or with an IDL built before they existed)
+  sessionSchedule: number;
+  preCloseWindowSecs: number;
+  weekendInitialMarginRatio: number;
+  weekendMaintenanceMarginRatio: number;
+  maxConfidenceBps: number;
+  minOraclePrice: number;
+  settlementPrice: number;
 }
 
 interface OnChainMarket {
@@ -47,6 +55,13 @@ interface OnChainMarket {
   totalTrades: { toNumber: () => number };
   bump: number;
   isPaused: boolean;
+  sessionSchedule?: number;
+  preCloseWindowSecs?: number;
+  weekendInitialMarginRatio?: number;
+  weekendMaintenanceMarginRatio?: number;
+  maxConfidenceBps?: number;
+  minOraclePrice?: { toNumber: () => number };
+  settlementPrice?: { toNumber: () => number };
 }
 
 export function useOnChainMarket() {
@@ -95,6 +110,14 @@ export function useOnChainMarket() {
         makerFee: market.makerFee,
         liquidationFee: market.liquidationFee,
         insuranceFund: market.insuranceFund.toNumber() / Math.pow(10, PRICE_DECIMALS),
+        sessionSchedule: market.sessionSchedule ?? 0,
+        preCloseWindowSecs: market.preCloseWindowSecs ?? 0,
+        weekendInitialMarginRatio: market.weekendInitialMarginRatio ?? 0,
+        weekendMaintenanceMarginRatio: market.weekendMaintenanceMarginRatio ?? 0,
+        maxConfidenceBps: market.maxConfidenceBps ?? 0,
+        minOraclePrice: (market.minOraclePrice?.toNumber() ?? 0) / Math.pow(10, PRICE_DECIMALS),
+        // Kept in raw 6-decimal units; only compared against zero and displayed
+        settlementPrice: market.settlementPrice?.toNumber() ?? 0,
       });
     } catch (err) {
       console.error('Failed to fetch on-chain market:', err);

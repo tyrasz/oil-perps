@@ -8,20 +8,27 @@ interface MarketMarginParams {
   maxLeverage: number;
   /** On-chain initial margin ratio in basis points (10% = 1_000). */
   initialMarginRatio: number;
+  /** Initial margin before the weekly close, basis points; 0 = none. */
+  weekendInitialMarginRatio?: number;
 }
 
 /**
  * Highest leverage the program will accept: the lowest of the commodity's UI
- * limit, the market's max leverage, and 1 / initial margin ratio.
+ * limit, the market's max leverage, and 1 / initial margin ratio (the weekend
+ * initial margin when `preClose` is set).
  */
 export function maxAllowedLeverage(
   commodityMaxLeverage: number,
-  market?: MarketMarginParams | null
+  market?: MarketMarginParams | null,
+  preClose = false
 ): number {
   const limits = [commodityMaxLeverage];
   if (market) {
     if (market.maxLeverage > 0) limits.push(market.maxLeverage / 10 ** LEVERAGE_DECIMALS);
-    if (market.initialMarginRatio > 0) limits.push(BPS / market.initialMarginRatio);
+    const initial = preClose
+      ? Math.max(market.initialMarginRatio, market.weekendInitialMarginRatio ?? 0)
+      : market.initialMarginRatio;
+    if (initial > 0) limits.push(BPS / initial);
   }
   return Math.min(...limits);
 }

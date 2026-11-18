@@ -4,11 +4,12 @@ import { useMarketStore } from '../stores/marketStore';
 import { useTrading } from '../hooks/useTrading';
 import { useTriggerOrderStore } from '../stores/triggerOrderStore';
 import { TpSlManager } from './TpSlManager';
+import { useOnChainMarket } from '../hooks/useOnChainMarket';
+import { useMarketSession } from '../hooks/useMarketSession';
+import { WEEKEND_MARGIN_NOTICE_SECS } from '../utils/session';
 import type { Position } from '../types';
 
-// Liquidation thresholds
-const LIQUIDATION_THRESHOLD = 5; // Critical - will be liquidated soon
-const WARNING_THRESHOLD = 10; // Warning - getting close to liquidation
+const DEFAULT_MAINTENANCE_MARGIN_PCT = 5;
 
 export function PositionTable() {
   const { positions } = usePositions();
@@ -16,6 +17,23 @@ export function PositionTable() {
   const market = getCurrentMarket();
   const { closePosition, error, clearError, getExplorerUrl } = useTrading();
   const { getTriggerOrdersForPosition } = useTriggerOrderStore();
+  const { marketData: onChainMarket } = useOnChainMarket();
+  const session = useMarketSession(onChainMarket);
+
+  // Liquidation thresholds follow the maintenance margin in force, which rises
+  // shortly before the weekly close.
+  const maintenanceBps = onChainMarket
+    ? session.state === 'pre-close'
+      ? Math.max(onChainMarket.maintenanceMarginRatio, onChainMarket.weekendMaintenanceMarginRatio)
+      : onChainMarket.maintenanceMarginRatio
+    : 0;
+  const LIQUIDATION_THRESHOLD = maintenanceBps > 0 ? maintenanceBps / 100 : DEFAULT_MAINTENANCE_MARGIN_PCT;
+  // Within a day of weekend margins, warn about positions that will fall below them.
+  const until = session.secondsUntilWeekendMargins;
+  const weekendSoon = until != null && until <= WEEKEND_MARGIN_NOTICE_SECS;
+  const weekendPct = (onChainMarket?.weekendMaintenanceMarginRatio ?? 0) / 100;
+  const WARNING_THRESHOLD = Math.max(LIQUIDATION_THRESHOLD * 2, weekendSoon ? weekendPct : 0);
+  const closeBlocked = session.state === 'closed';
 
   const [closingPositionId, setClosingPositionId] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -27,7 +45,7 @@ export function PositionTable() {
     const critical = positions.filter(p => p.marginRatio < LIQUIDATION_THRESHOLD);
     const warning = positions.filter(p => p.marginRatio >= LIQUIDATION_THRESHOLD && p.marginRatio < WARNING_THRESHOLD);
     return { criticalPositions: critical, warningPositions: warning };
-  }, [positions]);
+  }, [positions, LIQUIDATION_THRESHOLD, WARNING_THRESHOLD]);
 
   const handleClosePosition = async (position: Position) => {
     setClosingPositionId(position.address);
@@ -152,7 +170,8 @@ export function PositionTable() {
                     <button
                       className="action-btn close-btn"
                       onClick={() => handleClosePosition(position)}
-                      disabled={closingPositionId === position.address}
+                      disabled={closingPositionId === position.address || closeBlocked}
+                      title={closeBlocked ? `Market closed. Trading resumes ${session.reopens}` : undefined}
                     >
                       {closingPositionId === position.address ? '...' : 'Close'}
                     </button>
