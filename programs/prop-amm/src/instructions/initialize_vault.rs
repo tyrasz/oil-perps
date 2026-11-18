@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
-use crate::state::LpVault;
+use crate::state::{LpVault, ProtocolConfig};
 use crate::errors::PropAmmError;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
@@ -17,8 +17,16 @@ pub struct InitializeVaultParams {
 
 #[derive(Accounts)]
 pub struct InitializeVault<'info> {
+    /// Must be the protocol admin; nobody else can create vaults.
     #[account(mut)]
     pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [ProtocolConfig::SEED],
+        bump = config.bump,
+        constraint = config.admin == authority.key() @ PropAmmError::Unauthorized
+    )]
+    pub config: Account<'info, ProtocolConfig>,
 
     #[account(
         init,
@@ -44,7 +52,8 @@ pub struct InitializeVault<'info> {
     /// CHECK: Market account from perps-core
     pub market: AccountInfo<'info>,
 
-    /// CHECK: Pyth price feed
+    /// CHECK: Pyth price feed; must be owned by the configured oracle program
+    #[account(constraint = *pyth_price_feed.owner == config.oracle_program @ PropAmmError::InvalidOracleAccount)]
     pub pyth_price_feed: AccountInfo<'info>,
 
     pub system_program: Program<'info, System>,

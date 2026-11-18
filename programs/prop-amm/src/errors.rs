@@ -49,4 +49,7 @@ pub enum PropAmmError {
 
     #[msg("Oracle confidence interval is too wide")]
     OracleConfidenceTooWide,
+
+    #[msg("Price feed is not owned by the configured oracle program")]
+    InvalidOracleAccount,
 }

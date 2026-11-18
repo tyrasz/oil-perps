@@ -17,7 +17,24 @@ declare_id!("PropAMM111111111111111111111111111111111111");
 pub mod prop_amm {
     use super::*;
 
-    /// Initialize a new LP vault for a market
+    /// One-time setup by the upgrade authority, who becomes the admin
+    pub fn initialize_config(ctx: Context<InitializeConfig>, oracle_program: Pubkey) -> Result<()> {
+        instructions::protocol_config::initialize_config(ctx, oracle_program)
+    }
+
+    pub fn propose_admin(ctx: Context<AdminOnly>, new_admin: Pubkey) -> Result<()> {
+        instructions::protocol_config::propose_admin(ctx, new_admin)
+    }
+
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        instructions::protocol_config::accept_admin(ctx)
+    }
+
+    pub fn set_oracle_program(ctx: Context<AdminOnly>, oracle_program: Pubkey) -> Result<()> {
+        instructions::protocol_config::set_oracle_program(ctx, oracle_program)
+    }
+
+    /// Initialize a new LP vault for a market (admin only)
     pub fn initialize_vault(
         ctx: Context<InitializeVault>,
         params: InitializeVaultParams,

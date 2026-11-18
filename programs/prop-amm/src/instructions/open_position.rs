@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{Token, TokenAccount};
 use pyth_sdk_solana::load_price_feed_from_account_info;
 use crate::oracle::{validate_price, PriceRejection};
-use crate::state::LpVault;
+use crate::state::{LpVault, ProtocolConfig};
 use crate::errors::PropAmmError;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
@@ -18,15 +18,21 @@ pub struct OpenPositionAmm<'info> {
     #[account(mut)]
     pub trader: Signer<'info>,
 
-    // Operator-only until positions are program-owned accounts. The trade
+    // Admin-only until positions are program-owned accounts. The trade
     // params (size, side, entry price) are taken on trust and no collateral
     // is posted, so a public caller could open phantom exposure or close a
     // position that never existed and be paid PnL from the LP vault.
     #[account(
+        seeds = [ProtocolConfig::SEED],
+        bump = config.bump,
+        constraint = config.admin == trader.key() @ PropAmmError::Unauthorized
+    )]
+    pub config: Account<'info, ProtocolConfig>,
+
+    #[account(
         mut,
         seeds = [b"lp_vault", vault.collateral_mint.as_ref()],
-        bump = vault.bump,
-        constraint = vault.authority == trader.key() @ PropAmmError::Unauthorized
+        bump = vault.bump
     )]
     pub vault: Account<'info, LpVault>,
 
