@@ -73,10 +73,8 @@ async fn update_market_funding(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     debug!("Checking funding for {} market {}", commodity, market_pda);
 
-    if market_data.is_paused {
-        debug!("Market is paused, skipping funding update");
-        return Ok(false);
-    }
+    // Pausing only stops new positions; the program still accepts liquidations
+    // and funding updates, and skipping them would let bad debt build up.
 
     if market_data.is_settled() || !market_data.is_in_session(crate::liquidator::unix_now()) {
         debug!("Market is settled or outside trading hours, skipping funding update");

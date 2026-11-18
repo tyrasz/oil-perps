@@ -67,7 +67,6 @@ pub struct MarketData {
     pub max_confidence_bps: u32,
     pub min_oracle_price: u64,
     pub settlement_price: u64,
-    pub referral_reserve: u64,
     pub funding_rate: i64,
 }
 
@@ -144,8 +143,16 @@ pub fn fetch_market(client: &RpcClient, config: &KeeperConfig, commodity: &str) 
     let Some(account) = client.get_account_with_commitment(&market_pda, client.commitment())?.value else {
         return Ok(None);
     };
-    let market: MarketData = BorshDeserialize::deserialize(&mut &account.data[8..])?;
-    Ok(Some((market_pda, market)))
+    Ok(decode_market(&account.owner, &account.data, &config.perps_program_id).map(|m| (market_pda, m)))
+}
+
+/// Decode a Market account, or `None` if it isn't one: anyone can send
+/// lamports to an unused market address, so check owner, size and type first.
+fn decode_market(owner: &Pubkey, data: &[u8], program_id: &Pubkey) -> Option<MarketData> {
+    if owner != program_id || data.get(..8)? != anchor_discriminator("account", "Market") {
+        return None;
+    }
+    MarketData::deserialize(&mut data.get(8..)?).ok()
 }
 
 /// Run `f` for every configured market. Errors in one market are logged and
@@ -208,10 +215,8 @@ async fn check_market(
 ) -> KeeperResult<u32> {
     debug!("Checking {} market {}", commodity, market_pda);
 
-    if market_data.is_paused {
-        debug!("Market is paused, skipping liquidation check");
-        return Ok(0);
-    }
+    // Pausing only stops new positions; the program still accepts liquidations
+    // and funding updates, and skipping them would let bad debt build up.
 
     let now = unix_now();
     if market_data.is_settled() {
@@ -488,9 +493,8 @@ mod tests {
         }
         bytes.extend_from_slice(&5_000_000u64.to_le_bytes()); // min_oracle_price
         bytes.extend_from_slice(&0u64.to_le_bytes()); // settlement_price
-        bytes.extend_from_slice(&77u64.to_le_bytes()); // referral_reserve
         bytes.extend_from_slice(&(-3i64).to_le_bytes()); // funding_rate
-        bytes.extend_from_slice(&[0u8; 7]); // padding
+        bytes.extend_from_slice(&[0u8; 15]); // padding
         assert_eq!(8 + bytes.len(), 298); // Market::LEN
 
         let m = MarketData::deserialize(&mut bytes.as_slice()).unwrap();
@@ -504,7 +508,21 @@ mod tests {
         assert_eq!(m.session_schedule, 1);
         assert_eq!((m.weekend_initial_margin_ratio, m.weekend_maintenance_margin_ratio), (2_000, 1_000));
         assert_eq!((m.max_confidence_bps, m.min_oracle_price, m.settlement_price), (150, 5_000_000, 0));
-        assert_eq!(m.referral_reserve, 77);
+    }
+
+    #[test]
+    fn ignores_accounts_that_are_not_markets() {
+        let program = Pubkey::new_unique();
+        let mut data = anchor_discriminator("account", "Market").to_vec();
+        data.extend(vec![0u8; 290]);
+        assert!(decode_market(&program, &data, &program).is_some());
+        // Lamports sent to an unused market address: system-owned, empty
+        assert!(decode_market(&Pubkey::default(), &[], &program).is_none());
+        // Program-owned but too short, or another account type
+        assert!(decode_market(&program, &data[..5], &program).is_none());
+        let mut other = anchor_discriminator("account", "Position").to_vec();
+        other.extend(vec![0u8; 290]);
+        assert!(decode_market(&program, &other, &program).is_none());
     }
 
     #[test]
