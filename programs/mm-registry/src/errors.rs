@@ -61,4 +61,10 @@ pub enum MmRegistryError {
 
     #[msg("Has open inventory - close it first")]
     HasOpenInventory,
+
+    #[msg("Quote fills are disabled until they settle into perps-core positions")]
+    FillsDisabled,
+
+    #[msg("Collateral mint must be the market's collateral mint")]
+    InvalidCollateralMint,
 }

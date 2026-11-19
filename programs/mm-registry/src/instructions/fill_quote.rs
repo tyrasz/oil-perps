@@ -61,7 +61,14 @@ pub struct FillQuote<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+/// Fills are disabled. As written, a fill only moves cash between the taker
+/// and the MM's vault: a taker "selling" into a bid is paid the full notional
+/// without delivering anything, and a buyer pays and receives no position.
+/// They must settle into perps-core positions before being enabled.
+pub const FILLS_ENABLED: bool = false;
+
 pub fn handler(ctx: Context<FillQuote>, params: FillQuoteParams) -> Result<FillQuoteResult> {
+    require!(FILLS_ENABLED, MmRegistryError::FillsDisabled);
     let quote = &ctx.accounts.quote;
     let registry = &ctx.accounts.registry;
     let current_time = Clock::get()?.unix_timestamp;
@@ -122,18 +129,22 @@ pub fn handler(ctx: Context<FillQuote>, params: FillQuoteParams) -> Result<FillQ
         let taker_receives = notional.saturating_sub(fee);
 
         // Transfer from MM collateral to taker
-        let market_maker_key = ctx.accounts.market_maker.key();
+        // The vault's SPL owner is the market_maker PDA (see register_mm)
+        let registry_key = ctx.accounts.registry.key();
+        let owner_key = ctx.accounts.market_maker.owner;
+        let mm_bump = ctx.accounts.market_maker.bump;
         let seeds = &[
-            b"mm_collateral".as_ref(),
-            market_maker_key.as_ref(),
-            &[*ctx.bumps.get("mm_collateral_account").unwrap()],
+            b"market_maker".as_ref(),
+            registry_key.as_ref(),
+            owner_key.as_ref(),
+            &[mm_bump],
         ];
         let signer = &[&seeds[..]];
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.mm_collateral_account.to_account_info(),
             to: ctx.accounts.taker_token_account.to_account_info(),
-            authority: ctx.accounts.mm_collateral_account.to_account_info(),
+            authority: ctx.accounts.market_maker.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
@@ -175,6 +186,8 @@ pub fn handler(ctx: Context<FillQuote>, params: FillQuoteParams) -> Result<FillQ
 
     let market_maker = &mut ctx.accounts.market_maker;
     market_maker.unlock_collateral(collateral_freed);
+    // Record the new lock so later fills and cancel don't unlock it again
+    ctx.accounts.quote.collateral_locked = new_collateral_locked;
 
     // Check if quote is fully filled
     let quote = &mut ctx.accounts.quote;

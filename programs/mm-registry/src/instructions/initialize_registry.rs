@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token};
 use crate::state::MmRegistry;
+use perps_core::state::{Market, ProtocolConfig};
 use crate::errors::MmRegistryError;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
@@ -14,8 +15,18 @@ pub struct InitializeRegistryParams {
 
 #[derive(Accounts)]
 pub struct InitializeRegistry<'info> {
+    /// Must be the perps-core admin: the registry PDA is one per market, so a
+    /// permissionless init would let anyone claim it with their own mint/fees.
     #[account(mut)]
     pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [ProtocolConfig::SEED],
+        bump = config.bump,
+        seeds::program = perps_core::ID,
+        constraint = config.admin == authority.key() @ MmRegistryError::Unauthorized
+    )]
+    pub config: Box<Account<'info, ProtocolConfig>>,
 
     #[account(
         init,
@@ -26,9 +37,10 @@ pub struct InitializeRegistry<'info> {
     )]
     pub registry: Account<'info, MmRegistry>,
 
-    /// CHECK: Market account from perps-core
-    pub market: AccountInfo<'info>,
+    /// The perps-core market this registry serves (owner checked by Account)
+    pub market: Box<Account<'info, Market>>,
 
+    #[account(constraint = collateral_mint.key() == market.collateral_mint @ MmRegistryError::InvalidCollateralMint)]
     pub collateral_mint: Account<'info, Mint>,
 
     pub system_program: Program<'info, System>,

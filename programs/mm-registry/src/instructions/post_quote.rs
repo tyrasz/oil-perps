@@ -38,7 +38,7 @@ pub struct PostQuote<'info> {
         init,
         payer = owner,
         space = TwoSidedQuote::LEN,
-        seeds = [b"quote", market_maker.key().as_ref(), &market_maker.active_quotes.to_le_bytes()],
+        seeds = [b"quote", market_maker.key().as_ref(), &market_maker.quotes_posted.to_le_bytes()],
         bump
     )]
     pub quote: Account<'info, TwoSidedQuote>,
@@ -63,8 +63,8 @@ pub fn handler(ctx: Context<PostQuote>, params: PostQuoteParams) -> Result<()> {
     );
 
     // Check spread
-    let spread = ((params.ask_price - params.bid_price) as u128 * 10000 / params.bid_price as u128) as u32;
-    require!(spread <= registry.max_spread, MmRegistryError::SpreadTooWide);
+    let spread = (params.ask_price - params.bid_price) as u128 * 10000 / params.bid_price as u128;
+    require!(spread <= registry.max_spread as u128, MmRegistryError::SpreadTooWide);
 
     // Check max quotes
     require!(
@@ -73,9 +73,10 @@ pub fn handler(ctx: Context<PostQuote>, params: PostQuoteParams) -> Result<()> {
     );
 
     // Calculate collateral requirement (10% of max potential exposure)
+    let notional = |size: u64, price: u64| u64::try_from(size as u128 * price as u128 / 1_000_000);
     let max_notional = std::cmp::max(
-        (params.bid_size as u128 * params.bid_price as u128 / 1_000_000) as u64,
-        (params.ask_size as u128 * params.ask_price as u128 / 1_000_000) as u64
+        notional(params.bid_size, params.bid_price).map_err(|_| MmRegistryError::MathOverflow)?,
+        notional(params.ask_size, params.ask_price).map_err(|_| MmRegistryError::MathOverflow)?,
     );
     let collateral_required = max_notional / 10;
 
@@ -117,6 +118,7 @@ pub fn handler(ctx: Context<PostQuote>, params: PostQuoteParams) -> Result<()> {
     let market_maker = &mut ctx.accounts.market_maker;
     market_maker.lock_collateral(collateral_required);
     market_maker.active_quotes += 1;
+    market_maker.quotes_posted += 1;
     market_maker.last_active_at = current_time;
 
     // Update registry

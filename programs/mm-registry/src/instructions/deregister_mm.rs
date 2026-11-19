@@ -54,18 +54,22 @@ pub fn handler(ctx: Context<DeregisterMm>) -> Result<()> {
     let balance = ctx.accounts.mm_collateral_account.amount;
 
     if balance > 0 {
-        let market_maker_key = ctx.accounts.market_maker.key();
+        // The vault's SPL owner is the market_maker PDA (see register_mm)
+        let registry_key = ctx.accounts.registry.key();
+        let owner_key = ctx.accounts.market_maker.owner;
+        let mm_bump = ctx.accounts.market_maker.bump;
         let seeds = &[
-            b"mm_collateral".as_ref(),
-            market_maker_key.as_ref(),
-            &[*ctx.bumps.get("mm_collateral_account").unwrap()],
+            b"market_maker".as_ref(),
+            registry_key.as_ref(),
+            owner_key.as_ref(),
+            &[mm_bump],
         ];
         let signer = &[&seeds[..]];
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.mm_collateral_account.to_account_info(),
             to: ctx.accounts.owner_token_account.to_account_info(),
-            authority: ctx.accounts.mm_collateral_account.to_account_info(),
+            authority: ctx.accounts.market_maker.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
@@ -78,7 +82,7 @@ pub fn handler(ctx: Context<DeregisterMm>) -> Result<()> {
         let close_accounts = CloseAccount {
             account: ctx.accounts.mm_collateral_account.to_account_info(),
             destination: ctx.accounts.owner.to_account_info(),
-            authority: ctx.accounts.mm_collateral_account.to_account_info(),
+            authority: ctx.accounts.market_maker.to_account_info(),
         };
         let close_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),

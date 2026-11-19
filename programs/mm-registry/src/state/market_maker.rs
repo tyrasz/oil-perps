@@ -68,6 +68,10 @@ pub struct MarketMaker {
     pub status: MmStatus,
 
     pub bump: u8,
+
+    /// Quotes ever posted; seeds the next quote PDA (active_quotes can repeat
+    /// after a cancel, which made post_quote collide with a live quote).
+    pub quotes_posted: u64,
 }
 
 impl MarketMaker {
@@ -91,7 +95,8 @@ impl MarketMaker {
         1 +   // max_quotes
         1 +   // status
         1 +   // bump
-        64;   // padding
+        8 +   // quotes_posted
+        56;   // padding
 
     /// Check if MM has enough available collateral
     pub fn has_available_collateral(&self, amount: u64) -> bool {

@@ -73,7 +73,7 @@ export class MmRegistryClient {
     return findMmCollateralPda(this.programId, marketMaker);
   }
 
-  findQuotePda(marketMaker: PublicKey, quoteIndex: number): [PublicKey, number] {
+  findQuotePda(marketMaker: PublicKey, quoteIndex: number | bigint | BN): [PublicKey, number] {
     return findQuotePda(this.programId, marketMaker, quoteIndex);
   }
 
@@ -228,20 +228,28 @@ export class MmRegistryClient {
     authority: PublicKey,
     market: PublicKey,
     collateralMint: PublicKey,
-    params: InitializeRegistryParams
+    params: InitializeRegistryParams,
+    perpsCoreProgramId: PublicKey
   ): Promise<TransactionInstruction> {
     if (!this.program) throw new Error("Program not set");
 
     const [registry] = this.findRegistryPda(market);
+    // Only the perps-core admin (its ProtocolConfig.admin) may create registries
+    const [config] = PublicKey.findProgramAddressSync(
+      [Buffer.from("config")],
+      perpsCoreProgramId
+    );
 
     return await this.program.methods
       .initializeRegistry(params)
       .accounts({
         authority,
+        config,
+        registry,
         market,
         collateralMint,
-        registry,
         systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .instruction();
   }
@@ -340,16 +348,26 @@ export class MmRegistryClient {
       .instruction();
   }
 
+  /**
+   * Post a two-sided quote. The quote PDA is seeded by the market maker's
+   * `quotesPosted` counter, which is fetched unless `quoteIndex` is given.
+   */
   async buildPostQuoteIx(
     owner: PublicKey,
     registry: PublicKey,
-    quoteIndex: number,
-    params: PostQuoteParams
+    params: PostQuoteParams,
+    quoteIndex?: BN
   ): Promise<TransactionInstruction> {
     if (!this.program) throw new Error("Program not set");
 
     const [marketMaker] = this.findMarketMakerPda(registry, owner);
-    const [quote] = this.findQuotePda(marketMaker, quoteIndex);
+    let index = quoteIndex;
+    if (index === undefined) {
+      const mm = await this.fetchMarketMaker(marketMaker);
+      if (!mm) throw new Error("Market maker not registered");
+      index = mm.quotesPosted;
+    }
+    const [quote] = this.findQuotePda(marketMaker, index);
 
     return await this.program.methods
       .postQuote(params)
@@ -416,7 +434,8 @@ export class MmRegistryClient {
     const quoteData = await this.fetchQuote(quote);
     if (!quoteData) throw new Error("Quote not found");
 
-    const [marketMaker] = this.findMarketMakerPda(registry, quoteData.marketMaker);
+    // quote.marketMaker is already the MarketMaker PDA, not its owner
+    const marketMaker = quoteData.marketMaker;
     const [mmCollateral] = this.findMmCollateralPda(marketMaker);
     const takerTokenAccount = getAssociatedTokenAddressSync(collateralMint, taker);
 

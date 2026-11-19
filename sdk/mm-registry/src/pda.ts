@@ -1,4 +1,5 @@
 import { PublicKey } from "@solana/web3.js";
+import BN from "bn.js";
 
 export const SEEDS = {
   MM_REGISTRY: Buffer.from("mm_registry"),
@@ -48,15 +49,16 @@ export function findMmCollateralPda(
 }
 
 /**
- * Derive a Quote PDA for a market maker
+ * Derive a Quote PDA for a market maker. The index is the market maker's
+ * `quotesPosted` counter (u64, little-endian) at the time the quote is posted.
  */
 export function findQuotePda(
   programId: PublicKey,
   marketMaker: PublicKey,
-  quoteIndex: number
+  quoteIndex: number | bigint | BN
 ): [PublicKey, number] {
-  const indexBuffer = Buffer.alloc(4);
-  indexBuffer.writeUInt32LE(quoteIndex);
+  const indexBuffer = Buffer.alloc(8);
+  indexBuffer.writeBigUInt64LE(BigInt(quoteIndex.toString()));
 
   return PublicKey.findProgramAddressSync(
     [SEEDS.QUOTE, marketMaker.toBuffer(), indexBuffer],

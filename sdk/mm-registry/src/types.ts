@@ -19,9 +19,10 @@ export enum QuoteSide {
 
 export enum QuoteStatus {
   Active = 0,
-  Filled = 1,
-  Cancelled = 2,
-  Expired = 3,
+  PartiallyFilled = 1,
+  Filled = 2,
+  Cancelled = 3,
+  Expired = 4,
 }
 
 // ============================================================================
@@ -46,23 +47,29 @@ export interface MmRegistry {
   bump: number;
 }
 
+/** Mirrors programs/mm-registry/src/state/market_maker.rs (field order matters for memcmp) */
 export interface MarketMaker {
   owner: PublicKey;
   registry: PublicKey;
-  status: MmStatus;
+  collateralAccount: PublicKey;
   collateralDeposited: BN;
   collateralLocked: BN;
   collateralAvailable: BN;
   inventory: BN;
-  averageEntryPrice: BN;
-  realizedPnl: BN;
+  avgInventoryPrice: BN;
   unrealizedPnl: BN;
+  realizedPnl: BN;
   totalVolume: BN;
-  totalFees: BN;
-  activeQuotes: number;
+  totalFills: BN;
+  totalFeesPaid: BN;
   registeredAt: BN;
   lastActiveAt: BN;
+  activeQuotes: number;
+  maxQuotes: number;
+  status: MmStatus;
   bump: number;
+  /** Quotes ever posted; the next quote's PDA index */
+  quotesPosted: BN;
 }
 
 export interface Quote {
@@ -113,21 +120,26 @@ export interface PostQuoteParams {
   bidSize: BN;
   askPrice: BN;
   askSize: BN;
+  minFillSize: BN;
+  /** Seconds until expiry; 0 = no expiry */
   expiresIn: BN;
 }
 
 export interface UpdateQuoteParams {
-  bidPrice?: BN;
-  bidSize?: BN;
-  askPrice?: BN;
-  askSize?: BN;
+  bidPrice: BN | null;
+  bidSize: BN | null;
+  askPrice: BN | null;
+  askSize: BN | null;
 }
 
+/**
+ * Note: fills are disabled on-chain (FillsDisabled) until they settle into
+ * perps-core positions.
+ */
 export interface FillQuoteParams {
-  side: QuoteSide;
   size: BN;
-  maxPrice?: BN;
-  minPrice?: BN;
+  /** true = taker buys (fills the MM's ask), false = taker sells (fills the bid) */
+  isBuy: boolean;
 }
 
 // ============================================================================
