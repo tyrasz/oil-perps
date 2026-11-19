@@ -784,15 +784,19 @@ async fn legacy_finished_orders_can_be_closed() {
     let alice = env.alice.kp.insecure_clone();
     for status in [OrderStatus::Cancelled, OrderStatus::Filled] {
         let order = env.quick(&alice, OrderSide::Bid, 74.0, 1, 5).await;
-        // As the old cancel/match left it: counters already decremented
+        // As the old program left it: cancel_order took the order off the
+        // counters, match_orders did not
         patch::<Order>(&mut env.base, order, |o| o.status = status).await;
-        patch::<OrderBook>(&mut env.base, env.book, |b| b.total_bids -= 1).await;
+        if status == OrderStatus::Cancelled {
+            patch::<OrderBook>(&mut env.base, env.book, |b| b.total_bids -= 1).await;
+        }
         let before = env.book_state().await.total_bids;
+        let expected_after = if status == OrderStatus::Filled { before - 1 } else { before };
         let owner_before = env.lamports(alice.pubkey()).await;
         let rent = lamports(&mut env.base, order).await;
         env.close_expired(order, alice.pubkey()).await.unwrap();
         assert!(!exists(&mut env.base, order).await);
-        assert_eq!(env.book_state().await.total_bids, before);
+        assert_eq!(env.book_state().await.total_bids, expected_after);
         assert_eq!(env.lamports(alice.pubkey()).await, owner_before + rent);
     }
 }

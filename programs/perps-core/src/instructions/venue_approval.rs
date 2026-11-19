@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use crate::errors::PerpsError;
 use anchor_lang::solana_program::instruction::{get_stack_height, TRANSACTION_LEVEL_STACK_HEIGHT};
+use anchor_lang::solana_program::sysvar::instructions::{self as ix_sysvar, load_current_index_checked, load_instruction_at_checked};
 use crate::state::{Market, Venue, VenueApproval, MAX_APPROVAL_SECS, ROLE_MAKER, SIDE_LONG, SIDE_SHORT};
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
@@ -34,14 +35,41 @@ impl VenueApprovalParams {
         approval.expires_at = self.expires_at;
         approval.allowed_sides = self.allowed_sides;
     }
+
+    /// True if these params grant nothing `approval` doesn't already: always
+    /// safe to apply, from anywhere (it is how an owner pauses its quotes).
+    fn only_narrows(&self, approval: &VenueApproval) -> bool {
+        // 0 means "no bound" for the limits and the deviation
+        let tighter_cap = |new: u64, old: u64| old == 0 || (new != 0 && new <= old);
+        self.allowance <= approval.allowance
+            && self.max_leverage <= approval.max_leverage
+            && self.allowed_sides & !approval.allowed_sides == 0
+            && self.expires_at <= approval.expires_at
+            && tighter_cap(self.max_buy_price, approval.max_buy_price)
+            && (approval.min_sell_price == 0 || self.min_sell_price >= approval.min_sell_price)
+            && tighter_cap(self.max_price_deviation_bps as u64, approval.max_price_deviation_bps as u64)
+    }
 }
 
-/// Approvals may only be written by a top-level instruction. A taker signs
-/// the transaction that calls the venue, and a signer stays a signer in every
-/// CPI, so a compromised venue could otherwise widen the taker's own approval
-/// mid-transaction and then fill against it. (Revoking may come from anywhere.)
-fn require_top_level() -> Result<()> {
-    require!(get_stack_height() == TRANSACTION_LEVEL_STACK_HEIGHT, PerpsError::ApprovalViaCpi);
+/// Who may grant (create or widen) an approval for `venue`.
+///
+/// A taker signs the transaction that calls the venue, and a signer stays a
+/// signer in every CPI, so a compromised venue could otherwise widen the
+/// taker's approval mid-transaction and then fill against it. A grant must
+/// therefore come either from a top-level instruction, or from exactly one
+/// CPI deep under a top-level program that is not the venue: the owner's own
+/// wallet program (a multisig vault, a PDA owner). The venue itself is then
+/// the top-level program, or (behind a router) at least two CPIs deep.
+/// Narrowing and revoking are always allowed.
+fn require_grant_allowed(venue: &Venue, instructions: &AccountInfo) -> Result<()> {
+    let height = get_stack_height();
+    if height == TRANSACTION_LEVEL_STACK_HEIGHT {
+        return Ok(());
+    }
+    require!(height == TRANSACTION_LEVEL_STACK_HEIGHT + 1, PerpsError::ApprovalViaCpi);
+    let current = load_current_index_checked(instructions)? as usize;
+    let top_level = load_instruction_at_checked(current, instructions)?;
+    require!(top_level.program_id != venue.program, PerpsError::ApprovalViaCpi);
     Ok(())
 }
 
@@ -74,10 +102,14 @@ pub struct ApproveVenue<'info> {
     pub approval: Box<Account<'info, VenueApproval>>,
 
     pub system_program: Program<'info, System>,
+
+    /// CHECK: the instructions sysvar (address-checked), for require_grant_allowed
+    #[account(address = ix_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
 }
 
 pub fn approve_venue(ctx: Context<ApproveVenue>, role: u8, params: VenueApprovalParams) -> Result<()> {
-    require_top_level()?;
+    require_grant_allowed(&ctx.accounts.venue, &ctx.accounts.instructions)?;
     let now = Clock::get()?.unix_timestamp;
     require!(role <= ROLE_MAKER, PerpsError::InvalidApprovalParams);
     require!(params.validate(&ctx.accounts.market, now), PerpsError::InvalidApprovalParams);
@@ -119,10 +151,16 @@ pub struct UpdateVenueApproval<'info> {
         has_one = owner
     )]
     pub approval: Box<Account<'info, VenueApproval>>,
+
+    /// CHECK: the instructions sysvar (address-checked), for require_grant_allowed
+    #[account(address = ix_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
 }
 
 pub fn update_venue_approval(ctx: Context<UpdateVenueApproval>, params: VenueApprovalParams) -> Result<()> {
-    require_top_level()?;
+    if !params.only_narrows(&ctx.accounts.approval) {
+        require_grant_allowed(&ctx.accounts.venue, &ctx.accounts.instructions)?;
+    }
     let now = Clock::get()?.unix_timestamp;
     require!(params.validate(&ctx.accounts.market, now), PerpsError::InvalidApprovalParams);
     let approval = &mut ctx.accounts.approval;

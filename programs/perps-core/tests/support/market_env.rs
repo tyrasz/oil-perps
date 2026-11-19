@@ -635,6 +635,7 @@ pub fn approval_params(allowance: u64, now: i64) -> VenueApprovalParams {
 pub fn approve_ix(base: &Base, owner: &Pubkey, venue: &Pubkey, role: u8, params: VenueApprovalParams) -> Instruction {
     let accounts = perps_core::accounts::ApproveVenue {
         owner: *owner, market: base.market, venue: *venue, approval: approval_pda(owner, venue, role), system_program: system_program::ID,
+        instructions: sysvar::instructions::ID,
     };
     perps_ix(accounts, perps_core::instruction::ApproveVenue { role, params })
 }
@@ -649,6 +650,7 @@ pub async fn approve(base: &mut Base, owner: &Keypair, venue: &Pubkey, role: u8,
 pub fn update_approval_ix(base: &Base, owner: &Pubkey, venue: &Pubkey, role: u8, params: VenueApprovalParams) -> Instruction {
     let accounts = perps_core::accounts::UpdateVenueApproval {
         owner: *owner, market: base.market, venue: *venue, approval: approval_pda(owner, venue, role),
+        instructions: sysvar::instructions::ID,
     };
     perps_ix(accounts, perps_core::instruction::UpdateVenueApproval { params })
 }

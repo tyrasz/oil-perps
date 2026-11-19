@@ -194,13 +194,15 @@ pub mod orderbook {
 
     /// Permissionless: an expired order can never match, so anyone may return
     /// its rent and deposit to the owner. Orders the old program left Filled
-    /// or Cancelled without closing them are closed the same way, at any time
-    /// (they were already taken off the counters).
+    /// or Cancelled without closing them are closed the same way, at any time.
+    /// (The old cancel_order took its order off the counters; the old
+    /// match_orders never did, so a legacy Filled order still counts.)
     pub fn close_expired_order(ctx: Context<CloseExpiredOrder>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let order = &ctx.accounts.order;
         match order.status {
-            OrderStatus::Filled | OrderStatus::Cancelled => {}
+            OrderStatus::Cancelled => {}
+            OrderStatus::Filled => decrement_side(&mut ctx.accounts.orderbook, order.side),
             _ => {
                 require!(now > order.expires_at, ErrorCode::OrderNotExpired);
                 decrement_side(&mut ctx.accounts.orderbook, order.side);

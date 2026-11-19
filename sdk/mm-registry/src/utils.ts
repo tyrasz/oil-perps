@@ -262,6 +262,9 @@ export function randomPositionNonce(): BN {
  * Whether fill_quote would accept this quote at `now`: active, not expired,
  * and migrated (leverage and an expiry within the 24h TTL).
  */
+/** Slack on the TTL bound for skew between `now` and the chain clock */
+const TTL_SKEW_SECS = 300;
+
 export function isFillableQuote(
   quote: { isActive: boolean; expiresAt: BN; leverage: number },
   now: number
@@ -269,7 +272,9 @@ export function isFillableQuote(
   return (
     quote.isActive &&
     quote.leverage > 0 &&
-    quote.expiresAt.gtn(now) &&
-    quote.expiresAt.lten(now + MAX_QUOTE_TTL_SECS)
+    // is_valid: live through expires_at itself
+    quote.expiresAt.gten(now) &&
+    // The TTL bound only screens out legacy far expiries; allow clock skew
+    quote.expiresAt.lten(now + MAX_QUOTE_TTL_SECS + TTL_SKEW_SECS)
   );
 }

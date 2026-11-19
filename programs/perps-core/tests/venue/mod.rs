@@ -840,9 +840,10 @@ async fn fill_compute_units() {
     }
 }
 
-/// The relay's instruction forwarding an arbitrary perps-core instruction.
+/// The relay's instruction forwarding `inner` (to inner's own program, so
+/// relays can be nested to model a router).
 fn relay_wrap(relay_program: &Pubkey, inner: Instruction) -> Instruction {
-    let mut accounts = vec![AccountMeta::new_readonly(perps_core::ID, false)];
+    let mut accounts = vec![AccountMeta::new_readonly(inner.program_id, false)];
     accounts.extend(inner.accounts);
     Instruction { program_id: *relay_program, accounts, data: inner.data }
 }
@@ -850,22 +851,39 @@ fn relay_wrap(relay_program: &Pubkey, inner: Instruction) -> Instruction {
 #[tokio::test]
 async fn a_venue_cannot_widen_a_signing_takers_approval() {
     // The taker signs the transaction that calls the venue, and a signer stays
-    // a signer in every CPI. Approvals must only be writable at top level, or
-    // a compromised venue could raise the taker's allowance and then fill.
+    // a signer in every CPI. Grants must not be possible from inside the venue.
     let mut env = Env::new().await;
     let t = env.now().await;
     let (taker, venue) = (env.taker.kp.insecure_clone(), env.venue);
     let wide = approval_params(1_000_000 * USDC, t);
+    // RELAY is env.venue's program: as the top-level program it can't grant
     let inner = update_approval_ix(&env.base, &taker.pubkey(), &venue, ROLE_TAKER, wide);
     let result = send(&mut env.base.ctx, &[relay_wrap(&RELAY, inner)], &[&taker]).await;
     assert_eq!(custom_error(result), perr(PerpsError::ApprovalViaCpi));
-
     let fresh = trader(&mut env.base, DEPOSIT).await;
     let inner = approve_ix(&env.base, &fresh.key(), &venue, ROLE_TAKER, wide);
     let result = send(&mut env.base.ctx, &[relay_wrap(&RELAY, inner)], &[&fresh.kp]).await;
     assert_eq!(custom_error(result), perr(PerpsError::ApprovalViaCpi));
+    // Nor behind a router (two CPIs deep)
+    let inner = update_approval_ix(&env.base, &taker.pubkey(), &venue, ROLE_TAKER, wide);
+    let routed = relay_wrap(&RELAY2, relay_wrap(&RELAY, inner));
+    assert_eq!(custom_error(send(&mut env.base.ctx, &[routed], &[&taker]).await), perr(PerpsError::ApprovalViaCpi));
+    assert_eq!(env.approval(approval_pda(&taker.pubkey(), &venue, ROLE_TAKER)).await.allowance, ALLOWANCE);
 
-    // The same writes at top level still work, and revoking works from a CPI
+    // Narrowing is always allowed, even from the venue: it's the kill switch
+    let paused = VenueApprovalParams { allowance: 0, ..approval_params(0, t) };
+    let inner = update_approval_ix(&env.base, &taker.pubkey(), &venue, ROLE_TAKER, paused);
+    send(&mut env.base.ctx, &[relay_wrap(&RELAY, inner)], &[&taker]).await.unwrap();
+    assert_eq!(env.approval(approval_pda(&taker.pubkey(), &venue, ROLE_TAKER)).await.allowance, 0);
+
+    // An owner's own wallet program (here RELAY2, which is not this venue's
+    // program) may grant from one CPI deep, as a multisig vault does
+    let inner = update_approval_ix(&env.base, &taker.pubkey(), &venue, ROLE_TAKER, wide);
+    send(&mut env.base.ctx, &[relay_wrap(&RELAY2, inner)], &[&taker]).await.unwrap();
+    let inner = approve_ix(&env.base, &fresh.key(), &venue, ROLE_TAKER, wide);
+    send(&mut env.base.ctx, &[relay_wrap(&RELAY2, inner)], &[&fresh.kp]).await.unwrap();
+
+    // Top level works as always, and revoking works from any CPI
     update_approval(&mut env.base, &taker, &venue, ROLE_TAKER, wide).await.unwrap();
     let revoke = relay_wrap(&RELAY, revoke_ix(&taker.pubkey(), &venue, ROLE_TAKER));
     send(&mut env.base.ctx, &[revoke], &[&taker]).await.unwrap();

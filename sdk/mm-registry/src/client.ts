@@ -5,6 +5,7 @@ import {
   TransactionInstruction,
   SystemProgram,
   SYSVAR_RENT_PUBKEY,
+  SYSVAR_INSTRUCTIONS_PUBKEY,
 } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
@@ -255,8 +256,17 @@ export class MmRegistryClient {
     });
   }
 
-  /** Fillable quotes only (see isFillableQuote); `now` defaults to local time. */
-  async fetchActiveQuotes(registry: PublicKey, now: number = Math.floor(Date.now() / 1000)): Promise<QuoteInfo[]> {
+  /** The cluster's current unix time (Clock sysvar via the latest slot). */
+  async chainTime(): Promise<number> {
+    const slot = await this.connection.getSlot();
+    const t = await this.connection.getBlockTime(slot);
+    return t ?? Math.floor(Date.now() / 1000);
+  }
+
+  /** Fillable quotes only (see isFillableQuote); `now` defaults to chain time. */
+  async fetchActiveQuotes(registry: PublicKey, now?: number): Promise<QuoteInfo[]> {
+    // Chain time, not the local clock: fill_quote judges expiry on-chain
+    if (now === undefined) now = await this.chainTime();
     if (!this.program) throw new Error("Program not set");
 
     const accounts = await this.program.account.twoSidedQuote.all([
@@ -602,6 +612,9 @@ export class MmRegistryClient {
     if (!exists) {
       keys.push({ pubkey: SystemProgram.programId, isSigner: false, isWritable: false });
     }
+    // perps-core checks who is granting (top level, or one CPI deep under a
+    // program other than the venue) through the instructions sysvar
+    keys.push({ pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false });
     return new TransactionInstruction({ programId: perpsProgramId, keys, data });
   }
 
@@ -768,9 +781,10 @@ export class MmRegistryClient {
   }
 
   async getBestQuotes(
-    registry: PublicKey
+    registry: PublicKey,
+    now?: number
   ): Promise<{ bestBid: QuoteInfo | null; bestAsk: QuoteInfo | null }> {
-    const quotes = await this.fetchActiveQuotes(registry);
+    const quotes = await this.fetchActiveQuotes(registry, now);
 
     let bestBid: QuoteInfo | null = null;
     let bestAsk: QuoteInfo | null = null;
@@ -798,12 +812,13 @@ export class MmRegistryClient {
 
   async getAggregatedLiquidity(
     registry: PublicKey,
-    levels: number = 5
+    levels: number = 5,
+    now?: number
   ): Promise<{
     bids: Array<{ price: BN; size: BN; numQuotes: number }>;
     asks: Array<{ price: BN; size: BN; numQuotes: number }>;
   }> {
-    const quotes = await this.fetchActiveQuotes(registry);
+    const quotes = await this.fetchActiveQuotes(registry, now);
 
     // Aggregate bids by price
     const bidMap = new Map<string, { price: BN; size: BN; numQuotes: number }>();
