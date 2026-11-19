@@ -64,6 +64,21 @@ impl Vamm {
         price + (price * spread as u64 / 10000)
     }
 
+    /// Buy exactly `base_amount` of base from the pool; returns the quote paid.
+    /// (x * y = k: base reserve shrinks, quote reserve grows.)
+    pub fn buy_base(&mut self, base_amount: u64) -> Option<u64> {
+        let new_base_reserve = self.base_reserve.checked_sub(base_amount as u128)?;
+        if new_base_reserve == 0 {
+            return None;
+        }
+        // Round the quote reserve up so the trader never pays less than k requires
+        let new_quote_reserve = (self.k + new_base_reserve - 1) / new_base_reserve;
+        let quote_in = new_quote_reserve.checked_sub(self.quote_reserve)?;
+        self.base_reserve = new_base_reserve;
+        self.quote_reserve = new_quote_reserve;
+        u64::try_from(quote_in).ok()
+    }
+
     pub fn swap_base_to_quote(&mut self, base_amount: u64) -> u64 {
         // Selling base (closing long / opening short)
         let new_base_reserve = self.base_reserve + base_amount as u128;
@@ -127,11 +142,13 @@ pub mod vamm {
         Ok(())
     }
 
+    // All trades take `size` in base units: opening a long or closing a short
+    // buys base from the pool, opening a short or closing a long sells it.
     pub fn open_long(ctx: Context<Trade>, size: u64) -> Result<()> {
         let vamm = &mut ctx.accounts.vamm;
         require!(vamm.is_active, ErrorCode::VammPaused);
 
-        let quote_amount = vamm.swap_quote_to_base(size);
+        let quote_amount = vamm.buy_base(size).ok_or(ErrorCode::InvalidTradeSize)?;
         vamm.total_long += size;
         vamm.total_volume += size as u128;
 
@@ -153,6 +170,7 @@ pub mod vamm {
 
     pub fn close_long(ctx: Context<Trade>, size: u64) -> Result<()> {
         let vamm = &mut ctx.accounts.vamm;
+        require!(vamm.is_active, ErrorCode::VammPaused);
 
         let quote_amount = vamm.swap_base_to_quote(size);
         vamm.total_long = vamm.total_long.saturating_sub(size);
@@ -163,8 +181,9 @@ pub mod vamm {
 
     pub fn close_short(ctx: Context<Trade>, size: u64) -> Result<()> {
         let vamm = &mut ctx.accounts.vamm;
+        require!(vamm.is_active, ErrorCode::VammPaused);
 
-        let quote_amount = vamm.swap_quote_to_base(size);
+        let quote_amount = vamm.buy_base(size).ok_or(ErrorCode::InvalidTradeSize)?;
         vamm.total_short = vamm.total_short.saturating_sub(size);
 
         msg!("Closed short: size={}, quote_in={}, new_price={}", size, quote_amount, vamm.get_price());
@@ -226,12 +245,15 @@ pub struct InitializeVamm<'info> {
 
 #[derive(Accounts)]
 pub struct Trade<'info> {
+    /// Operator-only: trades post no collateral and closes aren't tied to
+    /// positions, so a public caller could move the reserves to any price.
     pub trader: Signer<'info>,
 
     #[account(
         mut,
         seeds = [b"vamm", vamm.market.as_ref()],
-        bump = vamm.bump
+        bump = vamm.bump,
+        constraint = vamm.authority == trader.key() @ ErrorCode::Unauthorized
     )]
     pub vamm: Account<'info, Vamm>,
 }
@@ -270,6 +292,12 @@ pub enum ErrorCode {
     InvalidLiquidityRatio,
     #[msg("Invalid vAMM parameters")]
     InvalidParameters,
+
+    #[msg("Unauthorized")]
+    Unauthorized,
+
+    #[msg("Trade size is zero or exceeds the pool")]
+    InvalidTradeSize,
 }
 
 #[cfg(test)]
@@ -282,7 +310,7 @@ mod tests {
             authority: Pubkey::default(),
             base_reserve,
             quote_reserve: 75 * base_reserve.max(1),
-            k: 0,
+            k: base_reserve * 75 * base_reserve.max(1),
             base_spread: 10,
             max_spread: 100,
             utilization_threshold: 8000,
@@ -292,6 +320,26 @@ mod tests {
             bump: 0,
             is_active: true,
         }
+    }
+
+    #[test]
+    fn long_round_trip_uses_base_units_and_restores_the_pool() {
+        let mut v = vamm(1_000_000, 0);
+        let (base0, quote0) = (v.base_reserve, v.quote_reserve);
+        let paid = v.buy_base(10_000).unwrap(); // open long 10,000 base
+        assert_eq!(v.base_reserve, base0 - 10_000);
+        let received = v.swap_base_to_quote(10_000); // close long 10,000 base
+        assert_eq!(v.base_reserve, base0);
+        // Rounding favours the pool, never the trader
+        assert!(received <= paid);
+        assert!(v.quote_reserve >= quote0);
+    }
+
+    #[test]
+    fn buying_the_whole_pool_is_rejected() {
+        let mut v = vamm(1_000, 0);
+        assert_eq!(v.buy_base(1_000), None);
+        assert_eq!(v.buy_base(2_000), None);
     }
 
     #[test]

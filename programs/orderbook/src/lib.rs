@@ -1,14 +1,15 @@
 use anchor_lang::prelude::*;
+use perps_core::state::{Market, ProtocolConfig};
 
 declare_id!("2XhUqeGhdkhKdZXkjHmMmFMXBJfYVVCbFxKjKqkCdMzt");
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OrderSide {
     Bid,
     Ask,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OrderType {
     Limit,
     Market,
@@ -16,7 +17,7 @@ pub enum OrderType {
     TakeProfit,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OrderStatus {
     Open,
     PartiallyFilled,
@@ -174,11 +175,21 @@ pub mod orderbook {
 
 #[derive(Accounts)]
 pub struct InitializeOrderBook<'info> {
+    /// Must be the perps-core admin: one book per market, so a permissionless
+    /// init would let anyone claim it (and its matching authority).
     #[account(mut)]
     pub authority: Signer<'info>,
 
-    /// CHECK: Market account from perps-core
-    pub market: AccountInfo<'info>,
+    #[account(
+        seeds = [ProtocolConfig::SEED],
+        bump = config.bump,
+        seeds::program = perps_core::ID,
+        constraint = config.admin == authority.key() @ ErrorCode::Unauthorized
+    )]
+    pub config: Box<Account<'info, ProtocolConfig>>,
+
+    /// The perps-core market this book serves (owner checked by Account)
+    pub market: Box<Account<'info, Market>>,
 
     #[account(
         init,
@@ -208,7 +219,7 @@ pub struct PlaceOrder<'info> {
         init,
         payer = owner,
         space = Order::LEN,
-        seeds = [b"order", owner.key().as_ref(), &orderbook.sequence_number.to_le_bytes()],
+        seeds = [b"order", orderbook.key().as_ref(), owner.key().as_ref(), &orderbook.sequence_number.to_le_bytes()],
         bump
     )]
     pub order: Account<'info, Order>,
@@ -230,27 +241,40 @@ pub struct CancelOrder<'info> {
 
     #[account(
         mut,
-        constraint = order.owner == owner.key()
+        constraint = order.owner == owner.key(),
+        constraint = order.market == orderbook.market @ ErrorCode::WrongOrderBook
     )]
     pub order: Account<'info, Order>,
 }
 
 #[derive(Accounts)]
 pub struct MatchOrders<'info> {
+    /// Only the book's authority may match: matching settles nothing yet (no
+    /// funds or positions move), so a public matcher could mark anyone's order
+    /// filled and destroy it.
     #[account(mut)]
     pub matcher: Signer<'info>,
 
     #[account(
         mut,
         seeds = [b"orderbook", orderbook.market.as_ref()],
-        bump = orderbook.bump
+        bump = orderbook.bump,
+        constraint = orderbook.authority == matcher.key() @ ErrorCode::Unauthorized
     )]
     pub orderbook: Account<'info, OrderBook>,
 
-    #[account(mut, constraint = bid_order.side == OrderSide::Bid)]
+    #[account(
+        mut,
+        constraint = bid_order.side == OrderSide::Bid,
+        constraint = bid_order.market == orderbook.market @ ErrorCode::WrongOrderBook
+    )]
     pub bid_order: Account<'info, Order>,
 
-    #[account(mut, constraint = ask_order.side == OrderSide::Ask)]
+    #[account(
+        mut,
+        constraint = ask_order.side == OrderSide::Ask,
+        constraint = ask_order.market == orderbook.market @ ErrorCode::WrongOrderBook
+    )]
     pub ask_order: Account<'info, Order>,
 }
 
@@ -260,4 +284,10 @@ pub enum ErrorCode {
     InvalidOrder,
     #[msg("Bid price must be >= ask price")]
     PriceMismatch,
+
+    #[msg("Unauthorized")]
+    Unauthorized,
+
+    #[msg("Order belongs to a different order book")]
+    WrongOrderBook,
 }
