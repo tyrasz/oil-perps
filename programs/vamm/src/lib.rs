@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use perps_core::state::{Market, ProtocolConfig};
 
 declare_id!("3Vft6oJxPvHXELuqrPgCdPqJf1LxGpqDxBdqNhJxLZbm");
 
@@ -72,7 +73,9 @@ impl Vamm {
             return None;
         }
         // Round the quote reserve up so the trader never pays less than k requires
-        let new_quote_reserve = (self.k + new_base_reserve - 1) / new_base_reserve;
+        // ceil(k / n) without `k + n - 1`, which overflows for k near u128::MAX
+        let new_quote_reserve =
+            self.k / new_base_reserve + (self.k % new_base_reserve != 0) as u128;
         let quote_in = new_quote_reserve.checked_sub(self.quote_reserve)?;
         self.base_reserve = new_base_reserve;
         self.quote_reserve = new_quote_reserve;
@@ -225,11 +228,21 @@ pub mod vamm {
 
 #[derive(Accounts)]
 pub struct InitializeVamm<'info> {
+    /// Must be the perps-core admin: one vAMM per market, so a permissionless
+    /// init would let anyone squat it.
     #[account(mut)]
     pub authority: Signer<'info>,
 
-    /// CHECK: Market account from perps-core
-    pub market: AccountInfo<'info>,
+    #[account(
+        seeds = [ProtocolConfig::SEED],
+        bump = config.bump,
+        seeds::program = perps_core::ID,
+        constraint = config.admin == authority.key() @ ErrorCode::Unauthorized
+    )]
+    pub config: Box<Account<'info, ProtocolConfig>>,
+
+    /// The perps-core market this vAMM serves (owner checked by Account)
+    pub market: Box<Account<'info, Market>>,
 
     #[account(
         init,
@@ -245,23 +258,38 @@ pub struct InitializeVamm<'info> {
 
 #[derive(Accounts)]
 pub struct Trade<'info> {
-    /// Operator-only: trades post no collateral and closes aren't tied to
-    /// positions, so a public caller could move the reserves to any price.
+    /// Operator-only (the live perps-core admin): trades post no collateral
+    /// and closes aren't tied to positions, so a public caller could move the
+    /// reserves to any price.
     pub trader: Signer<'info>,
+
+    #[account(
+        seeds = [ProtocolConfig::SEED],
+        bump = config.bump,
+        seeds::program = perps_core::ID,
+        constraint = config.admin == trader.key() @ ErrorCode::Unauthorized
+    )]
+    pub config: Box<Account<'info, ProtocolConfig>>,
 
     #[account(
         mut,
         seeds = [b"vamm", vamm.market.as_ref()],
-        bump = vamm.bump,
-        constraint = vamm.authority == trader.key() @ ErrorCode::Unauthorized
+        bump = vamm.bump
     )]
     pub vamm: Account<'info, Vamm>,
 }
 
 #[derive(Accounts)]
 pub struct ManageLiquidity<'info> {
-    #[account(constraint = authority.key() == vamm.authority)]
     pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [ProtocolConfig::SEED],
+        bump = config.bump,
+        seeds::program = perps_core::ID,
+        constraint = config.admin == authority.key() @ ErrorCode::Unauthorized
+    )]
+    pub config: Box<Account<'info, ProtocolConfig>>,
 
     #[account(
         mut,
@@ -273,8 +301,15 @@ pub struct ManageLiquidity<'info> {
 
 #[derive(Accounts)]
 pub struct ManageVamm<'info> {
-    #[account(constraint = authority.key() == vamm.authority)]
     pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [ProtocolConfig::SEED],
+        bump = config.bump,
+        seeds::program = perps_core::ID,
+        constraint = config.admin == authority.key() @ ErrorCode::Unauthorized
+    )]
+    pub config: Box<Account<'info, ProtocolConfig>>,
 
     #[account(
         mut,
@@ -320,6 +355,19 @@ mod tests {
             bump: 0,
             is_active: true,
         }
+    }
+
+    #[test]
+    fn buying_base_near_the_k_limit_does_not_overflow() {
+        // init accepts any k that fits in u128; ceil(k / n) must not compute k + n - 1
+        let mut v = vamm(1, 0);
+        v.base_reserve = (1u128 << 64) + 1;
+        v.quote_reserve = (1u128 << 64) - 1;
+        v.k = u128::MAX;
+        // quote_in = ceil(k / 2^64) - (2^64 - 1) = 2^64 - (2^64 - 1) = 1
+        assert_eq!(v.buy_base(1), Some(1));
+        assert_eq!(v.base_reserve, 1u128 << 64);
+        assert_eq!(v.quote_reserve, 1u128 << 64);
     }
 
     #[test]

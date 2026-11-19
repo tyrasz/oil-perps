@@ -52,8 +52,9 @@ pub fn handler(ctx: Context<UpdateQuote>, params: UpdateQuoteParams) -> Result<(
     require!(new_ask_price > new_bid_price, MmRegistryError::InvalidPrice);
 
     // Check spread
-    let spread = ((new_ask_price - new_bid_price) as u128 * 10000 / new_bid_price as u128) as u32;
-    require!(spread <= registry.max_spread, MmRegistryError::SpreadTooWide);
+    // u128 compare: casting to u32 let a 2^32 bps spread wrap to 0 and pass
+    let spread = (new_ask_price - new_bid_price) as u128 * 10000 / new_bid_price as u128;
+    require!(spread <= registry.max_spread as u128, MmRegistryError::SpreadTooWide);
 
     // Update sizes if provided (can only increase, not decrease below remaining)
     let new_bid_size = params.bid_size.unwrap_or(quote.bid_size);
@@ -77,9 +78,11 @@ pub fn handler(ctx: Context<UpdateQuote>, params: UpdateQuoteParams) -> Result<(
 
     // Calculate new collateral requirement
     let old_collateral = quote.collateral_locked;
+    // Checked: a wrapped notional would release the quote's collateral
+    let notional = |size: u64, price: u64| u64::try_from(size as u128 * price as u128 / 1_000_000);
     let new_max_notional = std::cmp::max(
-        (new_bid_remaining as u128 * new_bid_price as u128 / 1_000_000) as u64,
-        (new_ask_remaining as u128 * new_ask_price as u128 / 1_000_000) as u64
+        notional(new_bid_remaining, new_bid_price).map_err(|_| MmRegistryError::MathOverflow)?,
+        notional(new_ask_remaining, new_ask_price).map_err(|_| MmRegistryError::MathOverflow)?,
     );
     let new_collateral_required = new_max_notional / 10;
 

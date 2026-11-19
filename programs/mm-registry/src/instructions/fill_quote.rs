@@ -197,6 +197,14 @@ pub fn handler(ctx: Context<FillQuote>, params: FillQuoteParams) -> Result<FillQ
 
         let registry = &mut ctx.accounts.registry;
         registry.active_quotes = registry.active_quotes.saturating_sub(1);
+
+        // Close it: cancel_quote only takes active quotes, so a filled one
+        // would otherwise live forever, and after deregister/re-register
+        // (quotes_posted restarts at 0) its PDA would block post_quote.
+        // Rent goes to the market_maker PDA and returns to the owner on
+        // deregister.
+        let market_maker_info = ctx.accounts.market_maker.to_account_info();
+        ctx.accounts.quote.close(market_maker_info)?;
     }
 
     // Update registry stats

@@ -3,7 +3,7 @@
 //! admin).
 
 use anchor_lang::{InstructionData, ToAccountMetas};
-use mm_registry::instructions::{FillQuoteParams, InitializeRegistryParams, PostQuoteParams};
+use mm_registry::instructions::{FillQuoteParams, InitializeRegistryParams, PostQuoteParams, UpdateQuoteParams};
 use mm_registry::MmRegistryError;
 use perps_core::instructions::{InitializeMarketParams, ProtocolRolesParams};
 use pyth_sdk_solana::state::{AccountType, PriceAccount, PriceInfo, PriceStatus, MAGIC, VERSION_2};
@@ -294,4 +294,29 @@ async fn fills_are_disabled_and_move_no_funds() {
     }
     assert_eq!(balance(&mut env.ctx, env.vault).await, Some(1_000 * USDC));
     assert_eq!(balance(&mut env.ctx, env.taker_tokens).await, Some(10_000 * USDC));
+}
+
+#[tokio::test]
+async fn update_quote_cannot_wrap_the_spread_check() {
+    let mut env = Env::new().await;
+    let admin = env.admin.insecure_clone();
+    let mint = env.mint;
+    env.init_registry(&admin, mint).await.unwrap();
+    env.register(1_000 * USDC).await;
+    env.post_quote(0).await.unwrap();
+
+    let mm = env.mm.insecure_clone();
+    let (registry, market_maker, quote) = (env.registry, env.market_maker, env.quote(0));
+    let update = |bid: u64, ask: u64| {
+        let accounts = mm_registry::accounts::UpdateQuote { owner: mm.pubkey(), registry, market_maker, quote };
+        let params = UpdateQuoteParams { bid_price: Some(bid), bid_size: None, ask_price: Some(ask), ask_size: None };
+        ix(mm_registry::ID, accounts, mm_registry::instruction::UpdateQuote { params })
+    };
+    // (ask - bid) * 10000 / bid == 2^32 bps, which used to truncate to 0 as u32
+    let wrapped = update(1_000_000, 1_000_000 + (1u64 << 32) * 100);
+    let result = send(&mut env.ctx, &[wrapped], &[&mm]).await;
+    assert_eq!(custom_error(result), mm_error(MmRegistryError::SpreadTooWide));
+    // A sane update still goes through
+    let ok = update(74_960_000, 75_000_000);
+    send(&mut env.ctx, &[ok], &[&mm]).await.unwrap();
 }

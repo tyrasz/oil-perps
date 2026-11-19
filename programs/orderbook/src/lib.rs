@@ -249,17 +249,25 @@ pub struct CancelOrder<'info> {
 
 #[derive(Accounts)]
 pub struct MatchOrders<'info> {
-    /// Only the book's authority may match: matching settles nothing yet (no
+    /// Only the perps-core admin may match: matching settles nothing yet (no
     /// funds or positions move), so a public matcher could mark anyone's order
-    /// filled and destroy it.
+    /// filled and destroy it. Checked against the live admin so it follows an
+    /// admin handover (orderbook.authority is a snapshot from init).
     #[account(mut)]
     pub matcher: Signer<'info>,
 
     #[account(
+        seeds = [ProtocolConfig::SEED],
+        bump = config.bump,
+        seeds::program = perps_core::ID,
+        constraint = config.admin == matcher.key() @ ErrorCode::Unauthorized
+    )]
+    pub config: Box<Account<'info, ProtocolConfig>>,
+
+    #[account(
         mut,
         seeds = [b"orderbook", orderbook.market.as_ref()],
-        bump = orderbook.bump,
-        constraint = orderbook.authority == matcher.key() @ ErrorCode::Unauthorized
+        bump = orderbook.bump
     )]
     pub orderbook: Account<'info, OrderBook>,
 
