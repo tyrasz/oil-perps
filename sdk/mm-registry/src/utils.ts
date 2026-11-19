@@ -1,4 +1,5 @@
 import { BN } from "@coral-xyz/anchor";
+import { Keypair } from "@solana/web3.js";
 
 // Price decimals (6 for USDC-style)
 export const PRICE_DECIMALS = 6;
@@ -81,7 +82,8 @@ export function calculateNotional(size: BN, price: BN): BN {
 }
 
 /**
- * Calculate collateral required (10% of notional)
+ * Calculate collateral required (10% of notional).
+ * @deprecated Quotes lock nothing; fills margin in perps-core (see venueMargin).
  */
 export function calculateCollateralRequired(notional: BN): BN {
   return notional.divn(10);
@@ -158,4 +160,97 @@ export function getExpirationTimestamp(secondsFromNow: number): BN {
  */
 export function isExpired(expiresAt: BN): boolean {
   return expiresAt.ltn(Math.floor(Date.now() / 1000));
+}
+
+// ============================================================================
+// Fills (perps-core venue_fill)
+// ============================================================================
+
+/** Longest a quote may live (mm-registry MAX_QUOTE_TTL_SECS) */
+export const MAX_QUOTE_TTL_SECS = 86_400;
+
+/** Compute budget for a taker's fill transaction */
+export const FILL_COMPUTE_UNITS = 300_000;
+
+/** Lifetime of the taker's one-shot approval */
+export const ONE_SHOT_APPROVAL_SECS = 120;
+
+const BPS = new BN(10_000);
+const ONE = new BN(PRICE_MULTIPLIER);
+
+function ceilDiv(a: BN, b: BN): BN {
+  return a.add(b).subn(1).div(b);
+}
+
+/**
+ * Collateral a venue fill posts for one side: mirrors perps-core's
+ * `venue_margin`, `max(notional_fill / lev, IM x notional_oracle) + adverse`,
+ * where adverse is the side's immediate loss at the oracle.
+ *
+ * `initialMarginBps` is the initial margin in force at fill time (the weekend
+ * value inside the pre-close window). Returns null when `leverage` is above
+ * what that margin allows.
+ */
+export function venueMargin(
+  isLong: boolean,
+  size: BN,
+  price: BN,
+  oracle: BN,
+  leverage: number,
+  initialMarginBps: number
+): BN | null {
+  if (leverage <= 0) return null;
+  const im = new BN(initialMarginBps);
+  const notionalFill = size.mul(price).div(ONE);
+  const notionalOracle = size.mul(oracle).div(ONE);
+  const base = ceilDiv(notionalFill.mul(new BN(1_000)), new BN(leverage));
+  if (base.lt(ceilDiv(notionalFill.mul(im), BPS))) return null;
+  const imOracle = ceilDiv(notionalOracle.mul(im), BPS);
+  // bn.js div truncates toward zero, like perps-core's i128 PnL
+  const diff = isLong ? oracle.sub(price) : price.sub(oracle);
+  const pnl = size.mul(diff).div(ONE);
+  const adverse = pnl.isNeg() ? pnl.neg() : new BN(0);
+  return BN.max(base, imOracle).add(adverse);
+}
+
+/**
+ * The most collateral a fill at `price` can post at any oracle the venue's
+ * band (`bandBps`) accepts: the allowance for a one-shot taker approval.
+ * venueMargin is convex in the oracle, so the band's two ends bound it.
+ */
+export function worstCaseVenueMargin(
+  isLong: boolean,
+  size: BN,
+  price: BN,
+  leverage: number,
+  initialMarginBps: number,
+  bandBps: number
+): BN | null {
+  const b = new BN(bandBps);
+  // within_band: |price - oracle| * 10_000 <= oracle * band
+  const lo = ceilDiv(price.mul(BPS), BPS.add(b));
+  const hi = price.mul(BPS).div(BPS.sub(b));
+  let worst: BN | null = null;
+  for (const oracle of [lo, price, hi]) {
+    const margin = venueMargin(isLong, size, price, oracle, leverage, initialMarginBps);
+    if (margin === null) return null;
+    if (worst === null || margin.gt(worst)) worst = margin;
+  }
+  return worst;
+}
+
+/**
+ * A random u64 for FillQuoteParams.positionNonce. A reused nonce only makes
+ * that fill fail, but a counter would let any other fill landing first
+ * invalidate a transaction already built.
+ */
+export function randomPositionNonce(): BN {
+  const bytes = new Uint8Array(8);
+  const webCrypto = (globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array } }).crypto;
+  if (webCrypto && webCrypto.getRandomValues) {
+    webCrypto.getRandomValues(bytes);
+  } else {
+    bytes.set(Keypair.generate().publicKey.toBytes().subarray(0, 8));
+  }
+  return new BN(Buffer.from(bytes), "le");
 }

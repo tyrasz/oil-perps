@@ -21,6 +21,13 @@ use solana_sdk::{
     transaction::{Transaction, TransactionError},
 };
 
+#[allow(dead_code)]
+#[path = "support/market_env.rs"]
+mod support;
+// venue_fill, driven through a relay venue on the shared harness
+#[path = "venue/mod.rs"]
+mod venue;
+
 const USDC: u64 = 1_000_000;
 /// Stands in for the Pyth program: owner of every test price feed.
 const PYTH_PROGRAM: Pubkey = Pubkey::new_from_array([0x50; 32]);

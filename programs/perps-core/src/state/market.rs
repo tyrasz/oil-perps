@@ -219,7 +219,7 @@ pub fn liquidation_payout(fund: u64, remaining_collateral: u64, deficit: u64, re
     (from_collateral + top_up, fund, uncovered)
 }
 
-fn ceil_div(a: u128, b: u128) -> u128 {
+pub(crate) fn ceil_div(a: u128, b: u128) -> u128 {
     (a + b - 1) / b
 }
 

@@ -22,25 +22,27 @@ pub struct MarketMaker {
     /// MM's collateral token account
     pub collateral_account: Pubkey,
 
-    /// Total collateral deposited
+    /// Total collateral deposited. The vault is a registration bond only:
+    /// fills margin from the MM's own perps-core UserAccount.
     pub collateral_deposited: u64,
 
-    /// Collateral locked in active quotes
+    /// Collateral locked in legacy quotes; only ever released now
     pub collateral_locked: u64,
 
     /// Available collateral (deposited - locked)
     pub collateral_available: u64,
 
-    /// Current inventory position (positive = long, negative = short)
+    /// Deprecated, always 0: fills open perps-core positions owned by the MM's
+    /// wallet, which hold the inventory and PnL. Kept for the account layout.
     pub inventory: i64,
 
-    /// Average entry price of inventory
+    /// Deprecated, always 0
     pub avg_inventory_price: u64,
 
-    /// Unrealized PnL from inventory
+    /// Deprecated, always 0
     pub unrealized_pnl: i64,
 
-    /// Realized PnL (historical)
+    /// Deprecated, always 0
     pub realized_pnl: i64,
 
     /// Total volume traded
@@ -49,7 +51,8 @@ pub struct MarketMaker {
     /// Total number of fills
     pub total_fills: u64,
 
-    /// Total fees paid
+    /// Total fees paid. No fee is charged at fill (perps-core charges the
+    /// taker fee on close), so this no longer grows.
     pub total_fees_paid: u64,
 
     /// Registration timestamp

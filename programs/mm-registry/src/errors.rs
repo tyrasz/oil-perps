@@ -62,9 +62,22 @@ pub enum MmRegistryError {
     #[msg("Has open inventory - close it first")]
     HasOpenInventory,
 
+    /// Unused since fills settle into perps-core positions; kept so later codes don't shift
     #[msg("Quote fills are disabled until they settle into perps-core positions")]
     FillsDisabled,
 
     #[msg("Collateral mint must be the market's collateral mint")]
     InvalidCollateralMint,
+
+    #[msg("Quote price is worse than the taker's limit")]
+    PriceWorseThanLimit,
+
+    #[msg("Legacy quote: set a leverage and expiry with update_quote")]
+    QuoteNotFillable,
+
+    #[msg("Taker cannot fill their own quote")]
+    SelfTrade,
+
+    #[msg("Market is not this registry's market")]
+    WrongMarket,
 }

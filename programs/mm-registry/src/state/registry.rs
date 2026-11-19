@@ -25,7 +25,8 @@ pub struct MmRegistry {
     /// Maximum quote size
     pub max_quote_size: u64,
 
-    /// Fee charged to MMs per fill (basis points)
+    /// Reserved: no fee is charged at fill. perps-core charges its taker fee
+    /// on each leg when it is closed.
     pub mm_fee: u32,
 
     /// Total registered market makers
@@ -37,7 +38,7 @@ pub struct MmRegistry {
     /// Total volume traded through MMs
     pub total_volume: u64,
 
-    /// Total fees collected
+    /// Total fees collected; no longer grows (see `mm_fee`)
     pub total_fees: u64,
 
     /// Whether registry is accepting new MMs

@@ -37,6 +37,7 @@ export interface MmRegistry {
   maxSpread: number;
   minQuoteSize: BN;
   maxQuoteSize: BN;
+  /** Reserved: no fee is charged at fill */
   mmFee: number;
   totalMms: number;
   activeQuotes: number;
@@ -47,7 +48,11 @@ export interface MmRegistry {
   bump: number;
 }
 
-/** Mirrors programs/mm-registry/src/state/market_maker.rs (field order matters for memcmp) */
+/**
+ * Mirrors programs/mm-registry/src/state/market_maker.rs (field order matters for memcmp).
+ * inventory, avgInventoryPrice, unrealizedPnl and realizedPnl are deprecated and
+ * always 0: fills open perps-core positions owned by the MM's wallet.
+ */
 export interface MarketMaker {
   owner: PublicKey;
   registry: PublicKey;
@@ -86,6 +91,7 @@ export interface Quote {
   bump: number;
 }
 
+/** Mirrors programs/mm-registry/src/state/quote.rs (field order matters for memcmp) */
 export interface TwoSidedQuote {
   marketMaker: PublicKey;
   registry: PublicKey;
@@ -95,12 +101,17 @@ export interface TwoSidedQuote {
   askPrice: BN;
   askSize: BN;
   askRemaining: BN;
+  minFillSize: BN;
+  /** Only legacy quotes lock collateral; new quotes lock nothing */
   collateralLocked: BN;
-  isActive: boolean;
   createdAt: BN;
-  updatedAt: BN;
+  /** 0 only on legacy quotes, which cannot be filled until update_quote sets an expiry */
   expiresAt: BN;
+  updatedAt: BN;
+  isActive: boolean;
   bump: number;
+  /** MM's leverage for fills of this quote (3 decimals, 10x = 10_000); 0 on legacy quotes */
+  leverage: number;
 }
 
 // ============================================================================
@@ -121,25 +132,56 @@ export interface PostQuoteParams {
   askPrice: BN;
   askSize: BN;
   minFillSize: BN;
-  /** Seconds until expiry; 0 = no expiry */
+  /** Seconds until expiry, 1..=MAX_QUOTE_TTL_SECS */
   expiresIn: BN;
+  /** MM's leverage for fills (3 decimals, 10x = 10_000), > 0; perps-core caps it */
+  leverage: number;
 }
 
+/** null leaves a field unchanged. Any update releases a legacy quote's lock. */
 export interface UpdateQuoteParams {
   bidPrice: BN | null;
   bidSize: BN | null;
   askPrice: BN | null;
   askSize: BN | null;
+  /** > 0 */
+  leverage: number | null;
+  /** New expiry, this many seconds from now: 1..=MAX_QUOTE_TTL_SECS */
+  expiresIn: BN | null;
 }
 
 /**
- * Note: fills are disabled on-chain (FillsDisabled) until they settle into
- * perps-core positions.
+ * A fill opens a taker position and the opposite MM position in perps-core,
+ * each margined from its owner's perps-core UserAccount.
  */
 export interface FillQuoteParams {
   size: BN;
-  /** true = taker buys (fills the MM's ask), false = taker sells (fills the bid) */
+  /** true = taker goes long against the ask, false = taker goes short against the bid */
   isBuy: boolean;
+  /** > 0. Buy: ask <= limit; sell: bid >= limit. Guards against a repriced quote. */
+  limitPrice: BN;
+  /** Taker's leverage (3 decimals) */
+  takerLeverage: number;
+  /** Fill what remains instead of failing when size > remaining */
+  allowPartial: boolean;
+  /** Seeds the taker's position PDA; pick a random u64 (see randomPositionNonce) */
+  positionNonce: BN;
+}
+
+/** Mirrors perps-core's VenueApprovalParams */
+export interface VenueApprovalParams {
+  /** Collateral the venue may still commit for this owner; spent down by fills */
+  allowance: BN;
+  /** 3 decimals, 1..=market max leverage */
+  maxLeverage: number;
+  /** 0 = none; applies when the owner goes long */
+  maxBuyPrice: BN;
+  /** 0 = none; applies when the owner goes short */
+  minSellPrice: BN;
+  /** Adverse deviation from the oracle, 0..=10_000 bps; 0 = off */
+  maxPriceDeviationBps: number;
+  /** Unix seconds; at most 90 days out */
+  expiresAt: BN;
 }
 
 // ============================================================================
@@ -149,6 +191,7 @@ export interface FillQuoteParams {
 export interface FillQuoteResult {
   fillPrice: BN;
   fillSize: BN;
+  /** Always 0: perps-core charges its taker fee on each leg at close */
   fee: BN;
 }
 

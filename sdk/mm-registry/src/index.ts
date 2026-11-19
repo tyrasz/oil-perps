@@ -1,5 +1,12 @@
 // Main client
-export { MmRegistryClient, MM_REGISTRY_PROGRAM_ID } from "./client";
+export {
+  MmRegistryClient,
+  MM_REGISTRY_PROGRAM_ID,
+  PerpsMarketInfo,
+  VenueInfo,
+  TakerFillOptions,
+  TakerFill,
+} from "./client";
 
 // Types
 export {
@@ -17,6 +24,7 @@ export {
   PostQuoteParams,
   UpdateQuoteParams,
   FillQuoteParams,
+  VenueApprovalParams,
   // Result types
   FillQuoteResult,
   // SDK types
@@ -33,6 +41,19 @@ export {
   findMmCollateralPda,
   findQuotePda,
   getMarketMakerPdas,
+  // perps-core
+  PERPS_CORE_PROGRAM_ID,
+  BPF_LOADER_UPGRADEABLE_PROGRAM_ID,
+  PERPS_SEEDS,
+  VenueRole,
+  findPerpsConfigPda,
+  findPerpsUserPda,
+  findVenuePda,
+  findVenueAuthorityPda,
+  findProgramDataPda,
+  findVenueApprovalPda,
+  findVPositionPda,
+  findVMakerPda,
 } from "./pda";
 
 // Utility functions
@@ -66,4 +87,11 @@ export {
   isExpired,
   // Timestamp functions
   getExpirationTimestamp,
+  // Fills
+  MAX_QUOTE_TTL_SECS,
+  FILL_COMPUTE_UNITS,
+  ONE_SHOT_APPROVAL_SECS,
+  venueMargin,
+  worstCaseVenueMargin,
+  randomPositionNonce,
 } from "./utils";

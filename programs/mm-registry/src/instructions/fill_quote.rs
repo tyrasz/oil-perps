@@ -1,24 +1,35 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer};
-use crate::state::{MmRegistry, MarketMaker, TwoSidedQuote};
+use perps_core::instructions::VenueFillParams;
+use crate::state::{MmRegistry, MarketMaker, MmStatus, TwoSidedQuote};
 use crate::errors::MmRegistryError;
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
 pub struct FillQuoteParams {
     pub size: u64,
-    pub is_buy: bool,  // true = taker is buying (fills MM's ask), false = taker is selling (fills MM's bid)
+    pub is_buy: bool,        // true: taker long vs the ask (MM short); false: taker short vs the bid (MM long)
+    // Guards the taker against an update_quote landing first: buy needs ask <= limit, sell bid >= limit
+    pub limit_price: u64,
+    pub taker_leverage: u32, // 3 decimals
+    pub allow_partial: bool, // fill what remains instead of failing when size > remaining
+    // Seeds the taker's perps-core position; clients pick a random u64
+    pub position_nonce: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct FillQuoteResult {
     pub fill_price: u64,
     pub fill_size: u64,
-    pub fee: u64,
+    pub fee: u64, // Always 0: perps-core charges its taker fee on close
 }
 
+/// Fill a quote by opening a taker position and the opposite MM position in
+/// perps-core (`venue_fill`), each margined from its owner's own UserAccount
+/// and bounded by its owner's VenueApproval. No tokens move here.
 #[derive(Accounts)]
 pub struct FillQuote<'info> {
-    /// The taker (trader) filling the quote
+    /// Also perps-core's payer: being in a Signer slot of the CPI is what makes
+    /// the taker count towards the venue's `min_signers` (Anchor's CPI passes
+    /// the UncheckedAccount `taker` slot as a non-signer).
     #[account(mut)]
     pub taker: Signer<'info>,
 
@@ -28,173 +39,143 @@ pub struct FillQuote<'info> {
         bump = registry.bump,
         constraint = registry.is_trading_enabled @ MmRegistryError::TradingDisabled
     )]
-    pub registry: Account<'info, MmRegistry>,
+    pub registry: Box<Account<'info, MmRegistry>>,
 
     #[account(
         mut,
         seeds = [b"market_maker", registry.key().as_ref(), market_maker.owner.as_ref()],
-        bump = market_maker.bump
+        bump = market_maker.bump,
+        constraint = market_maker.status == MmStatus::Active @ MmRegistryError::MarketMakerNotActive
     )]
-    pub market_maker: Account<'info, MarketMaker>,
+    pub market_maker: Box<Account<'info, MarketMaker>>,
 
     #[account(
         mut,
         constraint = quote.market_maker == market_maker.key() @ MmRegistryError::Unauthorized,
+        constraint = quote.registry == registry.key() @ MmRegistryError::Unauthorized,
         constraint = quote.is_active @ MmRegistryError::QuoteNotActive
     )]
-    pub quote: Account<'info, TwoSidedQuote>,
+    pub quote: Box<Account<'info, TwoSidedQuote>>,
 
-    #[account(
-        mut,
-        seeds = [b"mm_collateral", market_maker.key().as_ref()],
-        bump
-    )]
-    pub mm_collateral_account: Account<'info, TokenAccount>,
+    /// CHECK: the MM's wallet, which owns the maker position
+    #[account(address = market_maker.owner @ MmRegistryError::Unauthorized)]
+    pub mm_owner: UncheckedAccount<'info>,
 
-    #[account(
-        mut,
-        constraint = taker_token_account.owner == taker.key(),
-        constraint = taker_token_account.mint == registry.collateral_mint
-    )]
-    pub taker_token_account: Account<'info, TokenAccount>,
+    /// CHECK: signs the venue_fill CPI; perps-core checks it is this venue's authority
+    #[account(seeds = [b"perps_venue", registry.market.as_ref()], bump)]
+    pub venue_authority: UncheckedAccount<'info>,
 
-    pub token_program: Program<'info, Token>,
+    /// CHECK: perps-core validates
+    pub perps_config: UncheckedAccount<'info>,
+
+    /// CHECK: perps-core validates
+    #[account(mut)]
+    pub perps_venue: UncheckedAccount<'info>,
+
+    /// CHECK: perps-core validates
+    pub venue_program_data: UncheckedAccount<'info>,
+
+    /// CHECK: must be this registry's market; perps-core validates the rest.
+    /// Never a typed Account here: the CPI mutates it.
+    #[account(mut, address = registry.market @ MmRegistryError::WrongMarket)]
+    pub market: UncheckedAccount<'info>,
+
+    /// CHECK: perps-core validates
+    pub pyth_price_feed: UncheckedAccount<'info>,
+
+    /// CHECK: perps-core validates
+    #[account(mut)]
+    pub taker_user: UncheckedAccount<'info>,
+
+    /// CHECK: perps-core validates
+    #[account(mut)]
+    pub taker_approval: UncheckedAccount<'info>,
+
+    /// CHECK: perps-core inits
+    #[account(mut)]
+    pub taker_position: UncheckedAccount<'info>,
+
+    /// CHECK: perps-core validates
+    #[account(mut)]
+    pub mm_user: UncheckedAccount<'info>,
+
+    /// CHECK: perps-core validates
+    #[account(mut)]
+    pub mm_approval: UncheckedAccount<'info>,
+
+    /// CHECK: perps-core inits
+    #[account(mut)]
+    pub mm_position: UncheckedAccount<'info>,
+
+    pub perps_core_program: Program<'info, perps_core::program::PerpsCore>,
+    pub system_program: Program<'info, System>,
 }
 
-/// Fills are disabled. As written, a fill only moves cash between the taker
-/// and the MM's vault: a taker "selling" into a bid is paid the full notional
-/// without delivering anything, and a buyer pays and receives no position.
-/// They must settle into perps-core positions before being enabled.
-pub const FILLS_ENABLED: bool = false;
-
 pub fn handler(ctx: Context<FillQuote>, params: FillQuoteParams) -> Result<FillQuoteResult> {
-    require!(FILLS_ENABLED, MmRegistryError::FillsDisabled);
-    let quote = &ctx.accounts.quote;
-    let registry = &ctx.accounts.registry;
+    let bump = *ctx.bumps.get("venue_authority").unwrap();
     let current_time = Clock::get()?.unix_timestamp;
+    let quote = &ctx.accounts.quote;
 
-    // Validate quote is still valid
     require!(quote.is_valid(current_time), MmRegistryError::QuoteExpired);
+    // Legacy quotes (no leverage, no expiry) must be migrated with update_quote
+    require!(quote.leverage > 0 && quote.expires_at > 0, MmRegistryError::QuoteNotFillable);
+    require!(ctx.accounts.taker.key() != ctx.accounts.market_maker.owner, MmRegistryError::SelfTrade);
+    require!(params.limit_price > 0, MmRegistryError::InvalidPrice);
 
-    // Determine fill price and validate size
-    let (fill_price, max_size) = if params.is_buy {
-        // Taker buying = filling MM's ask
+    let (fill_price, remaining) = if params.is_buy {
         (quote.ask_price, quote.ask_remaining)
     } else {
-        // Taker selling = filling MM's bid
         (quote.bid_price, quote.bid_remaining)
     };
+    require!(remaining > 0, MmRegistryError::FillSizeExceedsRemaining);
+    let within_limit = if params.is_buy { fill_price <= params.limit_price } else { fill_price >= params.limit_price };
+    require!(within_limit, MmRegistryError::PriceWorseThanLimit);
 
-    require!(params.size >= quote.min_fill_size, MmRegistryError::FillSizeTooSmall);
-    require!(params.size <= max_size, MmRegistryError::FillSizeExceedsRemaining);
-
-    // Calculate notional and fee
-    let notional = (params.size as u128 * fill_price as u128 / 1_000_000) as u64;
-    let fee = (notional * registry.mm_fee as u64) / 10000;
-
-    // Process the fill based on direction
-    if params.is_buy {
-        // Taker buys from MM (MM sells/goes short)
-        // Taker pays notional + fee, MM receives notional
-        let taker_pays = notional + fee;
-
-        // Transfer from taker to MM collateral
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.taker_token_account.to_account_info(),
-            to: ctx.accounts.mm_collateral_account.to_account_info(),
-            authority: ctx.accounts.taker.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts
-        );
-        token::transfer(cpi_ctx, taker_pays)?;
-
-        // Update quote
-        let quote = &mut ctx.accounts.quote;
-        quote.ask_remaining = quote.ask_remaining.saturating_sub(params.size);
-        quote.updated_at = current_time;
-
-        if quote.bid_remaining == 0 && quote.ask_remaining == 0 {
-            quote.is_active = false;
-        }
-
-        // Update MM inventory (MM is selling/shorting)
-        let market_maker = &mut ctx.accounts.market_maker;
-        market_maker.update_inventory(params.size as i64, fill_price, false);
-        market_maker.collateral_deposited += notional; // MM receives payment
+    let fill_size = if params.size <= remaining {
+        params.size
+    } else if params.allow_partial {
+        remaining
     } else {
-        // Taker sells to MM (MM buys/goes long)
-        // MM pays notional, taker receives notional - fee
-        let taker_receives = notional.saturating_sub(fee);
-
-        // Transfer from MM collateral to taker
-        // The vault's SPL owner is the market_maker PDA (see register_mm)
-        let registry_key = ctx.accounts.registry.key();
-        let owner_key = ctx.accounts.market_maker.owner;
-        let mm_bump = ctx.accounts.market_maker.bump;
-        let seeds = &[
-            b"market_maker".as_ref(),
-            registry_key.as_ref(),
-            owner_key.as_ref(),
-            &[mm_bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.mm_collateral_account.to_account_info(),
-            to: ctx.accounts.taker_token_account.to_account_info(),
-            authority: ctx.accounts.market_maker.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signer
-        );
-        token::transfer(cpi_ctx, taker_receives)?;
-
-        // Update quote
-        let quote = &mut ctx.accounts.quote;
-        quote.bid_remaining = quote.bid_remaining.saturating_sub(params.size);
-        quote.updated_at = current_time;
-
-        if quote.bid_remaining == 0 && quote.ask_remaining == 0 {
-            quote.is_active = false;
-        }
-
-        // Update MM inventory (MM is buying/going long)
-        let market_maker = &mut ctx.accounts.market_maker;
-        market_maker.update_inventory(params.size as i64, fill_price, true);
-        market_maker.collateral_deposited = market_maker.collateral_deposited.saturating_sub(notional);
-    }
-
-    // Update MM stats
-    let market_maker = &mut ctx.accounts.market_maker;
-    market_maker.total_volume += notional;
-    market_maker.total_fills += 1;
-    market_maker.total_fees_paid += fee;
-    market_maker.last_active_at = current_time;
-
-    // Recalculate locked collateral based on remaining quote sizes
-    let quote = &ctx.accounts.quote;
-    let new_max_notional = std::cmp::max(
-        (quote.bid_remaining as u128 * quote.bid_price as u128 / 1_000_000) as u64,
-        (quote.ask_remaining as u128 * quote.ask_price as u128 / 1_000_000) as u64
+        return Err(MmRegistryError::FillSizeExceedsRemaining.into());
+    };
+    // The last tail may be below min_fill_size, or it could never be filled
+    require!(
+        fill_size > 0 && (fill_size >= quote.min_fill_size || fill_size == remaining),
+        MmRegistryError::FillSizeTooSmall
     );
-    let new_collateral_locked = new_max_notional / 10;
-    let collateral_freed = quote.collateral_locked.saturating_sub(new_collateral_locked);
+    let notional = u64::try_from(fill_size as u128 * fill_price as u128 / 1_000_000)
+        .map_err(|_| MmRegistryError::MathOverflow)?;
 
-    let market_maker = &mut ctx.accounts.market_maker;
-    market_maker.unlock_collateral(collateral_freed);
-    // Record the new lock so later fills and cancel don't unlock it again
-    ctx.accounts.quote.collateral_locked = new_collateral_locked;
+    cpi_venue_fill(&ctx.accounts, bump, VenueFillParams {
+        size: fill_size,
+        price: fill_price,
+        taker_side: if params.is_buy { 0 } else { 1 },
+        taker_leverage: params.taker_leverage,
+        maker_leverage: quote.leverage,
+        position_nonce: params.position_nonce,
+    })?;
 
-    // Check if quote is fully filled
     let quote = &mut ctx.accounts.quote;
-    if !quote.is_active {
+    if params.is_buy {
+        quote.ask_remaining -= fill_size;
+    } else {
+        quote.bid_remaining -= fill_size;
+    }
+    quote.updated_at = current_time;
+    let exhausted = quote.bid_remaining == 0 && quote.ask_remaining == 0;
+
+    // Stats only: saturate rather than fail a fill that perps-core accepted
+    let market_maker = &mut ctx.accounts.market_maker;
+    market_maker.total_volume = market_maker.total_volume.saturating_add(notional);
+    market_maker.total_fills = market_maker.total_fills.saturating_add(1);
+    market_maker.last_active_at = current_time;
+    let registry = &mut ctx.accounts.registry;
+    registry.total_volume = registry.total_volume.saturating_add(notional);
+
+    if exhausted {
+        ctx.accounts.quote.is_active = false;
         let market_maker = &mut ctx.accounts.market_maker;
         market_maker.active_quotes = market_maker.active_quotes.saturating_sub(1);
-
         let registry = &mut ctx.accounts.registry;
         registry.active_quotes = registry.active_quotes.saturating_sub(1);
 
@@ -207,22 +188,44 @@ pub fn handler(ctx: Context<FillQuote>, params: FillQuoteParams) -> Result<FillQ
         ctx.accounts.quote.close(market_maker_info)?;
     }
 
-    // Update registry stats
-    let registry = &mut ctx.accounts.registry;
-    registry.total_volume += notional;
-    registry.total_fees += fee;
-
     msg!(
-        "Quote filled: {} {} @ {}, fee={}",
+        "Quote filled: {} {} @ {}",
         if params.is_buy { "BUY" } else { "SELL" },
-        params.size,
-        fill_price,
-        fee
+        fill_size,
+        fill_price
     );
 
-    Ok(FillQuoteResult {
-        fill_price,
-        fill_size: params.size,
-        fee,
-    })
+    Ok(FillQuoteResult { fill_price, fill_size, fee: 0 })
+}
+
+/// perps-core `venue_fill`, signed by this program's venue authority for the
+/// registry's market. The taker fills both the `payer` and `taker` slots; see
+/// `FillQuote::taker`.
+#[inline(never)]
+fn cpi_venue_fill<'info>(a: &FillQuote<'info>, bump: u8, params: VenueFillParams) -> Result<()> {
+    let market = a.registry.market;
+    let bump = [bump];
+    let seeds: &[&[u8]] = &[b"perps_venue", market.as_ref(), &bump];
+    let accounts = perps_core::cpi::accounts::VenueFill {
+        venue_authority: a.venue_authority.to_account_info(),
+        payer: a.taker.to_account_info(),
+        config: a.perps_config.to_account_info(),
+        market: a.market.to_account_info(),
+        venue: a.perps_venue.to_account_info(),
+        venue_program_data: a.venue_program_data.to_account_info(),
+        pyth_price_feed: a.pyth_price_feed.to_account_info(),
+        taker: a.taker.to_account_info(),
+        taker_user: a.taker_user.to_account_info(),
+        taker_approval: a.taker_approval.to_account_info(),
+        taker_position: a.taker_position.to_account_info(),
+        maker: a.mm_owner.to_account_info(),
+        maker_user: a.mm_user.to_account_info(),
+        maker_approval: a.mm_approval.to_account_info(),
+        maker_position: a.mm_position.to_account_info(),
+        system_program: a.system_program.to_account_info(),
+    };
+    perps_core::cpi::venue_fill(
+        CpiContext::new_with_signer(a.perps_core_program.to_account_info(), accounts, &[seeds]),
+        params,
+    )
 }

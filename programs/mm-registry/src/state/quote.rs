@@ -131,6 +131,10 @@ impl Quote {
     }
 }
 
+/// Longest a quote may live. Fills are priced off the quote, not the oracle,
+/// so a forgotten quote must not stay fillable for long.
+pub const MAX_QUOTE_TTL_SECS: i64 = 86_400;
+
 /// Two-sided quote (bid and ask together)
 #[account]
 #[derive(Default)]
@@ -162,13 +166,14 @@ pub struct TwoSidedQuote {
     /// Minimum fill size
     pub min_fill_size: u64,
 
-    /// Collateral locked
+    /// Collateral locked. Only legacy quotes have any: fills margin from the
+    /// MM's perps-core account, so new quotes lock nothing.
     pub collateral_locked: u64,
 
     /// Quote creation timestamp
     pub created_at: i64,
 
-    /// Quote expiry timestamp (0 = no expiry)
+    /// Quote expiry timestamp. 0 only on legacy quotes, which cannot be filled.
     pub expires_at: i64,
 
     /// Last update timestamp
@@ -178,6 +183,10 @@ pub struct TwoSidedQuote {
     pub is_active: bool,
 
     pub bump: u8,
+
+    /// The MM's leverage for fills of this quote (3 decimals, 10x = 10_000).
+    /// 0 only on legacy quotes, which cannot be filled.
+    pub leverage: u32,
 }
 
 impl TwoSidedQuote {
@@ -197,7 +206,8 @@ impl TwoSidedQuote {
         8 +   // updated_at
         1 +   // is_active
         1 +   // bump
-        32;   // padding
+        4 +   // leverage
+        28;   // padding
 
     /// Calculate spread (basis points)
     pub fn spread(&self) -> u32 {
@@ -223,5 +233,18 @@ impl TwoSidedQuote {
         }
 
         self.bid_remaining > 0 || self.ask_remaining > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_sided_quote_len_is_unchanged() {
+        // `leverage` came out of the padding, so existing accounts need no realloc
+        let serialized = TwoSidedQuote::default().try_to_vec().unwrap().len();
+        assert_eq!(TwoSidedQuote::LEN, 194);
+        assert_eq!(TwoSidedQuote::LEN, 8 + serialized + 28);
     }
 }

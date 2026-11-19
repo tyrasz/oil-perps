@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use crate::state::{MmRegistry, MarketMaker, TwoSidedQuote, MmStatus};
+use crate::state::{MmRegistry, MarketMaker, TwoSidedQuote, MmStatus, MAX_QUOTE_TTL_SECS};
 use crate::errors::MmRegistryError;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
@@ -9,7 +9,8 @@ pub struct PostQuoteParams {
     pub ask_price: u64,
     pub ask_size: u64,
     pub min_fill_size: u64,
-    pub expires_in: i64,  // Seconds until expiry (0 = no expiry)
+    pub expires_in: i64,  // Seconds until expiry, 1..=MAX_QUOTE_TTL_SECS
+    pub leverage: u32,    // MM's leverage for fills (3 decimals); perps-core caps it
 }
 
 #[derive(Accounts)]
@@ -72,17 +73,12 @@ pub fn handler(ctx: Context<PostQuote>, params: PostQuoteParams) -> Result<()> {
         MmRegistryError::MaxQuotesReached
     );
 
-    // Calculate collateral requirement (10% of max potential exposure)
-    let notional = |size: u64, price: u64| u64::try_from(size as u128 * price as u128 / 1_000_000);
-    let max_notional = std::cmp::max(
-        notional(params.bid_size, params.bid_price).map_err(|_| MmRegistryError::MathOverflow)?,
-        notional(params.ask_size, params.ask_price).map_err(|_| MmRegistryError::MathOverflow)?,
-    );
-    let collateral_required = max_notional / 10;
-
+    // Nothing is locked: each fill margins from the MM's perps-core account
+    // and approval, checked atomically at fill time
+    require!(params.leverage > 0, MmRegistryError::InvalidQuoteParams);
     require!(
-        market_maker.has_available_collateral(collateral_required),
-        MmRegistryError::InsufficientCollateral
+        params.expires_in > 0 && params.expires_in <= MAX_QUOTE_TTL_SECS,
+        MmRegistryError::InvalidQuoteParams
     );
 
     let current_time = Clock::get()?.unix_timestamp;
@@ -101,22 +97,18 @@ pub fn handler(ctx: Context<PostQuote>, params: PostQuoteParams) -> Result<()> {
     quote.ask_remaining = params.ask_size;
 
     quote.min_fill_size = params.min_fill_size;
-    quote.collateral_locked = collateral_required;
+    quote.collateral_locked = 0;
 
     quote.created_at = current_time;
-    quote.expires_at = if params.expires_in > 0 {
-        current_time + params.expires_in
-    } else {
-        0
-    };
+    quote.expires_at = current_time + params.expires_in;
     quote.updated_at = current_time;
 
     quote.is_active = true;
     quote.bump = *ctx.bumps.get("quote").unwrap();
+    quote.leverage = params.leverage;
 
     // Update market maker
     let market_maker = &mut ctx.accounts.market_maker;
-    market_maker.lock_collateral(collateral_required);
     market_maker.active_quotes += 1;
     market_maker.quotes_posted += 1;
     market_maker.last_active_at = current_time;

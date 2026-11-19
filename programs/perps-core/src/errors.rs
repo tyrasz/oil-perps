@@ -98,4 +98,56 @@ pub enum PerpsError {
 
     #[msg("Price feed is not owned by the configured oracle program")]
     InvalidOracleAccount,
+
+    // Venue fills. Appended so existing codes stay put.
+    #[msg("Signer is not the venue's authority")]
+    VenueUnauthorized,
+
+    #[msg("Venue is disabled")]
+    VenueDisabled,
+
+    #[msg("Venue program was upgraded since it was registered; the admin must re-attest")]
+    VenueProgramChanged,
+
+    #[msg("Venue fills are paused protocol-wide")]
+    VenueFillsPaused,
+
+    #[msg("Invalid venue parameters")]
+    InvalidVenueParams,
+
+    #[msg("Invalid fill parameters")]
+    InvalidFillParams,
+
+    #[msg("Fill price is outside the venue's band around the oracle")]
+    FillPriceOutOfBand,
+
+    #[msg("Fill notional exceeds the venue's per-fill cap")]
+    FillTooLarge,
+
+    #[msg("Taker and maker are the same wallet")]
+    SelfTrade,
+
+    #[msg("Not enough of taker and maker signed")]
+    MissingSigner,
+
+    #[msg("Venue approval has expired")]
+    ApprovalExpired,
+
+    #[msg("Fill would commit more collateral than the approval allows")]
+    ApprovalAllowanceExceeded,
+
+    #[msg("Leverage exceeds the approval's maximum")]
+    ApprovalLeverageExceeded,
+
+    #[msg("Fill price is beyond the approval's limit price")]
+    ApprovalLimitPrice,
+
+    #[msg("Fill price deviates too far from the oracle for the approval")]
+    ApprovalPriceDeviation,
+
+    #[msg("Invalid venue approval parameters")]
+    InvalidApprovalParams,
+
+    #[msg("Venue fill would open a position below initial margin")]
+    VenueMarginInvariant,
 }

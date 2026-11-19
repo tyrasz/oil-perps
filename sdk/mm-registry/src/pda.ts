@@ -8,6 +8,37 @@ export const SEEDS = {
   QUOTE: Buffer.from("quote"),
 } as const;
 
+/** perps-core, which fill_quote settles into */
+export const PERPS_CORE_PROGRAM_ID = new PublicKey(
+  "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
+);
+
+export const BPF_LOADER_UPGRADEABLE_PROGRAM_ID = new PublicKey(
+  "BPFLoaderUpgradeab1e11111111111111111111111"
+);
+
+export const PERPS_SEEDS = {
+  CONFIG: Buffer.from("config"),
+  USER: Buffer.from("user"),
+  VENUE: Buffer.from("venue"),
+  VENUE_AUTHORITY: Buffer.from("perps_venue"),
+  VENUE_APPROVAL: Buffer.from("venue_approval"),
+  VPOSITION: Buffer.from("vposition"),
+  VMAKER: Buffer.from("vmaker"),
+} as const;
+
+/** Which side of a venue fill a VenueApproval lets the venue put its owner on */
+export enum VenueRole {
+  Taker = 0,
+  Maker = 1,
+}
+
+function u64Le(value: number | bigint | BN): Buffer {
+  const buffer = Buffer.alloc(8);
+  buffer.writeBigUInt64LE(BigInt(value.toString()));
+  return buffer;
+}
+
 /**
  * Derive the MmRegistry PDA for a given market
  */
@@ -57,11 +88,8 @@ export function findQuotePda(
   marketMaker: PublicKey,
   quoteIndex: number | bigint | BN
 ): [PublicKey, number] {
-  const indexBuffer = Buffer.alloc(8);
-  indexBuffer.writeBigUInt64LE(BigInt(quoteIndex.toString()));
-
   return PublicKey.findProgramAddressSync(
-    [SEEDS.QUOTE, marketMaker.toBuffer(), indexBuffer],
+    [SEEDS.QUOTE, marketMaker.toBuffer(), u64Le(quoteIndex)],
     programId
   );
 }
@@ -95,4 +123,94 @@ export function getMarketMakerPdas(
     collateralAccount,
     collateralBump,
   };
+}
+
+// ============================================================================
+// perps-core PDAs used by fill_quote
+// ============================================================================
+
+export function findPerpsConfigPda(
+  perpsProgramId: PublicKey = PERPS_CORE_PROGRAM_ID
+): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync([PERPS_SEEDS.CONFIG], perpsProgramId);
+}
+
+/** A wallet's perps-core UserAccount in `market`, which every fill margins from */
+export function findPerpsUserPda(
+  owner: PublicKey,
+  market: PublicKey,
+  perpsProgramId: PublicKey = PERPS_CORE_PROGRAM_ID
+): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [PERPS_SEEDS.USER, owner.toBuffer(), market.toBuffer()],
+    perpsProgramId
+  );
+}
+
+/** perps-core's Venue record for `venueProgram` (here mm-registry) in `market` */
+export function findVenuePda(
+  market: PublicKey,
+  venueProgram: PublicKey,
+  perpsProgramId: PublicKey = PERPS_CORE_PROGRAM_ID
+): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [PERPS_SEEDS.VENUE, market.toBuffer(), venueProgram.toBuffer()],
+    perpsProgramId
+  );
+}
+
+/** The PDA the venue program signs venue_fill with: `[b"perps_venue", market]` under the venue program */
+export function findVenueAuthorityPda(
+  venueProgram: PublicKey,
+  market: PublicKey
+): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [PERPS_SEEDS.VENUE_AUTHORITY, market.toBuffer()],
+    venueProgram
+  );
+}
+
+/** The upgradeable loader's ProgramData for `program`; perps-core pins its slot */
+export function findProgramDataPda(program: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [program.toBuffer()],
+    BPF_LOADER_UPGRADEABLE_PROGRAM_ID
+  );
+}
+
+/** A wallet's consent for `venue` to open positions for it in `role` */
+export function findVenueApprovalPda(
+  owner: PublicKey,
+  venue: PublicKey,
+  role: VenueRole,
+  perpsProgramId: PublicKey = PERPS_CORE_PROGRAM_ID
+): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [PERPS_SEEDS.VENUE_APPROVAL, owner.toBuffer(), venue.toBuffer(), Buffer.from([role])],
+    perpsProgramId
+  );
+}
+
+/** Taker position of a venue fill, seeded by a nonce the caller picks */
+export function findVPositionPda(
+  taker: PublicKey,
+  market: PublicKey,
+  positionNonce: number | bigint | BN,
+  perpsProgramId: PublicKey = PERPS_CORE_PROGRAM_ID
+): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [PERPS_SEEDS.VPOSITION, taker.toBuffer(), market.toBuffer(), u64Le(positionNonce)],
+    perpsProgramId
+  );
+}
+
+/** Maker position of the venue fill whose taker position is `takerPosition` */
+export function findVMakerPda(
+  takerPosition: PublicKey,
+  perpsProgramId: PublicKey = PERPS_CORE_PROGRAM_ID
+): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [PERPS_SEEDS.VMAKER, takerPosition.toBuffer()],
+    perpsProgramId
+  );
 }

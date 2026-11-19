@@ -34,7 +34,7 @@ jobs:
           echo "$HOME/solana-release/bin" >> "$GITHUB_PATH"
       - run: scripts/build-sbf.sh
       # Native tests can't catch SBF-only failures (e.g. the 4 KB stack limit)
-      - run: SBF_OUT_DIR=$PWD/target/deploy cargo test -p perps-core -p prop-amm --test integration
+      - run: SBF_OUT_DIR=$PWD/target/deploy cargo test -p perps-core -p prop-amm -p mm-registry -p orderbook --test integration
       - uses: actions/setup-node@v4
         with:
           node-version: 22

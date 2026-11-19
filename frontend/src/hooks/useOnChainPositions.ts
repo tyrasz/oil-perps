@@ -23,7 +23,7 @@ interface OnChainPosition {
     openedAt: { toNumber: () => number };
     lastUpdatedAt: { toNumber: () => number };
     status: { open?: object; closed?: object; liquidated?: object };
-    executionSource: { orderBook?: object; amm?: object };
+    executionSource: { orderBook?: object; amm?: object; venue?: object };
     bump: number;
   };
 }

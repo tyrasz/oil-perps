@@ -13,6 +13,9 @@ pub mod protocol_config;
 pub mod pause_market;
 pub mod create_referral_code;
 pub mod apply_referral_code;
+pub mod venue_admin;
+pub mod venue_approval;
+pub mod venue_fill;
 
 pub use initialize_market::*;
 pub use initialize_user::*;
@@ -29,3 +32,6 @@ pub use protocol_config::*;
 pub use pause_market::*;
 pub use create_referral_code::*;
 pub use apply_referral_code::*;
+pub use venue_admin::*;
+pub use venue_approval::*;
+pub use venue_fill::*;

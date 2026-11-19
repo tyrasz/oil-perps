@@ -63,6 +63,19 @@ describe('useOnChainPositions', () => {
     expect(positionAll.mock.calls.length).toBe(loads);
   });
 
+  it('lists positions opened by a venue fill like any other', async () => {
+    const venueShort = {
+      publicKey: key('vmaker1'),
+      account: { ...oilLong.account, side: { short: {} }, executionSource: { venue: {} } },
+    };
+    positionAll.mockResolvedValue([venueShort]);
+    setOilPrice(75);
+    const { result } = renderHook(() => useOnChainPositions());
+    await waitFor(() => expect(result.current.positions).toHaveLength(1));
+    expect(result.current.positions[0].side).toBe('short');
+    expect(result.current.positions[0].marginRatio).toBeCloseTo(10);
+  });
+
   it('keeps the last positions when a reload fails', async () => {
     positionAll.mockResolvedValueOnce([oilLong]).mockRejectedValue(new Error('rpc down'));
     const { result } = renderHook(() => useOnChainPositions());

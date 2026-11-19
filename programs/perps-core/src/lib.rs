@@ -100,4 +100,41 @@ pub mod perps_core {
     pub fn apply_referral_code(ctx: Context<ApplyReferralCode>) -> Result<()> {
         instructions::apply_referral_code::handler(ctx)
     }
+
+    // Venues: programs the admin allows to open matched positions in a market
+    pub fn register_venue(ctx: Context<RegisterVenue>, params: VenueParams, expected_program_slot: u64) -> Result<()> {
+        instructions::venue_admin::register_venue(ctx, params, expected_program_slot)
+    }
+
+    pub fn update_venue(ctx: Context<UpdateVenue>, params: VenueParams, enabled: bool, expected_program_slot: u64) -> Result<()> {
+        instructions::venue_admin::update_venue(ctx, params, enabled, expected_program_slot)
+    }
+
+    // Admin or guardian
+    pub fn disable_venue(ctx: Context<DisableVenue>) -> Result<()> {
+        instructions::venue_admin::disable_venue(ctx)
+    }
+
+    // Pausing: admin or guardian. Resuming: admin.
+    pub fn set_venue_fills_paused(ctx: Context<SetVenueFillsPaused>, paused: bool) -> Result<()> {
+        instructions::venue_admin::set_venue_fills_paused(ctx, paused)
+    }
+
+    // Users: bound what a venue may do with their collateral, per role
+    pub fn approve_venue(ctx: Context<ApproveVenue>, role: u8, params: VenueApprovalParams) -> Result<()> {
+        instructions::venue_approval::approve_venue(ctx, role, params)
+    }
+
+    pub fn update_venue_approval(ctx: Context<UpdateVenueApproval>, params: VenueApprovalParams) -> Result<()> {
+        instructions::venue_approval::update_venue_approval(ctx, params)
+    }
+
+    pub fn revoke_venue_approval(ctx: Context<RevokeVenueApproval>) -> Result<()> {
+        instructions::venue_approval::revoke_venue_approval(ctx)
+    }
+
+    // CPI from a registered venue only
+    pub fn venue_fill(ctx: Context<VenueFill>, params: VenueFillParams) -> Result<()> {
+        instructions::venue_fill::handler(ctx, params)
+    }
 }

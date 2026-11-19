@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use crate::state::{MmRegistry, MarketMaker, TwoSidedQuote, MmStatus};
+use crate::state::{MmRegistry, MarketMaker, TwoSidedQuote, MmStatus, MAX_QUOTE_TTL_SECS};
 use crate::errors::MmRegistryError;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
@@ -8,6 +8,8 @@ pub struct UpdateQuoteParams {
     pub bid_size: Option<u64>,
     pub ask_price: Option<u64>,
     pub ask_size: Option<u64>,
+    pub leverage: Option<u32>,   // > 0
+    pub expires_in: Option<i64>, // 1..=MAX_QUOTE_TTL_SECS from now
 }
 
 #[derive(Accounts)]
@@ -76,30 +78,19 @@ pub fn handler(ctx: Context<UpdateQuote>, params: UpdateQuoteParams) -> Result<(
     let new_bid_remaining = new_bid_size.saturating_sub(bid_filled);
     let new_ask_remaining = new_ask_size.saturating_sub(ask_filled);
 
-    // Calculate new collateral requirement
-    let old_collateral = quote.collateral_locked;
-    // Checked: a wrapped notional would release the quote's collateral
-    let notional = |size: u64, price: u64| u64::try_from(size as u128 * price as u128 / 1_000_000);
-    let new_max_notional = std::cmp::max(
-        notional(new_bid_remaining, new_bid_price).map_err(|_| MmRegistryError::MathOverflow)?,
-        notional(new_ask_remaining, new_ask_price).map_err(|_| MmRegistryError::MathOverflow)?,
-    );
-    let new_collateral_required = new_max_notional / 10;
-
-    // Adjust collateral
-    let market_maker = &mut ctx.accounts.market_maker;
-
-    if new_collateral_required > old_collateral {
-        let additional = new_collateral_required - old_collateral;
-        require!(
-            market_maker.has_available_collateral(additional),
-            MmRegistryError::InsufficientCollateral
-        );
-        market_maker.lock_collateral(additional);
-    } else if new_collateral_required < old_collateral {
-        let freed = old_collateral - new_collateral_required;
-        market_maker.unlock_collateral(freed);
+    if let Some(leverage) = params.leverage {
+        require!(leverage > 0, MmRegistryError::InvalidQuoteParams);
+        quote.leverage = leverage;
     }
+    if let Some(expires_in) = params.expires_in {
+        require!(expires_in > 0 && expires_in <= MAX_QUOTE_TTL_SECS, MmRegistryError::InvalidQuoteParams);
+        quote.expires_at = current_time + expires_in;
+    }
+
+    // Quotes lock nothing any more; this releases a legacy quote's lock, and
+    // with a leverage and expiry set above makes it fillable
+    let market_maker = &mut ctx.accounts.market_maker;
+    market_maker.unlock_collateral(quote.collateral_locked);
 
     // Update quote
     quote.bid_price = new_bid_price;
@@ -110,7 +101,7 @@ pub fn handler(ctx: Context<UpdateQuote>, params: UpdateQuoteParams) -> Result<(
     quote.ask_size = new_ask_size;
     quote.ask_remaining = new_ask_remaining;
 
-    quote.collateral_locked = new_collateral_required;
+    quote.collateral_locked = 0;
     quote.updated_at = current_time;
 
     // Update MM timestamp

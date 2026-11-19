@@ -20,6 +20,8 @@ pub enum ExecutionSource {
     #[default]
     OrderBook,
     Amm,
+    // Opened by venue_fill. Must stay last so existing tags keep their meaning.
+    Venue,
 }
 
 #[account]
@@ -65,6 +67,38 @@ impl Position {
         1 +   // execution_source
         1 +   // bump
         32;   // padding
+
+    /// Set every field of a freshly created open position.
+    #[allow(clippy::too_many_arguments)]
+    pub fn init_open(
+        &mut self,
+        owner: Pubkey,
+        market: Pubkey,
+        side: Side,
+        size: u64,
+        collateral: u64,
+        entry_price: u64,
+        leverage: u32,
+        cumulative_funding: i64,
+        now: i64,
+        execution_source: ExecutionSource,
+        bump: u8,
+    ) {
+        self.owner = owner;
+        self.market = market;
+        self.side = side;
+        self.size = size;
+        self.collateral = collateral;
+        self.entry_price = entry_price;
+        self.leverage = leverage;
+        self.realized_pnl = 0;
+        self.last_funding_payment = cumulative_funding;
+        self.opened_at = now;
+        self.last_updated_at = now;
+        self.status = PositionStatus::Open;
+        self.execution_source = execution_source;
+        self.bump = bump;
+    }
 
     pub fn notional_value(&self) -> u64 {
         // size * entry_price / 1_000_000 (adjust for decimals)
@@ -212,6 +246,39 @@ mod tests {
         assert!(!long.is_liquidatable(75_000_000, 0, 500));
         assert!(long.is_liquidatable(75_000_000, -400 * USDC, 500));
     }
+
+    #[test]
+    fn account_sizes_are_pinned() {
+        assert_eq!(Position::LEN, 168);
+        let serialized = Position::default().try_to_vec().unwrap().len();
+        assert_eq!(8 + serialized + 32, Position::LEN);
+        assert_eq!(ExecutionSource::Venue.try_to_vec().unwrap(), vec![2]);
+        assert_eq!(UserAccount::LEN, 85);
+    }
+
+    /// Two legs of a venue fill share size and entry price; their PnL and
+    /// funding must cancel exactly, including the truncated last unit.
+    #[test]
+    fn pnl_and_funding_are_odd_in_side() {
+        let sizes = [1, 7, 999_999, CONTRACT_SIZE, 123 * CONTRACT_SIZE + 456_789];
+        let entries = [1, 999_999, 75_030_000, 74_970_001];
+        let marks = [1, 3, 75_000_000, 78_123_457, 100_000_001];
+        let indices = [-1_234_567_891, -7_500, -1, 0, 1, 7_499, 22_500, 9_876_543_210];
+        for &size in &sizes {
+            for &entry_price in &entries {
+                let long = Position { side: Side::Long, size, entry_price, last_funding_payment: 11, ..Default::default() };
+                let short = Position { side: Side::Short, ..long.clone() };
+                for &mark in &marks {
+                    assert_eq!(long.unrealized_pnl(mark), -short.unrealized_pnl(mark), "{} {} {}", size, entry_price, mark);
+                }
+                for &index in &indices {
+                    assert_eq!(long.accrued_funding(index), -short.accrued_funding(index), "{} {}", size, index);
+                }
+            }
+        }
+    }
+
+    const CONTRACT_SIZE: u64 = 1_000_000;
 
     #[test]
     fn margin_ratio_is_zero_when_underwater() {
