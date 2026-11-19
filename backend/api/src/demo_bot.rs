@@ -56,12 +56,11 @@ impl DemoBot {
             if let Some(price_data) = self.oracle.get_price(commodity).await {
                 let orderbook = self.generate_orderbook(price_data.price);
 
-                // Update cached orderbook (for now just storing the last one)
-                // In a real implementation, we'd have per-commodity orderbooks
-                if commodity == "OIL" {
-                    let mut cached = self.state.cached_orderbook.write().unwrap();
-                    *cached = Some(orderbook);
-                }
+                self.state
+                    .cached_orderbooks
+                    .write()
+                    .unwrap()
+                    .insert(commodity.to_string(), orderbook);
             }
         }
     }

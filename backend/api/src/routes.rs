@@ -247,8 +247,9 @@ pub async fn get_orderbook_by_commodity(
         return (StatusCode::NOT_FOUND, "Commodity not found").into_response();
     }
 
-    let orderbook = state.cached_orderbook.read().unwrap();
-    match &*orderbook {
+    // Each commodity's own book; it used to serve OIL's book for every commodity
+    let orderbooks = state.cached_orderbooks.read().unwrap();
+    match orderbooks.get(&commodity_upper) {
         Some(ob) => Json(OrderBookResponse {
             commodity: commodity_upper,
             bids: ob.bids.clone(),
@@ -318,8 +319,9 @@ pub async fn get_user_positions(
 pub async fn get_orderbook(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let orderbook = state.cached_orderbook.read().unwrap();
-    match &*orderbook {
+    // Legacy single-market endpoint: the OIL book
+    let orderbooks = state.cached_orderbooks.read().unwrap();
+    match orderbooks.get("OIL") {
         Some(ob) => Json(OrderBookResponse {
             commodity: "OIL".to_string(),
             bids: ob.bids.clone(),

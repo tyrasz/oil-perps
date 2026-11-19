@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::RwLock as TokioRwLock;
 use crate::oracle::OracleService;
@@ -16,7 +17,8 @@ pub struct SimulatedTrade {
 
 pub struct AppState {
     pub rpc_url: String,
-    pub cached_orderbook: RwLock<Option<OrderBookSnapshot>>,
+    /// Latest book per commodity id ("OIL", "GOLD", ...)
+    pub cached_orderbooks: RwLock<HashMap<String, OrderBookSnapshot>>,
     pub oracle_service: Arc<OracleService>,
     pub recent_trades: Arc<TokioRwLock<Vec<SimulatedTrade>>>,
 }
@@ -32,7 +34,7 @@ impl AppState {
     pub fn new(rpc_url: &str) -> Self {
         Self {
             rpc_url: rpc_url.to_string(),
-            cached_orderbook: RwLock::new(None),
+            cached_orderbooks: RwLock::new(HashMap::new()),
             oracle_service: Arc::new(OracleService::new()),
             recent_trades: Arc::new(TokioRwLock::new(Vec::new())),
         }

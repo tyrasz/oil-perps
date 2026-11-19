@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
-import { useMarketMaker, MmStatus } from '../hooks/useMarketMaker';
+import { useMarketMaker, MmStatus, MM_NOT_LIVE_MESSAGE } from '../hooks/useMarketMaker';
 import { MmQuoteManager } from './MmQuoteManager';
 import { MmQuotesTable } from './MmQuotesTable';
 
@@ -9,6 +9,7 @@ type MmTab = 'overview' | 'quotes' | 'collateral';
 export function MarketMakerPanel() {
   const { connected } = useWallet();
   const {
+    isLive,
     registry,
     marketMaker,
     quotes,
@@ -25,6 +26,16 @@ export function MarketMakerPanel() {
   const [registerAmount, setRegisterAmount] = useState('');
   const [collateralAmount, setCollateralAmount] = useState('');
   const [collateralAction, setCollateralAction] = useState<'deposit' | 'withdraw'>('deposit');
+
+  if (!isLive) {
+    return (
+      <div className="mm-panel">
+        <div className="mm-connect-prompt" role="status">
+          {MM_NOT_LIVE_MESSAGE}
+        </div>
+      </div>
+    );
+  }
 
   if (!connected) {
     return (

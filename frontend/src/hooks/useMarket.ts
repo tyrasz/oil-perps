@@ -88,10 +88,16 @@ export function useMarketFeed() {
     try {
       const res = await fetch(`${API_URL}/api/orderbook/${commodity.id}`);
 
-      // Fallback to old endpoint
-      const data = res.ok
-        ? await res.json()
-        : await fetch(`${API_URL}/api/orderbook`).then(r => r.json());
+      // The legacy endpoint serves the default (OIL) book only; never show it
+      // under another commodity
+      let data: { bids?: [number, number][]; asks?: [number, number][] };
+      if (res.ok) {
+        data = await res.json();
+      } else if (commodity.id === DEFAULT_COMMODITY.id) {
+        data = await fetch(`${API_URL}/api/orderbook`).then(r => r.json());
+      } else {
+        data = { bids: [], asks: [] };
+      }
 
       const bids = (data.bids || []).map(([price, size]: [number, number], i: number, arr: [number, number][]) => ({
         price: price / 1_000_000,
