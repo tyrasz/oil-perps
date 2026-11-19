@@ -16,7 +16,7 @@ jobs:
         with:
           toolchain: "1.97.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p perps-core -p prop-amm -p vamm
+      - run: cargo test -p perps-core -p prop-amm -p vamm -p mm-registry -p orderbook
 
   sbf:
     name: SBF build, end-to-end on SBF, TypeScript suite
