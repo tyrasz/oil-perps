@@ -196,6 +196,8 @@ impl Env {
             min_sell_price: if req.is_buy { 0 } else { req.limit },
             max_price_deviation_bps: 0,
             expires_at: now + 120,
+            // One-shot: only the side the taker asked for
+            allowed_sides: if req.is_buy { SIDE_LONG } else { SIDE_SHORT },
         };
         if exists(&mut self.base, approval_pda(taker, &self.venue, ROLE_TAKER)).await {
             update_approval_ix(&self.base, taker, &self.venue, ROLE_TAKER, params)
@@ -605,6 +607,25 @@ async fn legacy_quotes_are_cancellable() {
     env.reject(quote, buy(1), mm_error(MmRegistryError::QuoteNotFillable)).await;
     env.cancel_quote(&mm, quote).await.unwrap();
     assert!(!exists(&mut env.base, quote).await);
+}
+
+/// The old post_quote allowed any expiry; a legacy quote must not become
+/// fillable for years once it is given a leverage.
+#[tokio::test]
+async fn legacy_far_expiries_are_not_fillable() {
+    let mut env = Env::new().await;
+    let mm = env.mm.t.kp.insecure_clone();
+    let quote = env.quote().await;
+    let far = now(&mut env.base).await + 365 * 86_400;
+    patch::<TwoSidedQuote>(&mut env.base, quote, |q| { q.leverage = 0; q.expires_at = far }).await;
+    // Migrating needs a fresh expiry within the TTL
+    let keep_expiry = UpdateQuoteParams { leverage: Some(LEV), expires_in: None, ..no_update() };
+    assert_eq!(custom_error(env.update_quote(&mm, quote, keep_expiry).await), mm_error(MmRegistryError::InvalidQuoteParams));
+    // And fill_quote refuses one patched straight to fillable
+    patch::<TwoSidedQuote>(&mut env.base, quote, |q| q.leverage = LEV).await;
+    env.reject(quote, buy(1), mm_error(MmRegistryError::QuoteNotFillable)).await;
+    env.update_quote(&mm, quote, UpdateQuoteParams { leverage: Some(LEV), expires_in: Some(300), ..no_update() }).await.unwrap();
+    env.fill(quote, buy(1)).await.unwrap();
 }
 
 /// 8.3 #6: the maker side is the quote's MM and no one else.

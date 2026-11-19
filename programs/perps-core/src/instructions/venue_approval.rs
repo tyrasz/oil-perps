@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use crate::errors::PerpsError;
-use crate::state::{Market, Venue, VenueApproval, MAX_APPROVAL_SECS, ROLE_MAKER};
+use anchor_lang::solana_program::instruction::{get_stack_height, TRANSACTION_LEVEL_STACK_HEIGHT};
+use crate::state::{Market, Venue, VenueApproval, MAX_APPROVAL_SECS, ROLE_MAKER, SIDE_LONG, SIDE_SHORT};
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
 pub struct VenueApprovalParams {
@@ -10,6 +11,7 @@ pub struct VenueApprovalParams {
     pub min_sell_price: u64,          // 0 = none
     pub max_price_deviation_bps: u16, // 0..=10_000
     pub expires_at: i64,              // now < expires_at <= now + MAX_APPROVAL_SECS
+    pub allowed_sides: u8,            // SIDE_LONG | SIDE_SHORT, non-zero
 }
 
 impl VenueApprovalParams {
@@ -19,6 +21,8 @@ impl VenueApprovalParams {
             && self.max_price_deviation_bps <= 10_000
             && self.expires_at > now
             && self.expires_at <= now.saturating_add(MAX_APPROVAL_SECS)
+            && self.allowed_sides != 0
+            && self.allowed_sides & !(SIDE_LONG | SIDE_SHORT) == 0
     }
 
     fn apply(&self, approval: &mut VenueApproval) {
@@ -28,7 +32,17 @@ impl VenueApprovalParams {
         approval.min_sell_price = self.min_sell_price;
         approval.max_price_deviation_bps = self.max_price_deviation_bps;
         approval.expires_at = self.expires_at;
+        approval.allowed_sides = self.allowed_sides;
     }
+}
+
+/// Approvals may only be written by a top-level instruction. A taker signs
+/// the transaction that calls the venue, and a signer stays a signer in every
+/// CPI, so a compromised venue could otherwise widen the taker's own approval
+/// mid-transaction and then fill against it. (Revoking may come from anywhere.)
+fn require_top_level() -> Result<()> {
+    require!(get_stack_height() == TRANSACTION_LEVEL_STACK_HEIGHT, PerpsError::ApprovalViaCpi);
+    Ok(())
 }
 
 /// Consent to fills through `venue` in `role` (ROLE_TAKER or ROLE_MAKER).
@@ -63,6 +77,7 @@ pub struct ApproveVenue<'info> {
 }
 
 pub fn approve_venue(ctx: Context<ApproveVenue>, role: u8, params: VenueApprovalParams) -> Result<()> {
+    require_top_level()?;
     let now = Clock::get()?.unix_timestamp;
     require!(role <= ROLE_MAKER, PerpsError::InvalidApprovalParams);
     require!(params.validate(&ctx.accounts.market, now), PerpsError::InvalidApprovalParams);
@@ -107,6 +122,7 @@ pub struct UpdateVenueApproval<'info> {
 }
 
 pub fn update_venue_approval(ctx: Context<UpdateVenueApproval>, params: VenueApprovalParams) -> Result<()> {
+    require_top_level()?;
     let now = Clock::get()?.unix_timestamp;
     require!(params.validate(&ctx.accounts.market, now), PerpsError::InvalidApprovalParams);
     let approval = &mut ctx.accounts.approval;

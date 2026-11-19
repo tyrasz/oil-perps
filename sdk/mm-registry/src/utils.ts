@@ -197,14 +197,16 @@ export function venueMargin(
   price: BN,
   oracle: BN,
   leverage: number,
-  initialMarginBps: number
+  initialMarginBps: number,
+  /** IM that gates leverage; defaults to initialMarginBps */
+  leverageGateBps: number = initialMarginBps
 ): BN | null {
   if (leverage <= 0) return null;
   const im = new BN(initialMarginBps);
   const notionalFill = size.mul(price).div(ONE);
   const notionalOracle = size.mul(oracle).div(ONE);
   const base = ceilDiv(notionalFill.mul(new BN(1_000)), new BN(leverage));
-  if (base.lt(ceilDiv(notionalFill.mul(im), BPS))) return null;
+  if (base.lt(ceilDiv(notionalFill.mul(new BN(leverageGateBps)), BPS))) return null;
   const imOracle = ceilDiv(notionalOracle.mul(im), BPS);
   // bn.js div truncates toward zero, like perps-core's i128 PnL
   const diff = isLong ? oracle.sub(price) : price.sub(oracle);
@@ -224,7 +226,8 @@ export function worstCaseVenueMargin(
   price: BN,
   leverage: number,
   initialMarginBps: number,
-  bandBps: number
+  bandBps: number,
+  leverageGateBps: number = initialMarginBps
 ): BN | null {
   const b = new BN(bandBps);
   // within_band: |price - oracle| * 10_000 <= oracle * band
@@ -232,7 +235,7 @@ export function worstCaseVenueMargin(
   const hi = price.mul(BPS).div(BPS.sub(b));
   let worst: BN | null = null;
   for (const oracle of [lo, price, hi]) {
-    const margin = venueMargin(isLong, size, price, oracle, leverage, initialMarginBps);
+    const margin = venueMargin(isLong, size, price, oracle, leverage, initialMarginBps, leverageGateBps);
     if (margin === null) return null;
     if (worst === null || margin.gt(worst)) worst = margin;
   }
@@ -253,4 +256,20 @@ export function randomPositionNonce(): BN {
     bytes.set(Keypair.generate().publicKey.toBytes().subarray(0, 8));
   }
   return new BN(Buffer.from(bytes), "le");
+}
+
+/**
+ * Whether fill_quote would accept this quote at `now`: active, not expired,
+ * and migrated (leverage and an expiry within the 24h TTL).
+ */
+export function isFillableQuote(
+  quote: { isActive: boolean; expiresAt: BN; leverage: number },
+  now: number
+): boolean {
+  return (
+    quote.isActive &&
+    quote.leverage > 0 &&
+    quote.expiresAt.gtn(now) &&
+    quote.expiresAt.lten(now + MAX_QUOTE_TTL_SECS)
+  );
 }

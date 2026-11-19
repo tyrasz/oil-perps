@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use perps_core::instructions::VenueFillParams;
-use crate::state::{MmRegistry, MarketMaker, MmStatus, TwoSidedQuote};
+use crate::state::{MmRegistry, MarketMaker, MmStatus, TwoSidedQuote, MAX_QUOTE_TTL_SECS};
 use crate::errors::MmRegistryError;
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
@@ -117,8 +117,12 @@ pub fn handler(ctx: Context<FillQuote>, params: FillQuoteParams) -> Result<FillQ
     let quote = &ctx.accounts.quote;
 
     require!(quote.is_valid(current_time), MmRegistryError::QuoteExpired);
-    // Legacy quotes (no leverage, no expiry) must be migrated with update_quote
-    require!(quote.leverage > 0 && quote.expires_at > 0, MmRegistryError::QuoteNotFillable);
+    // Legacy quotes (no leverage, no expiry, or an expiry beyond the TTL the
+    // old post_quote allowed) must be migrated with update_quote
+    require!(
+        quote.leverage > 0 && quote.expires_at > 0 && quote.expires_at <= current_time.saturating_add(MAX_QUOTE_TTL_SECS),
+        MmRegistryError::QuoteNotFillable
+    );
     require!(ctx.accounts.taker.key() != ctx.accounts.market_maker.owner, MmRegistryError::SelfTrade);
     require!(params.limit_price > 0, MmRegistryError::InvalidPrice);
 

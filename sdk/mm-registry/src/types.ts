@@ -182,7 +182,12 @@ export interface VenueApprovalParams {
   maxPriceDeviationBps: number;
   /** Unix seconds; at most 90 days out */
   expiresAt: BN;
+  /** Which sides the owner may be put on: VenueSides.Long | VenueSides.Short */
+  allowedSides: number;
 }
+
+/** VenueApproval.allowed_sides bits */
+export const VenueSides = { Long: 1, Short: 2, Both: 3 } as const;
 
 // ============================================================================
 // Result Types

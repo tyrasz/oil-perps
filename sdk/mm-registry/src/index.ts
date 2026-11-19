@@ -31,6 +31,7 @@ export {
   MmRegistryConfig,
   QuoteInfo,
   MarketMakerInfo,
+  VenueSides,
 } from "./types";
 
 // PDA utilities
@@ -94,4 +95,5 @@ export {
   venueMargin,
   worstCaseVenueMargin,
   randomPositionNonce,
+  isFillableQuote,
 } from "./utils";

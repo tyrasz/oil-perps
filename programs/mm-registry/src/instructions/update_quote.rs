@@ -86,6 +86,11 @@ pub fn handler(ctx: Context<UpdateQuote>, params: UpdateQuoteParams) -> Result<(
         require!(expires_in > 0 && expires_in <= MAX_QUOTE_TTL_SECS, MmRegistryError::InvalidQuoteParams);
         quote.expires_at = current_time + expires_in;
     }
+    // A legacy quote could carry an expiry years out; it must not become
+    // fillable on it, so migrating one needs a fresh expires_in
+    if quote.leverage > 0 {
+        require!(quote.expires_at <= current_time.saturating_add(MAX_QUOTE_TTL_SECS), MmRegistryError::InvalidQuoteParams);
+    }
 
     // Quotes lock nothing any more; this releases a legacy quote's lock, and
     // with a leverage and expiry set above makes it fillable

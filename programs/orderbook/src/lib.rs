@@ -193,16 +193,20 @@ pub mod orderbook {
     }
 
     /// Permissionless: an expired order can never match, so anyone may return
-    /// its rent and deposit to the owner.
+    /// its rent and deposit to the owner. Orders the old program left Filled
+    /// or Cancelled without closing them are closed the same way, at any time
+    /// (they were already taken off the counters).
     pub fn close_expired_order(ctx: Context<CloseExpiredOrder>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let order = &ctx.accounts.order;
-        require!(
-            (order.status == OrderStatus::Open || order.status == OrderStatus::PartiallyFilled) && now > order.expires_at,
-            ErrorCode::OrderNotExpired
-        );
-        decrement_side(&mut ctx.accounts.orderbook, order.side);
-        msg!("Expired order closed: {}", order.key());
+        match order.status {
+            OrderStatus::Filled | OrderStatus::Cancelled => {}
+            _ => {
+                require!(now > order.expires_at, ErrorCode::OrderNotExpired);
+                decrement_side(&mut ctx.accounts.orderbook, order.side);
+            }
+        }
+        msg!("Order closed: {}", order.key());
         Ok(())
     }
 
@@ -217,7 +221,9 @@ pub mod orderbook {
     /// satisfies both limits. perps-core enforces margin, band and each
     /// owner's approval; this program only decides which orders trade.
     /// `position_nonce` seeds the taker's position (the matcher picks it).
-    pub fn match_orders(ctx: Context<MatchOrders>, position_nonce: u64) -> Result<()> {
+    /// `max_fill_size` (0 = none) lets the matcher split a cross into fills
+    /// that fit perps-core's per-fill notional cap and OI headroom.
+    pub fn match_orders(ctx: Context<MatchOrders>, position_nonce: u64, max_fill_size: u64) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let a = &ctx.accounts;
 
@@ -235,7 +241,8 @@ pub mod orderbook {
         let (taker, maker) = if taker_is_bid { (&a.bid_order, &a.ask_order) } else { (&a.ask_order, &a.bid_order) };
         let bid_remaining = a.bid_order.size - a.bid_order.filled_size;
         let ask_remaining = a.ask_order.size - a.ask_order.filled_size;
-        let fill_size = bid_remaining.min(ask_remaining);
+        let crossing = bid_remaining.min(ask_remaining);
+        let fill_size = if max_fill_size > 0 { crossing.min(max_fill_size) } else { crossing };
         // Both sides, so neither owner is split into positions below their minimum
         require!(
             (fill_size >= a.bid_order.min_fill_size || fill_size == bid_remaining)

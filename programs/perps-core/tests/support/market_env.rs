@@ -84,6 +84,8 @@ pub fn venue_authority(market: &Pubkey, program: &Pubkey) -> (Pubkey, u8) {
 
 pub const ROLE_TAKER: u8 = perps_core::state::ROLE_TAKER;
 pub const ROLE_MAKER: u8 = perps_core::state::ROLE_MAKER;
+pub const SIDE_LONG: u8 = perps_core::state::SIDE_LONG;
+pub const SIDE_SHORT: u8 = perps_core::state::SIDE_SHORT;
 
 pub fn approval_pda(owner: &Pubkey, venue: &Pubkey, role: u8) -> Pubkey {
     pda(&[b"venue_approval", owner.as_ref(), venue.as_ref(), &[role]], &perps_core::ID)
@@ -532,40 +534,60 @@ pub fn default_venue_params() -> VenueParams {
     VenueParams { max_price_deviation_bps: 50, max_oracle_age_secs: 15, min_signers: 0, max_fill_notional: 50_000 * USDC }
 }
 
-/// Write a fake upgradeable-loader ProgramData for `program` deployed at `slot`.
+/// Write a fake upgradeable-loader ProgramData for `program` deployed at
+/// `slot`, with `authority` as its upgrade authority (None = immutable).
 /// Works for any program id, including builtins and programs loaded by `add_program`.
-pub async fn add_venue_program_data(base: &mut Base, program: &Pubkey, slot: u64) {
-    let state = UpgradeableLoaderState::ProgramData { slot, upgrade_authority_address: Some(base.admin.pubkey()) };
+pub async fn set_program_data(base: &mut Base, program: &Pubkey, slot: u64, authority: Option<Pubkey>) {
+    let state = UpgradeableLoaderState::ProgramData { slot, upgrade_authority_address: authority };
     let account = Account { lamports: 1_000_000_000, data: bincode::serialize(&state).unwrap(), owner: bpf_loader_upgradeable::id(), executable: false, rent_epoch: 0 };
     base.ctx.set_account(&program_data_pda(program), &AccountSharedData::from(account));
 }
 
-/// The slot `program`'s fake ProgramData says it was deployed at.
-pub async fn program_slot(base: &mut Base, program: &Pubkey) -> u64 {
-    let acct = raw(base, program_data_pda(program)).await.expect("ProgramData exists");
+/// Fake ProgramData for `program` at `slot`, upgradeable by the admin.
+pub async fn add_venue_program_data(base: &mut Base, program: &Pubkey, slot: u64) {
+    let admin = base.admin.pubkey();
+    set_program_data(base, program, slot, Some(admin)).await;
+}
+
+fn program_data_state(acct: &Account) -> (u64, Option<Pubkey>) {
     match bincode::deserialize(&acct.data).unwrap() {
-        UpgradeableLoaderState::ProgramData { slot, .. } => slot,
+        UpgradeableLoaderState::ProgramData { slot, upgrade_authority_address } => (slot, upgrade_authority_address),
         other => panic!("not ProgramData: {:?}", other),
     }
 }
 
-/// Simulate an upgrade of `program`; returns the new slot.
-pub async fn bump_program_slot(base: &mut Base, program: &Pubkey) -> u64 {
-    let slot = program_slot(base, program).await + 1;
-    add_venue_program_data(base, program, slot).await;
-    slot
+/// `program`'s upgrade authority as venue records pin it (default = immutable).
+pub async fn program_upgrade_authority(base: &mut Base, program: &Pubkey) -> Pubkey {
+    let acct = raw(base, program_data_pda(program)).await.expect("ProgramData exists");
+    program_data_state(&acct).1.unwrap_or_default()
 }
 
-pub fn register_venue_ix(base: &Base, admin: &Pubkey, program: &Pubkey, params: VenueParams, expected_program_slot: u64) -> Instruction {
+/// Simulate an upgrade of `program` (new slot, same authority), as loader
+/// Upgrade or the permissionless ExtendProgram would.
+pub async fn bump_program_slot(base: &mut Base, program: &Pubkey) -> u64 {
+    let acct = raw(base, program_data_pda(program)).await.expect("ProgramData exists");
+    let (slot, authority) = program_data_state(&acct);
+    set_program_data(base, program, slot + 1, authority).await;
+    slot + 1
+}
+
+/// Simulate loader SetAuthority on `program`.
+pub async fn set_upgrade_authority(base: &mut Base, program: &Pubkey, authority: Option<Pubkey>) {
+    let acct = raw(base, program_data_pda(program)).await.expect("ProgramData exists");
+    let (slot, _) = program_data_state(&acct);
+    set_program_data(base, program, slot, authority).await;
+}
+
+pub fn register_venue_ix(base: &Base, admin: &Pubkey, program: &Pubkey, params: VenueParams, expected_upgrade_authority: Pubkey) -> Instruction {
     let accounts = perps_core::accounts::RegisterVenue {
         admin: *admin, config: config_pda(), market: base.market, venue_program: *program,
         venue_program_data: program_data_pda(program), venue: venue_pda(&base.market, program), system_program: system_program::ID,
     };
-    perps_ix(accounts, perps_core::instruction::RegisterVenue { params, expected_program_slot })
+    perps_ix(accounts, perps_core::instruction::RegisterVenue { params, expected_upgrade_authority })
 }
 
-pub async fn try_register_venue(base: &mut Base, signer: &Keypair, program: &Pubkey, params: VenueParams, expected_program_slot: u64) -> Result<(), BanksClientError> {
-    let ix = register_venue_ix(base, &signer.pubkey(), program, params, expected_program_slot);
+pub async fn try_register_venue(base: &mut Base, signer: &Keypair, program: &Pubkey, params: VenueParams, expected_upgrade_authority: Pubkey) -> Result<(), BanksClientError> {
+    let ix = register_venue_ix(base, &signer.pubkey(), program, params, expected_upgrade_authority);
     send(&mut base.ctx, &[ix], &[signer]).await
 }
 
@@ -575,17 +597,17 @@ pub async fn register_venue(base: &mut Base, program: &Pubkey, params: VenuePara
     if !exists(base, program_data_pda(program)).await {
         add_venue_program_data(base, program, 1).await;
     }
-    let slot = program_slot(base, program).await;
+    let authority = program_upgrade_authority(base, program).await;
     let admin = base.admin.insecure_clone();
-    try_register_venue(base, &admin, program, params, slot).await.unwrap();
+    try_register_venue(base, &admin, program, params, authority).await.unwrap();
     venue_pda(&base.market, program)
 }
 
-pub async fn update_venue(base: &mut Base, signer: &Keypair, program: &Pubkey, params: VenueParams, enabled: bool, expected_program_slot: u64) -> Result<(), BanksClientError> {
+pub async fn update_venue(base: &mut Base, signer: &Keypair, program: &Pubkey, params: VenueParams, enabled: bool, expected_upgrade_authority: Pubkey) -> Result<(), BanksClientError> {
     let accounts = perps_core::accounts::UpdateVenue {
         admin: signer.pubkey(), config: config_pda(), venue: venue_pda(&base.market, program), venue_program_data: program_data_pda(program),
     };
-    send(&mut base.ctx, &[perps_ix(accounts, perps_core::instruction::UpdateVenue { params, enabled, expected_program_slot })], &[signer]).await
+    send(&mut base.ctx, &[perps_ix(accounts, perps_core::instruction::UpdateVenue { params, enabled, expected_upgrade_authority })], &[signer]).await
 }
 
 pub async fn disable_venue(base: &mut Base, signer: &Keypair, program: &Pubkey) -> Result<(), BanksClientError> {
@@ -607,7 +629,7 @@ pub async fn load_venue(base: &mut Base, program: &Pubkey) -> Venue {
 
 /// No limit price or deviation bound, the market's max leverage, a day to expiry.
 pub fn approval_params(allowance: u64, now: i64) -> VenueApprovalParams {
-    VenueApprovalParams { allowance, max_leverage: 20_000, max_buy_price: 0, min_sell_price: 0, max_price_deviation_bps: 0, expires_at: now + 86_400 }
+    VenueApprovalParams { allowance, max_leverage: 20_000, max_buy_price: 0, min_sell_price: 0, max_price_deviation_bps: 0, expires_at: now + 86_400, allowed_sides: SIDE_LONG | SIDE_SHORT }
 }
 
 pub fn approve_ix(base: &Base, owner: &Pubkey, venue: &Pubkey, role: u8, params: VenueApprovalParams) -> Instruction {

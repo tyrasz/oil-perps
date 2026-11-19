@@ -3,7 +3,7 @@ use crate::errors::PerpsError;
 use crate::oracle::read_price_max_age;
 use crate::state::{
     venue_margin, within_adverse_bound, within_band, ExecutionSource, Market, Position, ProtocolConfig, Side,
-    UserAccount, Venue, VenueApproval, ROLE_MAKER, ROLE_TAKER,
+    UserAccount, Venue, VenueApproval, ROLE_MAKER, ROLE_TAKER, SIDE_LONG, SIDE_SHORT,
 };
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
@@ -62,7 +62,7 @@ pub struct VenueFill<'info> {
 
     #[account(
         address = venue.program_data @ PerpsError::VenueProgramChanged,
-        constraint = venue_program_data.slot == venue.program_slot @ PerpsError::VenueProgramChanged
+        constraint = venue_program_data.upgrade_authority_address.unwrap_or_default() == venue.upgrade_authority @ PerpsError::VenueProgramChanged
     )]
     pub venue_program_data: Box<Account<'info, ProgramData>>,
 
@@ -255,6 +255,11 @@ fn take_margin(
     require!(leverage > 0 && leverage <= market.max_leverage, PerpsError::ExcessiveLeverage);
     require!(leverage <= approval.max_leverage, PerpsError::ApprovalLeverageExceeded);
     require!(now <= approval.expires_at, PerpsError::ApprovalExpired);
+    let side_bit = match side {
+        Side::Long => SIDE_LONG,
+        Side::Short => SIDE_SHORT,
+    };
+    require!(approval.allowed_sides & side_bit != 0, PerpsError::ApprovalSideNotAllowed);
     let within_limit = match side {
         Side::Long => approval.max_buy_price == 0 || price <= approval.max_buy_price,
         Side::Short => approval.min_sell_price == 0 || price >= approval.min_sell_price,

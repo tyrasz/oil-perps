@@ -24,7 +24,8 @@ pub const RELAY2: Pubkey = Pubkey::new_from_array([0x7f; 32]);
 /// forwarded as received, plus this program's venue authority.
 fn relay(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let (perps, rest) = accounts.split_first().unwrap();
-    let market = *rest[3].key;
+    // venue_fill passes the market 4th; other forwarded instructions may have fewer accounts
+    let market = rest.get(3).map(|a| *a.key).unwrap_or_default();
     let (authority, bump) = venue_authority(&market, program_id);
     let metas = rest
         .iter()
@@ -383,7 +384,7 @@ async fn guardian_stops_fills_but_cannot_restart_them() {
     disable_venue(&mut env.base, &guardian, &RELAY).await.unwrap();
     let (fa, n) = env.std_accounts();
     env.rejects(&fa, fill_params(n), &[], perr(PerpsError::VenueDisabled)).await;
-    let slot = program_slot(&mut env.base, &RELAY).await;
+    let slot = program_upgrade_authority(&mut env.base, &RELAY).await;
     assert_eq!(custom_error(update_venue(&mut env.base, &guardian, &RELAY, default_venue_params(), true, slot).await), perr(PerpsError::Unauthorized));
     update_venue(&mut env.base, &admin, &RELAY, default_venue_params(), true, slot).await.unwrap();
     env.fill(&fa, fill_params(n)).await.unwrap();
@@ -401,23 +402,34 @@ async fn guardian_stops_fills_but_cannot_restart_them() {
 }
 
 #[tokio::test]
-async fn venue_upgrade_halts_fills_until_re_pinned() {
+async fn venue_fills_follow_the_pinned_upgrade_authority() {
     let mut env = Env::new().await;
     let admin = env.base.admin.insecure_clone();
-    let old_slot = program_slot(&mut env.base, &RELAY).await;
-    let new_slot = bump_program_slot(&mut env.base, &RELAY).await;
     let (fa, n) = env.std_accounts();
-    env.rejects(&fa, fill_params(n), &[], perr(PerpsError::VenueProgramChanged)).await;
-    // Another program's ProgramData in its place fails the address pin
-    add_venue_program_data(&mut env.base, &RELAY2, new_slot).await;
+    // A new deploy slot alone doesn't halt fills: loader ExtendProgram needs no
+    // authority and rewrites the slot, so pinning it would let anyone halt a venue
+    bump_program_slot(&mut env.base, &RELAY).await;
+    env.fill(&fa, fill_params(n)).await.unwrap();
+
+    // Another program's ProgramData, with the same authority, fails the address pin
+    add_venue_program_data(&mut env.base, &RELAY2, 1).await;
+    let (fa, n) = env.std_accounts();
     let mut swapped = fa;
     swapped.venue_program_data = program_data_pda(&RELAY2);
     env.rejects(&swapped, fill_params(n), &[], perr(PerpsError::VenueProgramChanged)).await;
 
-    // The admin must name the slot it re-attests
-    assert_eq!(custom_error(update_venue(&mut env.base, &admin, &RELAY, default_venue_params(), true, old_slot).await), perr(PerpsError::InvalidVenueParams));
-    update_venue(&mut env.base, &admin, &RELAY, default_venue_params(), true, new_slot).await.unwrap();
-    assert_eq!(load_venue(&mut env.base, &RELAY).await.program_slot, new_slot);
+    // A change of upgrade authority halts fills until the admin re-attests
+    let rogue = Pubkey::new_unique();
+    set_upgrade_authority(&mut env.base, &RELAY, Some(rogue)).await;
+    env.rejects(&fa, fill_params(n), &[], perr(PerpsError::VenueProgramChanged)).await;
+    // Making the venue immutable is a change too
+    set_upgrade_authority(&mut env.base, &RELAY, None).await;
+    env.rejects(&fa, fill_params(n), &[], perr(PerpsError::VenueProgramChanged)).await;
+
+    // The admin must name the authority it re-attests
+    assert_eq!(custom_error(update_venue(&mut env.base, &admin, &RELAY, default_venue_params(), true, admin.pubkey()).await), perr(PerpsError::InvalidVenueParams));
+    update_venue(&mut env.base, &admin, &RELAY, default_venue_params(), true, Pubkey::default()).await.unwrap();
+    assert_eq!(load_venue(&mut env.base, &RELAY).await.upgrade_authority, Pubkey::default());
     env.fill(&fa, fill_params(n)).await.unwrap();
 }
 
@@ -531,8 +543,17 @@ async fn limit_prices_bind_each_side() {
     update_approval(&mut env.base, &taker, &venue, ROLE_TAKER, p).await.unwrap();
     let (fa, n) = env.std_accounts();
     env.rejects(&fa, fill_params(n), &[], perr(PerpsError::ApprovalLimitPrice)).await;
-    // max_buy_price says nothing about selling
+    // max_buy_price says nothing about selling; allowed_sides does
     env.fill(&fa, VenueFillParams { taker_side: 1, ..fill_params(n) }).await.unwrap();
+    let buy_only = VenueApprovalParams { allowed_sides: SIDE_LONG, ..p };
+    update_approval(&mut env.base, &taker, &venue, ROLE_TAKER, buy_only).await.unwrap();
+    let (fa, n) = env.std_accounts();
+    env.rejects(&fa, VenueFillParams { taker_side: 1, price: 75_000_000, ..fill_params(n) }, &[], perr(PerpsError::ApprovalSideNotAllowed)).await;
+    let sell_only = VenueApprovalParams { allowed_sides: SIDE_SHORT, max_buy_price: 0, ..p };
+    update_approval(&mut env.base, &taker, &venue, ROLE_TAKER, sell_only).await.unwrap();
+    env.rejects(&fa, VenueFillParams { taker_side: 0, price: 75_000_000, ..fill_params(n) }, &[], perr(PerpsError::ApprovalSideNotAllowed)).await;
+    env.fill(&fa, VenueFillParams { taker_side: 1, price: 75_000_000, ..fill_params(n) }).await.unwrap();
+    update_approval(&mut env.base, &taker, &venue, ROLE_TAKER, p).await.unwrap();
 
     p.max_buy_price = 75_030_000;
     update_approval(&mut env.base, &taker, &venue, ROLE_TAKER, p).await.unwrap();
@@ -577,7 +598,7 @@ async fn self_trade_is_rejected() {
 async fn min_signers_counts_parties_the_venue_marks_as_signers() {
     let mut env = Env::new().await;
     let admin = env.base.admin.insecure_clone();
-    let slot = program_slot(&mut env.base, &RELAY).await;
+    let slot = program_upgrade_authority(&mut env.base, &RELAY).await;
     let one = VenueParams { min_signers: 1, ..default_venue_params() };
     update_venue(&mut env.base, &admin, &RELAY, one, true, slot).await.unwrap();
     let (fa, n) = env.std_accounts();
@@ -654,7 +675,7 @@ async fn each_side_needs_its_own_collateral() {
 async fn fill_size_is_capped_per_fill() {
     let mut env = Env::new().await;
     let admin = env.base.admin.insecure_clone();
-    let slot = program_slot(&mut env.base, &RELAY).await;
+    let slot = program_upgrade_authority(&mut env.base, &RELAY).await;
     let capped = VenueParams { max_fill_notional: 7_503 * USDC - 1, ..default_venue_params() };
     update_venue(&mut env.base, &admin, &RELAY, capped, true, slot).await.unwrap();
     let (fa, n) = env.std_accounts();
@@ -708,29 +729,30 @@ async fn only_the_admin_registers_and_updates_venues() {
     let guardian = env.base.guardian.insecure_clone();
     let admin = env.base.admin.insecure_clone();
     add_venue_program_data(&mut env.base, &RELAY2, 7).await;
+    let ua = admin.pubkey();
     let p = default_venue_params();
-    assert_eq!(custom_error(try_register_venue(&mut env.base, &guardian, &RELAY2, p, 7).await), perr(PerpsError::Unauthorized));
-    // The admin must name the deployed slot
-    assert_eq!(custom_error(try_register_venue(&mut env.base, &admin, &RELAY2, p, 6).await), perr(PerpsError::InvalidVenueParams));
-    try_register_venue(&mut env.base, &admin, &RELAY2, p, 7).await.unwrap();
-    assert!(try_register_venue(&mut env.base, &admin, &RELAY2, p, 7).await.is_err(), "a venue is registered once");
+    assert_eq!(custom_error(try_register_venue(&mut env.base, &guardian, &RELAY2, p, ua).await), perr(PerpsError::Unauthorized));
+    // The admin must name the venue's upgrade authority
+    assert_eq!(custom_error(try_register_venue(&mut env.base, &admin, &RELAY2, p, Pubkey::new_unique()).await), perr(PerpsError::InvalidVenueParams));
+    try_register_venue(&mut env.base, &admin, &RELAY2, p, ua).await.unwrap();
+    assert!(try_register_venue(&mut env.base, &admin, &RELAY2, p, ua).await.is_err(), "a venue is registered once");
 
     let v = load_venue(&mut env.base, &RELAY2).await;
     assert_eq!(v.authority, venue_authority(&env.base.market, &RELAY2).0);
-    assert_eq!((v.market, v.program, v.program_data, v.program_slot), (env.base.market, RELAY2, program_data_pda(&RELAY2), 7));
+    assert_eq!((v.market, v.program, v.program_data, v.upgrade_authority), (env.base.market, RELAY2, program_data_pda(&RELAY2), ua));
     assert_eq!((v.max_price_deviation_bps, v.max_oracle_age_secs, v.min_signers, v.max_fill_notional), (50, 15, 0, 50_000 * USDC));
     assert!(v.enabled && v.total_fills == 0);
 
-    assert_eq!(custom_error(update_venue(&mut env.base, &guardian, &RELAY2, p, false, 7).await), perr(PerpsError::Unauthorized));
+    assert_eq!(custom_error(update_venue(&mut env.base, &guardian, &RELAY2, p, false, ua).await), perr(PerpsError::Unauthorized));
     let wide = VenueParams { max_price_deviation_bps: 100, max_oracle_age_secs: 30, ..p };
-    update_venue(&mut env.base, &admin, &RELAY2, wide, false, 7).await.unwrap();
+    update_venue(&mut env.base, &admin, &RELAY2, wide, false, ua).await.unwrap();
     let v = load_venue(&mut env.base, &RELAY2).await;
     assert_eq!((v.max_price_deviation_bps, v.max_oracle_age_secs, v.enabled, v.program, v.market), (100, 30, false, RELAY2, env.base.market));
 
     // The admin handover moves venue control too
     let new_admin = rotate_admin(&mut env.base).await;
-    assert_eq!(custom_error(update_venue(&mut env.base, &admin, &RELAY2, p, true, 7).await), perr(PerpsError::Unauthorized));
-    update_venue(&mut env.base, &new_admin, &RELAY2, p, true, 7).await.unwrap();
+    assert_eq!(custom_error(update_venue(&mut env.base, &admin, &RELAY2, p, true, ua).await), perr(PerpsError::Unauthorized));
+    update_venue(&mut env.base, &new_admin, &RELAY2, p, true, ua).await.unwrap();
 }
 
 #[tokio::test]
@@ -738,6 +760,7 @@ async fn venue_params_are_validated() {
     let mut env = Env::new().await;
     let admin = env.base.admin.insecure_clone();
     add_venue_program_data(&mut env.base, &RELAY2, 1).await;
+    let ua = admin.pubkey();
     let p = default_venue_params();
     let bad = [
         VenueParams { max_price_deviation_bps: 501, ..p },
@@ -747,17 +770,17 @@ async fn venue_params_are_validated() {
         VenueParams { max_fill_notional: 0, ..p },
     ];
     for params in bad {
-        assert_eq!(custom_error(try_register_venue(&mut env.base, &admin, &RELAY2, params, 1).await), perr(PerpsError::InvalidVenueParams));
-        assert_eq!(custom_error(update_venue(&mut env.base, &admin, &RELAY, params, true, 1).await), perr(PerpsError::InvalidVenueParams));
+        assert_eq!(custom_error(try_register_venue(&mut env.base, &admin, &RELAY2, params, ua).await), perr(PerpsError::InvalidVenueParams));
+        assert_eq!(custom_error(update_venue(&mut env.base, &admin, &RELAY, params, true, ua).await), perr(PerpsError::InvalidVenueParams));
     }
     let edges = VenueParams { max_price_deviation_bps: 500, max_oracle_age_secs: 60, min_signers: 2, max_fill_notional: 1 };
-    try_register_venue(&mut env.base, &admin, &RELAY2, edges, 1).await.unwrap();
+    try_register_venue(&mut env.base, &admin, &RELAY2, edges, ua).await.unwrap();
 
     // perps-core itself and non-executable accounts can't be venues
-    assert_eq!(custom_error(try_register_venue(&mut env.base, &admin, &perps_core::ID, p, 0).await), perr(PerpsError::InvalidVenueParams));
+    assert_eq!(custom_error(try_register_venue(&mut env.base, &admin, &perps_core::ID, p, ua).await), perr(PerpsError::InvalidVenueParams));
     let wallet = funded_keypair(&mut env.base).await.pubkey();
     add_venue_program_data(&mut env.base, &wallet, 1).await;
-    assert_eq!(custom_error(try_register_venue(&mut env.base, &admin, &wallet, p, 1).await), perr(PerpsError::InvalidVenueParams));
+    assert_eq!(custom_error(try_register_venue(&mut env.base, &admin, &wallet, p, ua).await), perr(PerpsError::InvalidVenueParams));
 }
 
 #[tokio::test]
@@ -766,7 +789,7 @@ async fn registering_in_a_settled_market_fails() {
     let admin = env.base.admin.insecure_clone();
     add_venue_program_data(&mut env.base, &RELAY2, 1).await;
     settle(&mut env.base, 75 * USDC).await.unwrap();
-    assert_eq!(custom_error(try_register_venue(&mut env.base, &admin, &RELAY2, default_venue_params(), 1).await), perr(PerpsError::MarketSettled));
+    assert_eq!(custom_error(try_register_venue(&mut env.base, &admin, &RELAY2, default_venue_params(), admin.pubkey()).await), perr(PerpsError::MarketSettled));
 }
 
 #[tokio::test]
@@ -781,6 +804,8 @@ async fn approval_params_are_validated() {
         VenueApprovalParams { max_price_deviation_bps: 10_001, ..ok },
         VenueApprovalParams { expires_at: t, ..ok },
         VenueApprovalParams { expires_at: t + 90 * 86_400 + 1, ..ok },
+        VenueApprovalParams { allowed_sides: 0, ..ok },
+        VenueApprovalParams { allowed_sides: 4, ..ok },
     ];
     let venue = env.venue;
     for params in bad {
@@ -813,4 +838,36 @@ async fn fill_compute_units() {
     if is_sbf() {
         assert!(units > 0 && units < 100_000, "{} CU", units);
     }
+}
+
+/// The relay's instruction forwarding an arbitrary perps-core instruction.
+fn relay_wrap(relay_program: &Pubkey, inner: Instruction) -> Instruction {
+    let mut accounts = vec![AccountMeta::new_readonly(perps_core::ID, false)];
+    accounts.extend(inner.accounts);
+    Instruction { program_id: *relay_program, accounts, data: inner.data }
+}
+
+#[tokio::test]
+async fn a_venue_cannot_widen_a_signing_takers_approval() {
+    // The taker signs the transaction that calls the venue, and a signer stays
+    // a signer in every CPI. Approvals must only be writable at top level, or
+    // a compromised venue could raise the taker's allowance and then fill.
+    let mut env = Env::new().await;
+    let t = env.now().await;
+    let (taker, venue) = (env.taker.kp.insecure_clone(), env.venue);
+    let wide = approval_params(1_000_000 * USDC, t);
+    let inner = update_approval_ix(&env.base, &taker.pubkey(), &venue, ROLE_TAKER, wide);
+    let result = send(&mut env.base.ctx, &[relay_wrap(&RELAY, inner)], &[&taker]).await;
+    assert_eq!(custom_error(result), perr(PerpsError::ApprovalViaCpi));
+
+    let fresh = trader(&mut env.base, DEPOSIT).await;
+    let inner = approve_ix(&env.base, &fresh.key(), &venue, ROLE_TAKER, wide);
+    let result = send(&mut env.base.ctx, &[relay_wrap(&RELAY, inner)], &[&fresh.kp]).await;
+    assert_eq!(custom_error(result), perr(PerpsError::ApprovalViaCpi));
+
+    // The same writes at top level still work, and revoking works from a CPI
+    update_approval(&mut env.base, &taker, &venue, ROLE_TAKER, wide).await.unwrap();
+    let revoke = relay_wrap(&RELAY, revoke_ix(&taker.pubkey(), &venue, ROLE_TAKER));
+    send(&mut env.base.ctx, &[revoke], &[&taker]).await.unwrap();
+    assert!(!exists(&mut env.base, approval_pda(&taker.pubkey(), &venue, ROLE_TAKER)).await);
 }

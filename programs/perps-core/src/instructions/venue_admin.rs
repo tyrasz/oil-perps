@@ -28,7 +28,7 @@ impl VenueParams {
 }
 
 /// Admin: allow `venue_program` to open matched positions in `market`.
-/// Must run after the venue's deploy, since it pins the deployed slot.
+/// Pins the venue's current upgrade authority, which the admin must name.
 #[derive(Accounts)]
 pub struct RegisterVenue<'info> {
     #[account(mut)]
@@ -70,13 +70,16 @@ pub struct RegisterVenue<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn register_venue(ctx: Context<RegisterVenue>, params: VenueParams, expected_program_slot: u64) -> Result<()> {
+pub fn register_venue(ctx: Context<RegisterVenue>, params: VenueParams, expected_upgrade_authority: Pubkey) -> Result<()> {
     let market = &ctx.accounts.market;
     require!(!market.is_settled(), PerpsError::MarketSettled);
     require!(params.validate(), PerpsError::InvalidVenueParams);
-    // The admin states which deploy it audited; a later upgrade racing this
-    // transaction is not silently attested.
-    require!(ctx.accounts.venue_program_data.slot == expected_program_slot, PerpsError::InvalidVenueParams);
+    // The admin names the key it trusts to change the venue's code; an
+    // authority change racing this transaction is not silently attested.
+    require!(
+        ctx.accounts.venue_program_data.upgrade_authority_address.unwrap_or_default() == expected_upgrade_authority,
+        PerpsError::InvalidVenueParams
+    );
 
     let program = ctx.accounts.venue_program.key();
     let market_key = market.key();
@@ -85,18 +88,19 @@ pub fn register_venue(ctx: Context<RegisterVenue>, params: VenueParams, expected
     venue.program = program;
     venue.authority = Pubkey::find_program_address(&[Venue::AUTHORITY_SEED, market_key.as_ref()], &program).0;
     venue.program_data = ctx.accounts.venue_program_data.key();
-    venue.program_slot = expected_program_slot;
+    venue.upgrade_authority = expected_upgrade_authority;
     params.apply(venue);
     venue.total_fills = 0;
     venue.total_notional = 0;
     venue.enabled = true;
     venue.bump = *ctx.bumps.get("venue").unwrap();
-    msg!("Venue registered: program={}, market={}, authority={}, slot={}", program, market_key, venue.authority, venue.program_slot);
+    msg!("Venue registered: program={}, market={}, authority={}, upgrade_authority={}", program, market_key, venue.authority, venue.upgrade_authority);
     Ok(())
 }
 
 /// Admin: change a venue's limits, enable or disable it, and re-pin its
-/// program slot. After a venue upgrade this is the only way to resume fills.
+/// upgrade authority. After an authority change this is the only way to
+/// resume fills.
 #[derive(Accounts)]
 pub struct UpdateVenue<'info> {
     pub admin: Signer<'info>,
@@ -119,14 +123,17 @@ pub struct UpdateVenue<'info> {
     pub venue_program_data: Box<Account<'info, ProgramData>>,
 }
 
-pub fn update_venue(ctx: Context<UpdateVenue>, params: VenueParams, enabled: bool, expected_program_slot: u64) -> Result<()> {
+pub fn update_venue(ctx: Context<UpdateVenue>, params: VenueParams, enabled: bool, expected_upgrade_authority: Pubkey) -> Result<()> {
     require!(params.validate(), PerpsError::InvalidVenueParams);
-    require!(ctx.accounts.venue_program_data.slot == expected_program_slot, PerpsError::InvalidVenueParams);
+    require!(
+        ctx.accounts.venue_program_data.upgrade_authority_address.unwrap_or_default() == expected_upgrade_authority,
+        PerpsError::InvalidVenueParams
+    );
     let venue = &mut ctx.accounts.venue;
     params.apply(venue);
     venue.enabled = enabled;
-    venue.program_slot = expected_program_slot;
-    msg!("Venue updated: program={}, enabled={}, slot={}", venue.program, enabled, venue.program_slot);
+    venue.upgrade_authority = expected_upgrade_authority;
+    msg!("Venue updated: program={}, enabled={}, upgrade_authority={}", venue.program, enabled, venue.upgrade_authority);
     Ok(())
 }
 

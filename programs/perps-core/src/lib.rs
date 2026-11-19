@@ -102,12 +102,12 @@ pub mod perps_core {
     }
 
     // Venues: programs the admin allows to open matched positions in a market
-    pub fn register_venue(ctx: Context<RegisterVenue>, params: VenueParams, expected_program_slot: u64) -> Result<()> {
-        instructions::venue_admin::register_venue(ctx, params, expected_program_slot)
+    pub fn register_venue(ctx: Context<RegisterVenue>, params: VenueParams, expected_upgrade_authority: Pubkey) -> Result<()> {
+        instructions::venue_admin::register_venue(ctx, params, expected_upgrade_authority)
     }
 
-    pub fn update_venue(ctx: Context<UpdateVenue>, params: VenueParams, enabled: bool, expected_program_slot: u64) -> Result<()> {
-        instructions::venue_admin::update_venue(ctx, params, enabled, expected_program_slot)
+    pub fn update_venue(ctx: Context<UpdateVenue>, params: VenueParams, enabled: bool, expected_upgrade_authority: Pubkey) -> Result<()> {
+        instructions::venue_admin::update_venue(ctx, params, enabled, expected_upgrade_authority)
     }
 
     // Admin or guardian

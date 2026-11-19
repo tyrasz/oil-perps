@@ -25,6 +25,7 @@ import {
   MarketMakerInfo,
   MmStatus,
   VenueApprovalParams,
+  VenueSides,
 } from "./types";
 import {
   findRegistryPda,
@@ -48,6 +49,7 @@ import {
   ONE_SHOT_APPROVAL_SECS,
   randomPositionNonce,
   worstCaseVenueMargin,
+  isFillableQuote,
 } from "./utils";
 
 // Default program ID - replace with actual deployed ID
@@ -56,19 +58,21 @@ export const MM_REGISTRY_PROGRAM_ID = new PublicKey(
 );
 
 // perps-core instructions are encoded here rather than through its IDL, so
-// the SDK only needs mm-registry's. Anchor discriminators: sha256("global:<name>")[..8].
+// the SDK only needs mm-registry's. Anchor discriminators: sha256("global:<name>")[..8],
+// also pinned by `sdk_layout_is_pinned`.
 const APPROVE_VENUE_DISCRIMINATOR = Buffer.from([254, 60, 62, 30, 179, 64, 176, 184]);
 const UPDATE_VENUE_APPROVAL_DISCRIMINATOR = Buffer.from([243, 224, 3, 21, 150, 246, 103, 7]);
 
-// Byte offsets in perps-core accounts (8-byte discriminator included)
+// Byte offsets in perps-core accounts (8-byte discriminator included).
+// Pinned by perps-core's `sdk_layout_is_pinned` test: change both together.
 const MARKET_PYTH_PRICE_FEED = 104;
 const MARKET_MAX_LEVERAGE = 144;
 const MARKET_INITIAL_MARGIN_RATIO = 152;
 const MARKET_WEEKEND_INITIAL_MARGIN_RATIO = 247;
-const VENUE_MAX_PRICE_DEVIATION_BPS = 168;
-const VENUE_MAX_ORACLE_AGE_SECS = 170;
-const VENUE_MIN_SIGNERS = 172;
-const VENUE_ENABLED = 173;
+const VENUE_MAX_PRICE_DEVIATION_BPS = 160;
+const VENUE_MAX_ORACLE_AGE_SECS = 162;
+const VENUE_MIN_SIGNERS = 164;
+const VENUE_ENABLED = 165;
 
 /** The perps-core Market fields a fill needs */
 export interface PerpsMarketInfo {
@@ -115,14 +119,15 @@ export interface TakerFill {
 }
 
 function encodeVenueApprovalParams(params: VenueApprovalParams): Buffer {
-  const data = Buffer.alloc(8 + 4 + 8 + 8 + 2 + 8);
+  const data = Buffer.alloc(8 + 4 + 8 + 8 + 2 + 8 + 1);
   let o = 0;
   data.set(params.allowance.toArrayLike(Buffer, "le", 8), o); o += 8;
   data.writeUInt32LE(params.maxLeverage, o); o += 4;
   data.set(params.maxBuyPrice.toArrayLike(Buffer, "le", 8), o); o += 8;
   data.set(params.minSellPrice.toArrayLike(Buffer, "le", 8), o); o += 8;
   data.writeUInt16LE(params.maxPriceDeviationBps, o); o += 2;
-  data.set(params.expiresAt.toTwos(64).toArrayLike(Buffer, "le", 8), o);
+  data.set(params.expiresAt.toTwos(64).toArrayLike(Buffer, "le", 8), o); o += 8;
+  data.writeUInt8(params.allowedSides, o);
   return data;
 }
 
@@ -250,7 +255,8 @@ export class MmRegistryClient {
     });
   }
 
-  async fetchActiveQuotes(registry: PublicKey): Promise<QuoteInfo[]> {
+  /** Fillable quotes only (see isFillableQuote); `now` defaults to local time. */
+  async fetchActiveQuotes(registry: PublicKey, now: number = Math.floor(Date.now() / 1000)): Promise<QuoteInfo[]> {
     if (!this.program) throw new Error("Program not set");
 
     const accounts = await this.program.account.twoSidedQuote.all([
@@ -266,7 +272,8 @@ export class MmRegistryClient {
 
     for (const acc of accounts) {
       const quote = acc.account as unknown as TwoSidedQuote;
-      if (!quote.isActive) continue;
+      // Only quotes fill_quote would accept: live, unexpired, migrated
+      if (!isFillableQuote(quote, now)) continue;
 
       const mm = await this.fetchMarketMaker(quote.marketMaker);
       if (!mm) continue;
@@ -622,13 +629,17 @@ export class MmRegistryClient {
     const venue = await this.fetchVenue(market, perpsProgramId);
     if (!venue.enabled) throw new Error("mm-registry venue is disabled");
 
-    const im =
+    // Gate leverage on the weekday initial margin (the program enforces the
+    // weekend one inside the pre-close window), but size the allowance for the
+    // stricter of the two so it covers either
+    const gateIm = options.initialMarginBps ?? marketInfo.initialMarginBps;
+    const sizingIm =
       options.initialMarginBps ??
       Math.max(marketInfo.initialMarginBps, marketInfo.weekendInitialMarginBps);
     // A sell fills at the bid, which may be above the limit
     const price = options.isBuy ? options.limitPrice : BN.max(options.limitPrice, quoteData.bidPrice);
     const allowance = worstCaseVenueMargin(
-      options.isBuy, options.size, price, options.takerLeverage, im, venue.maxPriceDeviationBps
+      options.isBuy, options.size, price, options.takerLeverage, sizingIm, venue.maxPriceDeviationBps, gateIm
     );
     if (allowance === null) throw new Error("Leverage is above what the initial margin allows");
     const now = options.now ?? Math.floor(Date.now() / 1000);
@@ -639,6 +650,8 @@ export class MmRegistryClient {
       minSellPrice: options.isBuy ? new BN(0) : options.limitPrice,
       maxPriceDeviationBps: 0,
       expiresAt: new BN(now + ONE_SHOT_APPROVAL_SECS),
+      // Only the side asked for: a buggy venue must not open the other side
+      allowedSides: options.isBuy ? VenueSides.Long : VenueSides.Short,
     }, perpsProgramId);
 
     const positionNonce = options.positionNonce ?? randomPositionNonce();

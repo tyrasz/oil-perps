@@ -42,6 +42,8 @@ struct Env {
     alice: Trader,
     bob: Trader,
     next_nonce: u64,
+    /// Passed to match_orders; 0 = no cap
+    max_fill_size: u64,
     position_rent: u64,
     order_rent: u64,
 }
@@ -65,7 +67,7 @@ impl Env {
         let bob = trader(&mut base, DEPOSIT).await;
         let rent = base.ctx.banks_client.get_rent().await.unwrap();
         let mut env = Env {
-            base, book, venue, alice, bob, next_nonce: 0,
+            base, book, venue, alice, bob, next_nonce: 0, max_fill_size: 0,
             position_rent: rent.minimum_balance(Position::LEN), order_rent: rent.minimum_balance(Order::LEN),
         };
         for kp in [env.alice.kp.insecure_clone(), env.bob.kp.insecure_clone()] {
@@ -157,7 +159,7 @@ impl Env {
             perps_core_program: perps_core::ID,
             system_program: system_program::ID,
         };
-        (ix(orderbook::ID, accounts, orderbook::instruction::MatchOrders { position_nonce: nonce }), fa)
+        (ix(orderbook::ID, accounts, orderbook::instruction::MatchOrders { position_nonce: nonce, max_fill_size: self.max_fill_size }), fa)
     }
 
     async fn send_match(&mut self, matcher: &Keypair, ix: Instruction) -> Result<(), BanksClientError> {
@@ -741,5 +743,56 @@ async fn match_compute_units() {
     println!("match_orders: {} CU", units);
     if is_sbf() {
         assert!(units > 0 && units < 200_000, "{} CU", units);
+    }
+}
+
+/// A cross bigger than the venue's per-fill cap can be split by the matcher.
+#[tokio::test]
+async fn big_crosses_split_under_the_fill_cap() {
+    let mut env = Env::new().await;
+    let admin = env.base.admin.insecure_clone();
+    let ua = program_upgrade_authority(&mut env.base, &orderbook::ID).await;
+    let capped = VenueParams { max_fill_notional: 500 * USDC, ..book_venue_params() };
+    update_venue(&mut env.base, &admin, &orderbook::ID, capped, true, ua).await.unwrap();
+    let (alice, bob) = (env.alice.kp.insecure_clone(), env.bob.kp.insecure_clone());
+    let ask = env.quick(&bob, OrderSide::Ask, 75.0, 10, 5).await;
+    let bid = env.quick(&alice, OrderSide::Bid, 75.0, 10, 5).await;
+    // All 10 at once is $750, over the $500 cap
+    env.admin_rejects(bid, ask, perps_err(PerpsError::FillTooLarge)).await;
+
+    env.max_fill_size = 5 * CONTRACT;
+    env.do_match(bid, ask).await;
+    let (b, a) = (env.order(bid).await, env.order(ask).await);
+    assert_eq!((b.filled_size, a.filled_size), (5 * CONTRACT, 5 * CONTRACT));
+    assert_eq!((b.status, a.status), (OrderStatus::PartiallyFilled, OrderStatus::PartiallyFilled));
+    env.do_match(bid, ask).await;
+    // Both filled and closed back to their owners
+    assert!(!exists(&mut env.base, bid).await && !exists(&mut env.base, ask).await);
+
+    // A cap below an order's minimum fill is still refused
+    let ask = env.quick(&bob, OrderSide::Ask, 75.0, 4, 5).await;
+    let bid = env.quick(&alice, OrderSide::Bid, 75.0, 4, 5).await;
+    env.max_fill_size = 1;
+    env.admin_rejects(bid, ask, err(ErrorCode::FillTooSmall)).await;
+}
+
+/// The old program marked orders Filled or Cancelled without closing them;
+/// their rent is reclaimable, without touching the book's counters again.
+#[tokio::test]
+async fn legacy_finished_orders_can_be_closed() {
+    let mut env = Env::new().await;
+    let alice = env.alice.kp.insecure_clone();
+    for status in [OrderStatus::Cancelled, OrderStatus::Filled] {
+        let order = env.quick(&alice, OrderSide::Bid, 74.0, 1, 5).await;
+        // As the old cancel/match left it: counters already decremented
+        patch::<Order>(&mut env.base, order, |o| o.status = status).await;
+        patch::<OrderBook>(&mut env.base, env.book, |b| b.total_bids -= 1).await;
+        let before = env.book_state().await.total_bids;
+        let owner_before = env.lamports(alice.pubkey()).await;
+        let rent = lamports(&mut env.base, order).await;
+        env.close_expired(order, alice.pubkey()).await.unwrap();
+        assert!(!exists(&mut env.base, order).await);
+        assert_eq!(env.book_state().await.total_bids, before);
+        assert_eq!(env.lamports(alice.pubkey()).await, owner_before + rent);
     }
 }

@@ -5,8 +5,11 @@ use crate::state::{ceil_div, Market, Position, Side};
 ///
 /// Only that program can sign for `authority` (its PDA `[b"perps_venue",
 /// market]`), so the record binds the program, the market and the signer
-/// together. `program_slot` pins the venue's ProgramData: any upgrade of the
-/// venue halts its fills until the admin re-attests with update_venue.
+/// together. `upgrade_authority` pins who can change the venue's code: if the
+/// venue's ProgramData names any other upgrade authority, fills halt until
+/// the admin re-attests with update_venue. (Pinning the deploy slot instead
+/// is griefable: loader ExtendProgram needs no authority and rewrites
+/// ProgramData.slot, so anyone could halt every venue for a few lamports.)
 #[account]
 #[derive(Default)]
 pub struct Venue {
@@ -14,7 +17,6 @@ pub struct Venue {
     pub program: Pubkey,              // venue program id
     pub authority: Pubkey,            // find_program_address([b"perps_venue", market], program).0
     pub program_data: Pubkey,         // find_program_address([program], bpf_loader_upgradeable).0
-    pub program_slot: u64,            // ProgramData.slot pinned at register/update
     pub max_fill_notional: u64,       // Per fill, at fill price (6 dp USDC)
     pub total_fills: u64,
     pub total_notional: u64,          // Saturating
@@ -23,6 +25,7 @@ pub struct Venue {
     pub min_signers: u8,              // 0..=2 of {taker, maker} must be signers of the CPI
     pub enabled: bool,
     pub bump: u8,
+    pub upgrade_authority: Pubkey,    // ProgramData upgrade authority pinned at register/update; default = immutable
 }
 
 impl Venue {
@@ -30,7 +33,7 @@ impl Venue {
     pub const AUTHORITY_SEED: &'static [u8] = b"perps_venue";
     // No venue-wide notional window: colluding wallets could fill it with wash
     // trades and shut the venue for everyone. Its bytes went to padding.
-    pub const LEN: usize = 8 + 32 * 4 + 8 * 4 + 2 + 2 + 1 + 1 + 1 + 92; // 267
+    pub const LEN: usize = 8 + 32 * 5 + 8 * 3 + 2 + 2 + 1 + 1 + 1 + 68; // 267
 }
 
 /// One owner's consent to fills through one venue in one role.
@@ -56,15 +59,21 @@ pub struct VenueApproval {
     pub max_price_deviation_bps: u16, // Adverse-only bound vs oracle; 0 = off
     pub bump: u8,
     pub role: u8,                     // ROLE_TAKER or ROLE_MAKER; part of the seeds
+    pub allowed_sides: u8,            // SIDE_LONG | SIDE_SHORT: which sides the owner may be put on
 }
 
 impl VenueApproval {
     pub const SEED: &'static [u8] = b"venue_approval";
-    pub const LEN: usize = 8 + 32 * 3 + 8 * 6 + 4 + 2 + 1 + 1 + 31; // 191
+    pub const LEN: usize = 8 + 32 * 3 + 8 * 6 + 4 + 2 + 1 + 1 + 1 + 30; // 191
 }
 
 pub const ROLE_TAKER: u8 = 0;
 pub const ROLE_MAKER: u8 = 1;
+
+/// VenueApproval.allowed_sides bits. A one-shot "buy" approval must not let a
+/// venue open a short for the owner instead.
+pub const SIDE_LONG: u8 = 1;
+pub const SIDE_SHORT: u8 = 2;
 
 pub const MAX_VENUE_BAND_BPS: u16 = 500;
 pub const MAX_VENUE_ORACLE_AGE_SECS: u16 = 60;
@@ -116,6 +125,44 @@ mod tests {
     use super::*;
     use crate::session;
 
+    /// sdk/mm-registry decodes these accounts by byte offset and hand-encodes
+    /// these instructions; a layout change here must change it too.
+    #[test]
+    fn sdk_layout_is_pinned() {
+        use anchor_lang::{AccountSerialize, Discriminator};
+        fn bytes<T: AccountSerialize>(account: &T) -> Vec<u8> {
+            let mut out = Vec::new();
+            account.try_serialize(&mut out).unwrap();
+            out
+        }
+        let feed = Pubkey::new_from_array([0xab; 32]);
+        let m = Market {
+            pyth_price_feed: feed, max_leverage: 0x0102_0304, initial_margin_ratio: 0x0506_0708,
+            weekend_initial_margin_ratio: 0x090a_0b0c, ..Default::default()
+        };
+        let b = bytes(&m);
+        assert_eq!(&b[104..136], feed.as_ref());
+        assert_eq!(&b[144..148], &0x0102_0304u32.to_le_bytes());
+        assert_eq!(&b[152..156], &0x0506_0708u32.to_le_bytes());
+        assert_eq!(&b[247..251], &0x090a_0b0cu32.to_le_bytes());
+
+        let v = Venue { max_price_deviation_bps: 0x0d0e, max_oracle_age_secs: 0x0f10, min_signers: 2, enabled: true, ..Default::default() };
+        let b = bytes(&v);
+        assert_eq!(&b[160..162], &0x0d0eu16.to_le_bytes());
+        assert_eq!(&b[162..164], &0x0f10u16.to_le_bytes());
+        assert_eq!((b[164], b[165]), (2, 1));
+
+        assert_eq!(crate::instruction::ApproveVenue::DISCRIMINATOR, [254, 60, 62, 30, 179, 64, 176, 184]);
+        assert_eq!(crate::instruction::UpdateVenueApproval::DISCRIMINATOR, [243, 224, 3, 21, 150, 246, 103, 7]);
+        // VenueApprovalParams as the SDK encodes it: 39 bytes, allowed_sides last
+        let params = crate::instructions::VenueApprovalParams {
+            allowance: 1, max_leverage: 2, max_buy_price: 3, min_sell_price: 4, max_price_deviation_bps: 5, expires_at: 6, allowed_sides: 7,
+        };
+        let enc = params.try_to_vec().unwrap();
+        assert_eq!(enc.len(), 39);
+        assert_eq!(enc[38], 7);
+    }
+
     const CONTRACT: u64 = 1_000_000;
     // Fri 2026-11-13 22:00 UTC is the weekly close
     const FRIDAY_CLOSE: i64 = 1_794_607_200;
@@ -137,9 +184,9 @@ mod tests {
     #[test]
     fn account_sizes_are_pinned() {
         assert_eq!(Venue::LEN, 267);
-        assert_eq!(8 + Venue::default().try_to_vec().unwrap().len() + 92, Venue::LEN);
+        assert_eq!(8 + Venue::default().try_to_vec().unwrap().len() + 68, Venue::LEN);
         assert_eq!(VenueApproval::LEN, 191);
-        assert_eq!(8 + VenueApproval::default().try_to_vec().unwrap().len() + 31, VenueApproval::LEN);
+        assert_eq!(8 + VenueApproval::default().try_to_vec().unwrap().len() + 30, VenueApproval::LEN);
     }
 
     #[test]

@@ -150,4 +150,10 @@ pub enum PerpsError {
 
     #[msg("Venue fill would open a position below initial margin")]
     VenueMarginInvariant,
+
+    #[msg("The approval does not allow this side")]
+    ApprovalSideNotAllowed,
+
+    #[msg("Venue approvals can only be written by a top-level instruction")]
+    ApprovalViaCpi,
 }
