@@ -26,12 +26,14 @@ const program = {
     position: { all: positionAll },
     market: { fetchMultiple: vi.fn(async () => [{ maintenanceMarginRatio: 500, cumulativeFunding: bn(0) }]) },
     userAccount: { fetchNullable: vi.fn(async () => null) },
+    lpPool: { fetchMultiple: vi.fn(async () => [{ params: { backstopThresholdBps: 6_667, liqPenaltyBps: 200 } }]) },
   },
 };
 vi.mock('./usePerpsProgram', () => ({ usePerpsProgram: () => ({ program }) }));
 vi.mock('../utils/pda', () => ({
   getCommodityMarket: (id: string) => key(`market-${id}`),
   getUserAccountPDA: () => [key('user-account')],
+  getLpPoolPDA: (m: { toBase58: () => string }) => [key(`pool-${m.toBase58()}`)],
   commodityForMarket: (m: { toBase58: () => string }) => m.toBase58().replace('market-', ''),
 }));
 
@@ -58,9 +60,26 @@ describe('useOnChainPositions', () => {
     const loads = positionAll.mock.calls.length;
 
     act(() => setOilPrice(71));
-    expect(result.current.positions[0].marginRatio).toBeCloseTo(4.667, 3);
+    // $350 equity on $7,100 mark notional
+    expect(result.current.positions[0].marginRatio).toBeCloseTo(4.93, 2);
     expect(result.current.positions[0].markPrice).toBe(71);
     expect(positionAll.mock.calls.length).toBe(loads);
+  });
+
+  it("shows the open price and the pool's partial-liquidation line", async () => {
+    // settle_position_pnl moved the PnL basis to $72; it opened at $75
+    const settled = { ...oilLong, account: { ...oilLong.account, entryPrice: bn(72_000_000), openedPrice: bn(75_000_000) } };
+    positionAll.mockResolvedValue([settled]);
+    setOilPrice(72);
+    const { result } = renderHook(() => useOnChainPositions());
+    await waitFor(() => expect(result.current.positions).toHaveLength(1));
+    const p = result.current.positions[0];
+    expect([p.entryPrice, p.openedPrice]).toEqual([72, 75]);
+    expect(p.liquidationThreshold).toBe(5);
+    expect(p.backstopThreshold).toBe(3.33);
+    expect(p.liquidationNote).toMatch(/part of the position/);
+    // $750 collateral on 100 long at $72: 5% of mark notional at (7200 - 750) / 95
+    expect(p.liquidationPrice).toBeCloseTo(6_450 / 95);
   });
 
   it('lists positions opened by a venue fill like any other', async () => {

@@ -6,11 +6,28 @@ import { usePositions } from '../hooks/usePositions';
 import { useOnChainMarket } from '../hooks/useOnChainMarket';
 import type { OrderSide } from '../types';
 import { estimateLiquidationPrice, formatLeverage, maxAllowedLeverage } from '../utils/leverage';
+import { liquidationPrice } from '../utils/positionHealth';
+import { useLpPool } from '../hooks/useLpPool';
+import {
+  acceptablePrice,
+  checkOpenCaps,
+  closeFee,
+  fromUnits,
+  houseQuote,
+  marginRatios,
+  openHeadroom,
+  poolView,
+  toUnits,
+} from '../utils/pool';
+import { explainProgramError } from '../utils/errors';
+import { DEFAULT_SLIPPAGE_BPS } from '../config/program';
 import { useMarketSession } from '../hooks/useMarketSession';
 import { SessionNotice } from './SessionNotice';
 
 // Maximum position size in USD value (per position)
 const MAX_POSITION_VALUE = 100_000; // $100k max per position
+const SLIPPAGE_OPTIONS_BPS = [10, DEFAULT_SLIPPAGE_BPS, 100];
+const fmtUsd = (x: number) => x.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 export function OrderEntry() {
   const { connected, publicKey } = useWallet();
@@ -33,6 +50,8 @@ export function OrderEntry() {
   } = useTrading();
   const { userAccount } = usePositions();
   const { marketData: onChainMarket } = useOnChainMarket();
+  const { data: poolData } = useLpPool(selectedCommodity.id);
+  const [slippageBps, setSlippageBps] = useState(DEFAULT_SLIPPAGE_BPS);
   const session = useMarketSession(onChainMarket);
   const preClose = session.state === 'pre-close';
   const canOpen = session.state === 'open' || preClose;
@@ -72,6 +91,46 @@ export function OrderEntry() {
     return notional / leverage;
   }, [size, price, market, leverage, orderType]);
 
+  // The house quote (docs/lp-pool.md §4.4): skew-impact execution price,
+  // margin and open fee, from the market and pool accounts and the latest
+  // price; plus how much the pool's caps still allow (§3).
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const house = useMemo(() => {
+    const sizeNum = parseFloat(size) || 0;
+    if (!poolData?.pool || !market?.price) return null;
+    const { market: m, pool } = poolData;
+    const oracle = toUnits(market.price);
+    const v = poolView(pool, m, oracle, nowSecs);
+    if (!v) return null;
+    const houseNotional = toUnits(userAccount?.houseEntryNotional ?? 0);
+    const headroom = openHeadroom(m, pool, v, houseNotional, oracle, nowSecs);
+    if (sizeNum <= 0) return { headroom, quote: null, capError: null };
+    const sizeUnits = toUnits(sizeNum);
+    const q = houseQuote(m, pool, side === 'long', sizeUnits, BigInt(Math.round(leverage * 1_000)), oracle, nowSecs);
+    if (!q.ok) return { headroom, quote: null, capError: q.error };
+    const capError = checkOpenCaps(m, pool, v, side === 'long', sizeUnits, oracle, houseNotional, q.value.notional, nowSecs);
+    const [, mmr] = marginRatios(m, nowSecs);
+    return {
+      headroom,
+      capError,
+      quote: {
+        ...q.value,
+        execUsd: fromUnits(q.value.exec),
+        marginUsd: fromUnits(q.value.margin),
+        feeUsd: fromUnits(q.value.fee),
+        closeFeeUsd: fromUnits(closeFee(sizeUnits, q.value.exec, m.takerFee)),
+        liqPrice: liquidationPrice(
+          { isLong: side === 'long', size: sizeNum, collateral: fromUnits(q.value.margin), entryPrice: fromUnits(q.value.exec) },
+          Number(mmr)
+        ),
+        acceptable: acceptablePrice(side === 'long', q.value.exec, slippageBps),
+      },
+    };
+    // nowSecs changes every render; the quote only needs refreshing with its inputs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [poolData, market?.price, size, side, leverage, slippageBps, userAccount?.houseEntryNotional]);
+  const quote = house?.quote ?? null;
+
   const handleSubmit = async () => {
     if (!connected || !publicKey || !size) return;
 
@@ -80,7 +139,8 @@ export function OrderEntry() {
     setSuccessMessage(null);
 
     try {
-      await openPosition(side, parseFloat(size), leverage);
+      // Bounded at the quoted execution price, `slippageBps` worse
+      await openPosition(side, parseFloat(size), leverage, { acceptablePrice: quote?.acceptable, slippageBps });
 
       // Reset form on success
       setSize('');
@@ -95,9 +155,12 @@ export function OrderEntry() {
     }
   };
 
-  const margin = calculateMargin();
+  // Collateral the open moves out of the free balance: margin plus the open fee
+  const margin = quote ? quote.marginUsd + quote.feeUsd : calculateMargin();
   const insufficientMargin = margin > 0 && margin > availableCollateral;
-  const liquidationPrice = market
+  const liqPrice = quote
+    ? quote.liqPrice
+    : market
     ? estimateLiquidationPrice(
         market.price,
         leverage,
@@ -132,20 +195,26 @@ export function OrderEntry() {
       };
     }
 
-    // Check if would exceed max open interest (from on-chain)
+    // Check if would exceed max open interest (from on-chain); the cap is in
+    // contracts per side (docs/lp-pool.md D6)
     if (onChainMarket && sizeNum > 0) {
       const currentOI = side === 'long'
         ? onChainMarket.longOpenInterest
         : onChainMarket.shortOpenInterest;
       const maxOI = onChainMarket.maxOpenInterest;
 
-      if (currentOI + notionalValue > maxOI && maxOI > 0) {
+      if (currentOI + sizeNum > maxOI && maxOI > 0) {
         const available = Math.max(0, maxOI - currentOI);
         return {
           valid: false,
-          error: `Exceeds max OI. Available: $${available.toLocaleString()}`,
+          error: `Exceeds max open interest. Available: ${available.toLocaleString()} ${selectedCommodity.contractUnit}s`,
         };
       }
+    }
+
+    // The pool's caps on house opens (net, weekend, per account) and freezes
+    if (sizeNum > 0 && house?.capError) {
+      return { valid: false, error: explainProgramError(house.capError, { action: 'open' }) };
     }
 
     // Check leverage doesn't exceed max
@@ -157,7 +226,7 @@ export function OrderEntry() {
     }
 
     return { valid: true, error: null };
-  }, [size, market, selectedCommodity, leverage, side, onChainMarket, maxLev]);
+  }, [size, market, selectedCommodity, leverage, side, onChainMarket, maxLev, house?.capError]);
 
   const formatPrice = (value: number) => value.toFixed(selectedCommodity.decimals);
 
@@ -236,29 +305,81 @@ export function OrderEntry() {
 
       <div className="order-summary">
         <div className="summary-row">
-          <span>Entry Price</span>
-          <span>${orderType === 'market' ? formatPrice(market?.price || 0) : price || formatPrice(market?.price || 0)}</span>
+          <span title="Execution price against the LP pool, including skew impact">Exec Price</span>
+          <span>
+            ${quote ? formatPrice(quote.execUsd) : orderType === 'market' ? formatPrice(market?.price || 0) : price || formatPrice(market?.price || 0)}
+            {quote && quote.impactBps !== 0 && (
+              <span className={quote.impactBps > 0 === (side === 'long') ? 'text-red' : 'text-green'}>
+                {' '}({quote.impactBps > 0 ? '+' : ''}{quote.impactBps.toFixed(2)} bps impact)
+              </span>
+            )}
+          </span>
+        </div>
+        <div className="summary-row">
+          <span>Max Slippage</span>
+          <span>
+            {SLIPPAGE_OPTIONS_BPS.map((bps) => (
+              <button
+                key={bps}
+                type="button"
+                className={`leverage-btn ${slippageBps === bps ? 'active' : ''}`}
+                onClick={() => setSlippageBps(bps)}
+              >
+                {bps / 100}%
+              </button>
+            ))}
+          </span>
         </div>
         <div className="summary-row">
           <span>Available Collateral</span>
           <span>${availableCollateral.toFixed(2)}</span>
         </div>
         <div className="summary-row">
-          <span>Margin Required</span>
+          <span title="Margin posted to the position plus the open fee">Margin Required</span>
           <span className={insufficientMargin ? 'text-red' : ''}>
             ${margin.toFixed(2)}
           </span>
         </div>
         <div className="summary-row">
-          <span>Est. Liq. Price</span>
+          <span title="Liquidation compares equity with the maintenance margin on mark notional">Est. Liq. Price</span>
           <span className={side === 'long' ? 'text-red' : 'text-green'}>
-            ${formatPrice(liquidationPrice)}
+            ${formatPrice(liqPrice)}
           </span>
         </div>
-        <div className="summary-row">
-          <span>Trading Fee</span>
-          <span>${(margin * leverage * 0.0005).toFixed(4)}</span>
-        </div>
+        {quote ? (
+          <>
+            <div className="summary-row">
+              <span>Open Fee</span>
+              <span>${quote.feeUsd.toFixed(4)}</span>
+            </div>
+            <div className="summary-row">
+              <span title="Charged on close, on the opened notional">Close Fee</span>
+              <span>${quote.closeFeeUsd.toFixed(4)}</span>
+            </div>
+          </>
+        ) : (
+          <div className="summary-row">
+            <span>Trading Fee</span>
+            <span>${(margin * leverage * 0.0005).toFixed(4)}</span>
+          </div>
+        )}
+        {house && (
+          <div className="summary-row" title="How much more the LP pool can take on this side before its caps bind">
+            <span>Pool Headroom ({side === 'long' ? 'long' : 'short'})</span>
+            <span>
+              {house.headroom.frozen && house.headroom.frozen !== 'PoolHasNoLps' && (side === 'long' ? house.headroom.long : house.headroom.short) === 0n
+                ? 'frozen'
+                : `${fmtUsd(fromUnits(side === 'long' ? house.headroom.long : house.headroom.short))} ${selectedCommodity.contractUnit}s`}
+              {house.headroom.netCap === 'weekend' && ' (weekend cap)'}
+            </span>
+          </div>
+        )}
+        {house?.headroom.account != null && (
+          <div className="summary-row" title="Per-account cap on notional traded against the pool">
+            <span>Your Headroom</span>
+            <span>${fmtUsd(fromUnits(house.headroom.account))}</span>
+          </div>
+        )}
       </div>
 
       <SessionNotice

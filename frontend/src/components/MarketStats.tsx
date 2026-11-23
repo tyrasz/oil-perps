@@ -13,6 +13,10 @@ export function MarketStats() {
     if (!onChainMarket) return;
 
     const updateCountdown = () => {
+      if (onChainMarket.settlementPrice > 0) {
+        setTimeToFunding('settled');
+        return;
+      }
       const now = Math.floor(Date.now() / 1000);
       const remaining = onChainMarket.nextFundingTime - now;
 

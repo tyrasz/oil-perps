@@ -44,7 +44,14 @@ import {
   findVenueApprovalPda,
   findVPositionPda,
   findVMakerPda,
+  findLpPoolPda,
 } from "./pda";
+import {
+  LpPoolInfo,
+  decodeLpPool,
+  MARKET_FUNDING_CARRY_SECS,
+  MARKET_SETTLED_AT,
+} from "./perpsPool";
 import {
   FILL_COMPUTE_UNITS,
   ONE_SHOT_APPROVAL_SECS,
@@ -66,6 +73,7 @@ const UPDATE_VENUE_APPROVAL_DISCRIMINATOR = Buffer.from([243, 224, 3, 21, 150, 2
 
 // Byte offsets in perps-core accounts (8-byte discriminator included).
 // Pinned by perps-core's `sdk_layout_is_pinned` test: change both together.
+// The LP pool's appended Market fields and the LpPool layout are in perpsPool.ts.
 const MARKET_PYTH_PRICE_FEED = 104;
 const MARKET_MAX_LEVERAGE = 144;
 const MARKET_INITIAL_MARGIN_RATIO = 152;
@@ -82,6 +90,10 @@ export interface PerpsMarketInfo {
   initialMarginBps: number;
   /** 0 = same as initialMarginBps */
   weekendInitialMarginBps: number;
+  /** Open seconds accrued but not yet charged as funding (docs/lp-pool.md §8) */
+  fundingCarrySecs: number;
+  /** Unix seconds settle_market ran; 0 = not settled (D35) */
+  settledAt: number;
 }
 
 /** perps-core's Venue record for mm-registry in a market */
@@ -577,6 +589,8 @@ export class MmRegistryClient {
         mmUser: findPerpsUserPda(mm.owner, market, perpsProgramId)[0],
         mmApproval: findVenueApprovalPda(mm.owner, venue, VenueRole.Maker, perpsProgramId)[0],
         mmPosition: findVMakerPda(takerPosition, perpsProgramId)[0],
+        // venue_fill account 17: the market's LP pool (docs/lp-pool.md §4.8, §16.1)
+        perpsLpPool: findLpPoolPda(market, perpsProgramId)[0],
         perpsCoreProgram: perpsProgramId,
         systemProgram: SystemProgram.programId,
       })
@@ -701,7 +715,20 @@ export class MmRegistryClient {
       maxLeverage: d.readUInt32LE(MARKET_MAX_LEVERAGE),
       initialMarginBps: d.readUInt32LE(MARKET_INITIAL_MARGIN_RATIO),
       weekendInitialMarginBps: d.readUInt32LE(MARKET_WEEKEND_INITIAL_MARGIN_RATIO),
+      fundingCarrySecs: d.readUInt32LE(MARKET_FUNDING_CARRY_SECS),
+      settledAt: Number(d.readBigInt64LE(MARKET_SETTLED_AT)),
     };
+  }
+
+  /** Decode the market's perps-core LpPool (no trading until it has LPs, D11). */
+  async fetchLpPool(
+    market: PublicKey,
+    perpsProgramId: PublicKey = PERPS_CORE_PROGRAM_ID
+  ): Promise<LpPoolInfo> {
+    const [address] = findLpPoolPda(market, perpsProgramId);
+    const info = await this.connection.getAccountInfo(address);
+    if (!info) throw new Error("perps-core LP pool not found for this market");
+    return decodeLpPool(info.data);
   }
 
   /** Decode perps-core's Venue record for this program in `market`. */

@@ -1,18 +1,24 @@
 //! Engine actions with their effects predicted by `model` (and their
-//! rejections by `predict`), checked against what the engine actually did
-//! (invariants 4, 8, 9, 9b and 10). Every action records a failed transaction
-//! in the error histogram.
+//! rejections by `model` and `predict`), checked against what the engine
+//! actually did (invariants 4, 8, 9, 9b and 10): after every landed
+//! transaction that touches the market or the LP pool, the engine's Market,
+//! LpPool, Position, UserAccount and LpPosition must equal the model's field
+//! by field, its events must be the model's, and its token flows go into the
+//! vault ledger (2b). Every action records a failed transaction in the error
+//! histogram.
 
-use crate::chain::{bad_debt_log, TxFailure};
+use crate::chain::{events, TxFailure};
 use crate::checks::Class;
 use crate::ledger::{Route, Settlement};
-use crate::model;
+use crate::model::{self, Deficit, FundingEv, St};
 use crate::predict::{self, Leg, Rej, Terms};
 use crate::support::*;
 use crate::world::Sim;
 use mm_registry::TwoSidedQuote;
+use perps_core::events::{BadDebt, FundingUpdated};
 use perps_core::instructions::VenueApprovalParams;
-use perps_core::state::{ExecutionSource, Market, Position, PositionStatus, Side, VenueApproval};
+use perps_core::state::{ExecutionSource, LpPosition, Market, Position, PositionStatus, Side, UserAccount, VenueApproval};
+use serde_json::json;
 
 /// A landed transaction: its program logs.
 pub struct TxOk {
@@ -34,7 +40,8 @@ pub struct FillPlan {
 
 /// State a fill's accounting is checked against.
 pub struct FillPre {
-    pub market: Market,
+    /// The market and pool before the fill
+    pub st: St,
     pub taker_free: u64,
     pub maker_free: u64,
     /// Allowance the fill draws from: the grant written in the same
@@ -67,17 +74,105 @@ impl Sim {
     pub async fn run(&mut self, label: &str, ixs: &[Instruction], signers: &[&Keypair], predicted: Option<Rej>) -> Result<TxOk, TxFailure> {
         let out = self.chain.exec(label, ixs, signers).await;
         let (tick, now) = (self.tick, self.now);
+        // The probes (adversary.rs) read how their transaction ended
+        self.last_failure = out.result.as_ref().err().cloned();
+        self.last_logs = out.logs.clone();
         match out.result {
             Ok(()) => {
                 self.checks.landed(tick, now, label, predicted);
+                // Every crank, inline or not, for the report (§17.4: none may drop periods)
+                for e in events::<FundingUpdated>(&out.logs) {
+                    self.metrics.funding_periods_dropped += e.periods_dropped;
+                    self.metrics.funding_updates.push(json!({
+                        "time": now, "by": label, "periods": e.periods, "periods_dropped": e.periods_dropped, "rate": e.rate,
+                        "step": e.step, "cumulative": e.cumulative_funding, "carry_secs": e.carry_secs, "price": self.px,
+                    }));
+                }
                 Ok(TxOk { logs: out.logs })
             }
             Err(f) => {
+                if f.code == "PoolCashInsufficient" {
+                    *self.pool_stats.cash_insufficient.entry(label.to_string()).or_default() += 1;
+                }
                 if self.checks.failure(tick, now, label, &f, predicted) == Class::Expected {
                     self.hit_rejection(predicted.unwrap());
                 }
                 Err(f)
             }
+        }
+    }
+
+    // --- checking a landed transaction against the model ----------------------------------
+
+    /// The engine's market and pool after a landed transaction must equal the
+    /// model's (invariant 9); the shadow (invariants 2a, 2c) moves to the
+    /// engine's state either way, so one difference is reported once.
+    pub async fn expect_st(&mut self, label: &str, model: &St) -> bool {
+        let chain = self.st().await;
+        let mut diffs = model::diff_market(&chain.m, &model.m);
+        diffs.extend(model::diff_pool(&chain.pool, &model.pool));
+        let (tick, now) = (self.tick, self.now);
+        let ok = self.checks.check(tick, now, "9_settlement_accounting", diffs.is_empty(), || {
+            format!("{}: market/pool differ from the model: {}", label, diffs.join("; "))
+        });
+        self.shadow = Some(chain);
+        ok
+    }
+
+    /// The shadow follows the chain after a transaction the model does not
+    /// price field by field (a landed rejection, already flagged).
+    pub async fn resync(&mut self) {
+        self.shadow = Some(self.st().await);
+    }
+
+    /// A position after a landed transaction must equal the model's.
+    pub async fn expect_position(&mut self, label: &str, address: Pubkey, model: &Position) -> Position {
+        let chain: Position = load(self.chain.base(), address).await;
+        let diffs = model::diff_position(&chain, model);
+        let (tick, now) = (self.tick, self.now);
+        self.checks.check(tick, now, "9_settlement_accounting", diffs.is_empty(), || {
+            format!("{}: position {} differs from the model: {}", label, address, diffs.join("; "))
+        });
+        chain
+    }
+
+    /// A UserAccount after a landed transaction must equal the model's.
+    pub async fn expect_user(&mut self, label: &str, address: Pubkey, model: &UserAccount) {
+        let chain: UserAccount = load(self.chain.base(), address).await;
+        let diffs = model::diff_user(&chain, model);
+        let (tick, now) = (self.tick, self.now);
+        self.checks.check(tick, now, "9_settlement_accounting", diffs.is_empty(), || {
+            format!("{}: user {} differs from the model: {}", label, address, diffs.join("; "))
+        });
+    }
+
+    pub async fn user_at(&mut self, address: Pubkey) -> UserAccount {
+        load(self.chain.base(), address).await
+    }
+
+    /// The transaction's FundingUpdated and BadDebt events are exactly the
+    /// model's crank (if any) and deficits (9, 9b).
+    pub fn check_events(&mut self, label: &str, logs: &[String], funding: Option<FundingEv>, deficits: &[Deficit]) {
+        let (tick, now) = (self.tick, self.now);
+        let got: Vec<(u64, u64, i64, i64, u32)> = events::<FundingUpdated>(logs).iter().map(|e| (e.periods, e.periods_dropped, e.rate, e.step, e.carry_secs)).collect();
+        let want: Vec<(u64, u64, i64, i64, u32)> = funding.iter().map(|e| (e.n, e.dropped, e.rate, e.step, e.carry)).collect();
+        self.checks.check(tick, now, "9_settlement_accounting", got == want, || {
+            format!("{}: FundingUpdated (periods, dropped, rate, step, carry) {:?}, model {:?}", label, got, want)
+        });
+        let got: Vec<(u8, u64, u64, u64, u64)> = events::<BadDebt>(logs).iter().map(|e| (e.side, e.deficit, e.insurance_paid, e.lp_absorbed, e.pending_added)).collect();
+        let want: Vec<(u8, u64, u64, u64, u64)> = deficits.iter().map(|d| (d.side as u8, d.d, d.ins_paid, d.lp_absorbed, d.pending)).collect();
+        self.checks.check(tick, now, "9b_bad_debt_accounting", got == want, || {
+            format!("{}: BadDebt (side, deficit, insurance, lp, pending) {:?}, model {:?}", label, got, want)
+        });
+        for d in deficits {
+            self.pool_stats.deficit_total += d.d;
+            self.pool_stats.deficit_beyond_insurance += d.d - d.ins_paid;
+            self.pool_stats.deficit_lp_absorbed += d.lp_absorbed;
+            self.pool_stats.deficit_pending += d.pending;
+            self.pool_stats.deficits.push(json!({
+                "time": now, "tick": tick, "by": label, "side": d.side as u8, "deficit_usdc": d.d as f64 / 1e6,
+                "insurance_usdc": d.ins_paid as f64 / 1e6, "lp_absorbed_usdc": d.lp_absorbed as f64 / 1e6, "pending_usdc": d.pending as f64 / 1e6,
+            }));
         }
     }
 
@@ -106,8 +201,13 @@ impl Sim {
         }
         let kp = self.agents[agent].t.kp.insecure_clone();
         let ix = self.deposit_ix(agent, amount);
-        if self.run("deposit", &[ix], &[&kp], None).await.is_ok() {
+        let user = self.agents[agent].t.user;
+        let (mut st, mut u) = (self.st().await, self.user_at(user).await);
+        let predicted = model::deposit(&mut st, &mut u, amount).err();
+        if self.run("deposit", &[ix], &[&kp], predicted).await.is_ok() {
             self.vault_expected += amount as i128;
+            self.expect_st("deposit", &st).await;
+            self.expect_user("deposit", user, &u).await;
         }
     }
 
@@ -115,13 +215,17 @@ impl Sim {
     pub async fn withdraw(&mut self, agent: usize, amount: u64, label: &str) -> bool {
         let free = self.user_of(agent).await.collateral_balance;
         let vault = vault_token_balance(self.chain.base()).await;
-        let predicted = predict::withdraw(free, amount, vault);
+        let user = self.agents[agent].t.user;
+        let (mut st, mut u) = (self.st().await, self.user_at(user).await);
+        let predicted = predict::withdraw(free, amount, vault).or(model::withdraw(&mut st, &mut u, amount).err());
         let wallet = self.wallet(agent).await;
         let kp = self.agents[agent].t.kp.insecure_clone();
         let ix = self.withdraw_ix(agent, amount);
         if self.run(label, &[ix], &[&kp], predicted).await.is_err() {
             return false;
         }
+        self.expect_st(label, &st).await;
+        self.expect_user(label, user, &u).await;
         let after_free = self.user_of(agent).await.collateral_balance;
         let paid = self.wallet(agent).await as i128 - wallet as i128;
         let (tick, now) = (self.tick, self.now);
@@ -146,7 +250,9 @@ impl Sim {
         let address = self.ledger.positions[idx].address;
         let free = self.user_of(owner).await.collateral_balance;
         let before: Position = load(self.chain.base(), address).await;
-        let predicted = predict::add_margin(free, amount);
+        let user = self.agents[owner].t.user;
+        let (mut st, mut u, mut p) = (self.st().await, self.user_at(user).await, before.clone());
+        let predicted = model::add_margin(&mut st, &mut u, &mut p, amount, self.now).err();
         let t = &self.agents[owner].t;
         let accounts = perps_core::accounts::AddMargin { owner: t.key(), user_account: t.user, market: self.chain.base.market, position: address, lp_pool: self.chain.base.lp_pool };
         let ix = ix(perps_core::ID, accounts, perps_core::instruction::AddMargin { amount });
@@ -162,6 +268,9 @@ impl Sim {
         self.checks.check(tick, now, "9_settlement_accounting", ok, || {
             format!("add_margin {} to {}: collateral {} -> {}, free {} -> {}", amount, address, before.collateral, after.collateral, free, after_free)
         });
+        self.expect_st(label, &st).await;
+        self.expect_user(label, user, &u).await;
+        let after = self.expect_position(label, address, &p).await;
         self.ledger.update(idx, after);
         self.hit("add_margin");
         true
@@ -174,46 +283,53 @@ impl Sim {
     // --- house: open_position at the oracle -------------------------------------------
 
     pub async fn open_house(&mut self, agent: usize, side: Side, size: u64, leverage: u32, label: &str) -> bool {
-        let m = self.market().await;
+        self.open_house_bounded(agent, side, size, leverage, 0, label).await
+    }
+
+    /// open_position against the pool at the skew price, `acceptable_price`
+    /// bounding it (0: none), predicted and checked by the model (§4.4).
+    pub async fn open_house_bounded(&mut self, agent: usize, side: Side, size: u64, leverage: u32, acceptable_price: u64, label: &str) -> bool {
+        let user = self.agents[agent].t.user;
         let owner = self.agents[agent].t.key();
-        let free = self.user_of(agent).await.collateral_balance;
-        let predicted = predict::open_position(&m, &self.ov(), self.now, free, side, size, leverage);
+        let (mut st, mut u) = (self.st().await, self.user_at(user).await);
+        let res = model::open(&mut st, &mut u, &self.ov(), self.now, side, size, leverage, acceptable_price);
+        let predicted = res.as_ref().err().copied();
         if !self.should_send(label, predicted) {
             return false;
         }
-        let (ix, position) = open_ix(self.chain.base(), &owner, side as u8, size, leverage).await;
+        let (ix, position) = open_ix_with(self.chain.base(), &owner, side as u8, size, leverage, acceptable_price).await;
         let kp = self.agents[agent].t.kp.insecure_clone();
-        if self.run(label, &[ix], &[&kp], predicted).await.is_err() {
-            return false;
-        }
-        let (tick, now, px) = (self.tick, self.now, self.px);
-        let p: Option<Position> = try_load(self.chain.base(), position).await;
-        let user = self.user_of(agent).await;
-        let after = self.market().await;
-        let expected = model::open_margin(&m, size, px, leverage, now);
-        let ok = match &p {
-            Some(p) => {
-                Some(p.collateral) == expected
-                    && p.entry_price == px
-                    && p.side == side
-                    && p.size == size
-                    && p.leverage == leverage
-                    && p.status == PositionStatus::Open
-                    && p.last_funding_payment == m.cumulative_funding
-                    && user.collateral_balance + p.collateral == free
-                    && open_interest(&after, side) == open_interest(&m, side) + size
-                    && after.total_positions == m.total_positions + 1
+        let Ok(ok) = self.run(label, &[ix], &[&kp], predicted).await else { return false };
+        let (tick, now) = (self.tick, self.now);
+        let Ok(out) = res else {
+            // Landed against the prediction (invariant 10 has it): track what the engine did
+            self.resync().await;
+            if let Some(p) = try_load::<Position>(self.chain.base(), position).await {
+                self.ledger.add_position(position, agent, Route::House, tick, p);
             }
-            None => false,
+            return true;
         };
-        self.checks.check(tick, now, "8_fill_accounting", ok, || {
-            format!("open_position {:?} {} @ {} {}x: expected collateral {:?}, got {:?}", side as u8, size, px, leverage, expected, p.as_ref().map(|p| (p.collateral, p.entry_price)))
+        self.expect_st(label, &st).await;
+        self.expect_user(label, user, &u).await;
+        let p = self.expect_position(label, position, &out.position).await;
+        self.check_events(label, &ok.logs, out.funding, &[]);
+        let m = &st.m;
+        self.checks.check(tick, now, "8_fill_accounting", p.market == self.chain.base.market && p.execution_source == ExecutionSource::OrderBook, || {
+            format!("open_position {}: wrong market or source", position)
         });
-        if let Some(p) = p {
-            self.ledger.add_position(position, agent, Route::House, tick, p);
-            self.metrics.record_volume(Route::House, model::notional(size, px) as u64);
-            self.agents[agent].stats.opens += 1;
-            self.hit("open_position");
+        // No house position is born below IM at the oracle either
+        let (im, _) = model::margin_ratios(m, now);
+        self.checks.check(tick, now, "8_fill_accounting", model::margin_ratio_bps(&p, self.px, m.cumulative_funding) >= im as i128, || {
+            format!("open_position {}: born below IM at the oracle ({} bps)", position, model::margin_ratio_bps(&p, self.px, m.cumulative_funding))
+        });
+        self.ledger.add_position(position, agent, Route::House, tick, p);
+        self.metrics.record_volume(Route::House, out.notional);
+        self.pool_stats.open_fees += out.fee;
+        self.pool_stats.house_opens += 1;
+        self.agents[agent].stats.opens += 1;
+        self.hit("open_position");
+        if out.exec != self.px {
+            self.hit("open_position.skew_impact");
         }
         true
     }
@@ -346,16 +462,16 @@ impl Sim {
             maker_free,
             taker_allowance: written.map(|w| w.allowance).or(self.ledger.approval_cap(&taker_approval)).unwrap_or(0),
             maker_allowance: self.ledger.approval_cap(&maker_approval).unwrap_or(0),
-            market: m,
+            st: model::St { m, pool: self.pool().await },
         };
         let mut ixs = vec![compute_budget_ix(300_000)];
         ixs.extend(approval_ix);
         ixs.push(fill_ix);
         let kp = self.agents[t.agent].t.kp.insecure_clone();
         let result = self.run(t.label, &ixs, &[&kp], predicted).await;
-        if result.is_err() {
+        let Ok(ok) = result else {
             return Some(false);
-        }
+        };
         if let Some(w) = written {
             // The owner's own grant, in this transaction
             self.ledger.track_approval(taker_approval, w.allowance);
@@ -369,7 +485,7 @@ impl Sim {
             route: Route::MmRegistry, taker: t.agent, maker: t.mm, taker_side: side, size, price,
             taker_leverage: t.leverage, maker_leverage: q.leverage, collusion: t.collusion,
         };
-        self.settle_fill(plan, pre, fa).await;
+        self.settle_fill(plan, pre, fa, &ok.logs).await;
         self.ledger.record_quote_fill(t.quote);
         if model::notional(size, price) > SDK_FILL_CAP as i128 {
             self.hit("fill.over_sdk_cap");
@@ -378,10 +494,10 @@ impl Sim {
     }
 
     /// Check a landed venue fill against the model and record both legs.
-    pub async fn settle_fill(&mut self, plan: FillPlan, pre: FillPre, fa: FillAccounts) -> Option<usize> {
+    pub async fn settle_fill(&mut self, plan: FillPlan, pre: FillPre, fa: FillAccounts, logs: &[String]) -> Option<usize> {
         let (tick, now, px) = (self.tick, self.now, self.px);
         let maker_side = opposite(plan.taker_side);
-        let m = &pre.market;
+        let m = &pre.st.m;
         let c_taker = model::venue_margin(m, plan.taker_side, plan.size, plan.price, px, plan.taker_leverage, now);
         let c_maker = model::venue_margin(m, maker_side, plan.size, plan.price, px, plan.maker_leverage, now);
         let taker_pos: Option<Position> = try_load(self.chain.base(), fa.taker_position).await;
@@ -389,6 +505,29 @@ impl Sim {
         let taker_free = self.user_of(plan.taker).await.collateral_balance;
         let maker_free = self.user_of(plan.maker).await.collateral_balance;
         let after = self.market().await;
+        // The pool's side: the inline crank, both legs into the aggregates (§4.8)
+        let mut st = pre.st.clone();
+        let fill = match (c_taker, c_maker) {
+            (Some(tc), Some(mc)) => model::fill(&mut st, plan.taker_side, plan.size, plan.price, tc, mc, px, now).ok(),
+            _ => None,
+        };
+        match fill {
+            Some(ev) => {
+                // A matched pair leaves U where it was (§2.3)
+                let u_before = model::view(&pre.st.pool, &pre.st.m, px, now).map(|v| v.u);
+                let mut cranked = pre.st.clone();
+                model::crank(&mut cranked.m, px, now);
+                let u_cranked = model::view(&cranked.pool, &cranked.m, px, now).map(|v| v.u);
+                let u_after = model::view(&st.pool, &st.m, px, now).map(|v| v.u);
+                self.checks.check(tick, now, "2c_pool_aggregates", u_cranked.is_ok() && u_cranked == u_after, || {
+                    format!("{} fill moved U: {:?} (before the crank {:?}) -> {:?}", plan.route.name(), u_cranked, u_before, u_after)
+                });
+                self.expect_st(plan.route.name(), &st).await;
+                self.check_events(plan.route.name(), logs, ev, &[]);
+            }
+            None => self.resync().await,
+        }
+        let m = &st.m;
 
         let leg_ok = |p: &Option<Position>, owner: Pubkey, side: Side, lev: u32, c: Option<u64>| match p {
             Some(p) => {
@@ -407,9 +546,9 @@ impl Sim {
             && c_taker.map_or(false, |c| pre.taker_free.checked_sub(c) == Some(taker_free))
             && c_maker.map_or(false, |c| pre.maker_free.checked_sub(c) == Some(maker_free))
             && born_ok(&taker_pos) && born_ok(&maker_pos)
-            && after.long_open_interest == m.long_open_interest + plan.size
-            && after.short_open_interest == m.short_open_interest + plan.size
-            && after.total_positions == m.total_positions;
+            && after.long_open_interest == pre.st.m.long_open_interest + plan.size
+            && after.short_open_interest == pre.st.m.short_open_interest + plan.size
+            && after.total_positions == pre.st.m.total_positions;
         self.checks.check(tick, now, "8_fill_accounting", ok, || {
             format!(
                 "{} fill {} {} @ {} (oracle {}): expected margins {:?}/{:?}, positions {:?}/{:?}, free {}->{} / {}->{}",
@@ -454,119 +593,358 @@ impl Sim {
 
     /// close_position for the tracked position `idx`, checked against the model.
     pub async fn close_tracked(&mut self, idx: usize, label: &str) -> bool {
+        self.close_bounded(idx, 0, label).await
+    }
+
+    /// close_position with an `acceptable_price` bound (0: none), §4.5.
+    pub async fn close_bounded(&mut self, idx: usize, acceptable_price: u64, label: &str) -> bool {
         let address = self.ledger.positions[idx].address;
         let owner = self.ledger.positions[idx].owner;
-        let p: Position = load(self.chain.base(), address).await;
-        let m = self.market().await;
-        let predicted = predict::close_position(&m, &self.ov(), self.now);
+        let user = self.agents[owner].t.user;
+        let before: Position = load(self.chain.base(), address).await;
+        let (mut st, mut u, mut p) = (self.st().await, self.user_at(user).await, before.clone());
+        let res = model::close_position(&mut st, &mut p, &mut u, &self.ov(), self.now, acceptable_price);
+        let predicted = res.as_ref().err().copied();
         if !self.should_send(label, predicted) {
             return false;
         }
-        let mark = predict::close_mark(&m, &self.ov());
         let wallet = self.wallet(owner).await;
-        let ix = close_ix(&self.chain.base, &self.agents[owner].t, address);
+        let ix = close_ix_with(&self.chain.base, &self.agents[owner].t, address, acceptable_price);
         let kp = self.agents[owner].t.kp.insecure_clone();
         let Ok(ok) = self.run(label, &[ix], &[&kp], predicted).await else { return false };
-        let (tick, now) = (self.tick, self.now);
-        let expected = model::close(&m, &p, mark);
-        let after_p: Position = load(self.chain.base(), address).await;
-        let after_m = self.market().await;
         let paid = self.wallet(owner).await as i128 - wallet as i128;
-        let fine = paid == expected.payout as i128
-            && after_m.insurance_fund == expected.fund_after
-            && after_p.status == PositionStatus::Closed
-            && after_p.realized_pnl as i128 == expected.realized
-            && open_interest(&after_m, p.side) == open_interest(&m, p.side) - p.size;
-        self.checks.check(tick, now, "9_settlement_accounting", fine, || {
-            format!("close of {} ({:?} {} @ {}, collateral {}) at {}: expected {:?}, paid {}, realized {}, fund {} -> {}", address, p.side as u8, p.size, p.entry_price, p.collateral, mark, expected, paid, after_p.realized_pnl, m.insurance_fund, after_m.insurance_fund)
-        });
-        self.check_bad_debt_log("close", &ok.logs, expected.deficit, expected.uncovered);
-        // 2b: the vault pays what the model says it pays
-        self.vault_expected -= expected.payout as i128;
-        self.ledger.update(idx, after_p);
-        let settlement = Settlement {
-            liquidated: false, paid, insurance_delta: after_m.insurance_fund as i128 - m.insurance_fund as i128,
-            collateral: p.collateral, mark, cumulative_funding: m.cumulative_funding, uncovered: expected.uncovered,
+        let Ok(out) = res else {
+            self.resync().await;
+            self.vault_expected -= paid;
+            let after: Position = load(self.chain.base(), address).await;
+            self.ledger.update(idx, after);
+            return true;
         };
-        self.ledger.settle(idx, settlement);
+        let (tick, now) = (self.tick, self.now);
+        self.expect_st(label, &st).await;
+        self.expect_user(label, user, &u).await;
+        let after = self.expect_position(label, address, &p).await;
+        let deficits: Vec<Deficit> = out.deficit.into_iter().collect();
+        self.check_events(label, &ok.logs, out.funding, &deficits);
+        self.checks.check(tick, now, "9_settlement_accounting", paid == out.payout as i128, || {
+            format!("close of {}: paid {}, model {} ({:?})", address, paid, out.payout, out)
+        });
+        // 2b: the vault pays what the model says it pays
+        self.vault_expected -= out.payout as i128;
+        self.ledger.update(idx, after);
+        self.record_close_piece(idx, &before, &out, paid, st.m.cumulative_funding, false);
         self.check_pair(idx).await;
-        self.metrics.record_close(&expected);
+        self.metrics.record_close(out.fee, out.deficit.map_or(0, |d| d.d));
         self.hit("close");
-        if m.settlement_price > 0 {
+        if st.m.settlement_price > 0 {
             self.hit("close.at_settlement");
         }
-        if expected.deficit > 0 {
+        if out.exec != out.mark {
+            self.hit("close.skew_impact");
+        }
+        if out.solvency_hc + out.bad_debt_hc > 0 {
+            self.hit("close.haircut");
+        }
+        if let Some(d) = out.deficit {
             self.hit("close.deficit");
-            self.record_bad_debt("close", idx, expected.deficit, expected.uncovered, 0, after_m.insurance_fund);
+            self.record_bad_debt("close", idx, &d);
         }
         let a = &mut self.agents[owner];
         a.stats.closes += 1;
-        a.stats.fees_paid += expected.fee;
+        a.stats.fees_paid += out.fee;
         if let Some(book) = a.mm.as_mut() {
-            book.econ.close_fees += expected.fee;
+            book.econ.close_fees += out.fee;
         }
         true
     }
 
-    /// 9b: the engine's own "Bad debt: deficit=, uncovered=" message matches the model exactly.
-    pub fn check_bad_debt_log(&mut self, what: &str, logs: &[String], deficit: u64, uncovered: u64) {
-        let logged = bad_debt_log(logs);
-        let ok = if deficit > 0 { logged == Some((deficit, uncovered)) } else { logged.is_none() };
+    /// Record a full close (close_position or close_settled_position) of `idx`.
+    pub fn record_close_piece(&mut self, idx: usize, before: &Position, out: &model::CloseOut, paid: i128, cumulative_funding: i64, settled_close: bool) {
+        let piece = Settlement {
+            liquidated: false, paid, fees: out.fee as i128, top_up: 0, collateral: before.collateral as i128, realized: out.p,
+            haircut: (out.solvency_hc + out.bad_debt_hc) as i128, deficit: out.deficit.map_or(0, |d| d.d as i128),
+            insurance_draw: out.deficit.map_or(0, |d| d.ins_paid as i128), mark: out.exec, oracle: out.mark,
+            cumulative_funding, pieces: 1, done: true,
+        };
+        self.pool_stats.haircut("solvency", out.solvency_hc);
+        self.pool_stats.haircut("bad_debt", out.bad_debt_hc);
+        self.ledger.settle(idx, piece);
         let (tick, now) = (self.tick, self.now);
-        self.checks.check(tick, now, "9b_bad_debt_accounting", ok, || {
-            format!("{}: model deficit {} uncovered {}, engine logged {:?}", what, deficit, uncovered, logged)
+        let s = self.ledger.positions[idx].settled;
+        let address = self.ledger.positions[idx].address;
+        self.checks.check(tick, now, "4_pair_settlement", piece.balanced(), || {
+            format!("{} of {}: paid {} + fees {} != collateral {} + realized {} - haircut {} + deficit {}{}",
+                if settled_close { "settled close" } else { "close" }, address, piece.paid, piece.fees, piece.collateral, piece.realized, piece.haircut, piece.deficit,
+                if s.balanced() { "" } else { " (and over its life)" })
         });
     }
 
-    pub fn record_bad_debt(&mut self, kind: &str, idx: usize, deficit: u64, uncovered: u64, top_up: u64, fund_after: u64) {
-        if uncovered > 0 {
-            self.hit("bad_debt.uncovered");
+    /// A deficit was booked through the waterfall.
+    pub fn record_bad_debt(&mut self, kind: &str, idx: usize, d: &Deficit) {
+        if d.pending > 0 {
+            self.hit("bad_debt.pending");
         }
-        self.metrics.uncovered_bad_debt += uncovered;
+        if d.lp_absorbed > 0 {
+            self.hit("bad_debt.lp_absorbed");
+        }
+        self.metrics.uncovered_bad_debt += d.d - d.ins_paid;
         let owner = self.ledger.positions[idx].owner;
         self.metrics.bad_debt_events.push(serde_json::json!({
             "kind": kind, "time": self.now, "tick": self.tick, "owner": self.agents[owner].name, "route": self.ledger.positions[idx].route.name(),
-            "deficit_usdc": deficit as f64 / 1e6, "uncovered_usdc": uncovered as f64 / 1e6, "reward_top_up_usdc": top_up as f64 / 1e6,
-            "insurance_after_usdc": fund_after as f64 / 1e6,
+            "deficit_usdc": d.d as f64 / 1e6, "insurance_usdc": d.ins_paid as f64 / 1e6, "lp_absorbed_usdc": d.lp_absorbed as f64 / 1e6,
+            "pending_usdc": d.pending as f64 / 1e6,
         }));
     }
 
-    /// Invariant 4, once both legs of `idx`'s pair have settled (closed or
-    /// liquidated, at any marks): everything the vault paid out for the pair,
-    /// plus what the insurance fund gained from it, equals both legs'
-    /// collateral, plus the vault's PnL from settling them at different marks
-    /// and funding stamps, plus bad debt nobody absorbed. With equal marks and
-    /// stamps that PnL is exactly zero (spec 2.2: "closing both pays out
-    /// c_T + c_M - fee_T - fee_M").
+    /// Invariant 4, once both legs of `idx`'s pair are fully settled (closed,
+    /// liquidated, ADL'd, in any number of pieces, at any marks): what left
+    /// the pair (payouts, keeper rewards, fees and penalties, less insurance's
+    /// reward top-ups) equals both legs' collateral plus what they realized,
+    /// less haircuts, plus the deficits the waterfall absorbed. Settled each
+    /// in one piece at the same price and funding index, the legs realized
+    /// exactly opposite amounts (§2.3: matched pairs cancel).
     pub async fn check_pair(&mut self, idx: usize) {
         let Some(pair) = self.ledger.positions[idx].pair else { return };
         let (t, k) = (self.ledger.pairs[pair].taker, self.ledger.pairs[pair].maker);
-        let (Some(st), Some(sk)) = (self.ledger.positions[t].settled, self.ledger.positions[k].settled) else { return };
-        let leg = |i: usize, s: &Settlement| {
-            let p = &self.ledger.positions[i].state;
-            model::pnl(p.side, p.size, p.entry_price, s.mark) + model::funding(p.side, p.size, p.last_funding_payment, s.cumulative_funding)
-        };
-        let vault_pnl = leg(t, &st) + leg(k, &sk);
-        let lhs = st.paid + st.insurance_delta + sk.paid + sk.insurance_delta;
-        let rhs = st.collateral as i128 + sk.collateral as i128 + vault_pnl + st.uncovered as i128 + sk.uncovered as i128;
-        let same_mark = st.mark == sk.mark && st.cumulative_funding == sk.cumulative_funding;
+        let (st, sk) = (self.ledger.positions[t].settled, self.ledger.positions[k].settled);
+        if !(st.done && sk.done) {
+            return;
+        }
+        let lhs = st.paid + st.fees - st.top_up + sk.paid + sk.fees - sk.top_up;
+        let rhs = st.collateral + st.realized - st.haircut + st.deficit + sk.collateral + sk.realized - sk.haircut + sk.deficit;
+        let one_piece = st.pieces == 1 && sk.pieces == 1;
+        let same_mark = one_piece && st.mark == sk.mark && st.cumulative_funding == sk.cumulative_funding;
         let (tick, now) = (self.tick, self.now);
         let (ta, ka) = (self.ledger.positions[t].address, self.ledger.positions[k].address);
-        self.checks.check(tick, now, "4_pair_settlement", lhs == rhs && (!same_mark || vault_pnl == 0), || {
-            format!("pair {} / {}: paid + insurance {} != collateral + vault PnL {} + uncovered ({} = {} + {} + {} + {} + {}); marks {} / {}",
-                ta, ka, lhs, vault_pnl, rhs, st.collateral, sk.collateral, vault_pnl, st.uncovered, sk.uncovered, st.mark, sk.mark)
+        self.checks.check(tick, now, "4_pair_settlement", lhs == rhs && (!same_mark || st.realized + sk.realized == 0), || {
+            format!("pair {} / {}: out {} != collateral + realized - haircut + deficit {}; realized {} + {} (same mark {})", ta, ka, lhs, rhs, st.realized, sk.realized, same_mark)
         });
         self.hit(if same_mark { "pair.settled_same_mark" } else { "pair.settled_different_marks" });
         if self.ledger.pairs[pair].collusion {
-            // 12: closed together, the colluders only moved value between themselves
-            let closed_together = same_mark && !st.liquidated && !sk.liquidated;
-            let no_draw = st.uncovered == 0 && sk.uncovered == 0 && st.insurance_delta >= 0 && sk.insurance_delta >= 0;
-            let zero_sum = st.paid + sk.paid + st.insurance_delta + sk.insurance_delta == st.collateral as i128 + sk.collateral as i128;
-            self.checks.check(tick, now, "12_collusion_no_bad_debt", !closed_together || (no_draw && zero_sum), || {
-                format!("colluding pair {} / {} closed at {}: paid {} + {}, insurance {} + {}, collateral {} + {}", ta, ka, st.mark, st.paid, sk.paid, st.insurance_delta, sk.insurance_delta, st.collateral, sk.collateral)
+            // 12: closed back to back at one oracle price, the colluders took
+            // nothing from the pool and nothing from insurance: the skew
+            // prices of the two closes favour the pool (§2.4)
+            let together = one_piece && !st.liquidated && !sk.liquidated && st.oracle == sk.oracle && st.cumulative_funding == sk.cumulative_funding;
+            let no_draw = st.deficit == 0 && sk.deficit == 0 && st.insurance_draw == 0 && sk.insurance_draw == 0;
+            self.checks.check(tick, now, "12_collusion_no_bad_debt", !together || (no_draw && st.realized + sk.realized <= 0), || {
+                format!("colluding pair {} / {} closed at {}: realized {} + {}, deficits {} + {}", ta, ka, st.oracle, st.realized, sk.realized, st.deficit, sk.deficit)
             });
         }
     }
+
+    // --- LP flows (§9) ------------------------------------------------------------------------
+
+    /// lp_deposit by LP wallet `lp`, checked against the model.
+    pub async fn lp_deposit(&mut self, lp: usize, amount: u64, min_shares_out: u64, label: &str) -> bool {
+        let (mut st, mut pos) = (self.st().await, self.lp_position(lp).await);
+        let predicted = model::lp_deposit(&mut st, &mut pos, amount, min_shares_out, &self.ov(), self.now).err();
+        if !self.should_send(label, predicted) {
+            return false;
+        }
+        let ix = lp_deposit_ix(&self.chain.base, &self.lps[lp].lp, amount, min_shares_out);
+        let kp = self.lps[lp].lp.kp.insecure_clone();
+        let pre = self.st().await;
+        if self.run(label, &[ix], &[&kp], predicted).await.is_err() {
+            return false;
+        }
+        self.check_lp_gates(label, LpFlow::Deposit, &pre, None);
+        self.vault_expected += amount as i128;
+        self.after_lp(label, lp, &st, &pos, predicted).await;
+        self.hit("lp_deposit");
+        true
+    }
+
+    pub async fn lp_request(&mut self, lp: usize, shares: u64, label: &str) -> bool {
+        let (mut st, mut pos) = (self.st().await, self.lp_position(lp).await);
+        let predicted = model::lp_request(&mut st, &mut pos, shares, &self.ov(), self.now).err();
+        if !self.should_send(label, predicted) {
+            return false;
+        }
+        let ix = lp_request_ix(&self.chain.base, &self.lps[lp].lp, shares);
+        let kp = self.lps[lp].lp.kp.insecure_clone();
+        let pre = self.st().await;
+        if self.run(label, &[ix], &[&kp], predicted).await.is_err() {
+            return false;
+        }
+        self.check_lp_gates(label, LpFlow::Request, &pre, None);
+        self.after_lp(label, lp, &st, &pos, predicted).await;
+        self.hit("lp_request");
+        true
+    }
+
+    pub async fn lp_cancel(&mut self, lp: usize, label: &str) -> bool {
+        let (mut st, mut pos) = (self.st().await, self.lp_position(lp).await);
+        let predicted = model::lp_cancel(&mut st, &mut pos).err();
+        if !self.should_send(label, predicted) {
+            return false;
+        }
+        let b = &self.chain.base;
+        let l = &self.lps[lp].lp;
+        let ix = ix(perps_core::ID, perps_core::accounts::LpCancelWithdrawal { owner: l.key(), lp_pool: b.lp_pool, lp_position: l.position },
+            perps_core::instruction::LpCancelWithdrawal {});
+        let kp = l.kp.insecure_clone();
+        if self.run(label, &[ix], &[&kp], predicted).await.is_err() {
+            return false;
+        }
+        self.after_lp(label, lp, &st, &pos, predicted).await;
+        self.hit("lp_cancel");
+        true
+    }
+
+    /// lp_withdraw by `lp`: the tokens it received (None: not sent or failed).
+    pub async fn lp_withdraw(&mut self, lp: usize, label: &str) -> Option<u64> {
+        let (mut st, mut pos) = (self.st().await, self.lp_position(lp).await);
+        let res = model::lp_withdraw(&mut st, &mut pos, &self.ov(), self.now);
+        let predicted = res.as_ref().err().copied();
+        if !self.should_send(label, predicted) {
+            return None;
+        }
+        let tokens = self.lps[lp].lp.tokens;
+        let wallet = token_balance(self.chain.base(), tokens).await;
+        let ix = lp_withdraw_ix(&self.chain.base, &self.lps[lp].lp);
+        let kp = self.lps[lp].lp.kp.insecure_clone();
+        let (pre, pre_pos) = (self.st().await, self.lp_position(lp).await);
+        self.run(label, &[ix], &[&kp], predicted).await.ok()?;
+        self.check_lp_gates(label, LpFlow::Withdraw, &pre, Some(&pre_pos));
+        let got = token_balance(self.chain.base(), tokens).await - wallet;
+        self.vault_expected -= got as i128;
+        let (tick, now) = (self.tick, self.now);
+        if let Ok(value) = res {
+            self.checks.check(tick, now, "9_settlement_accounting", got == value, || format!("{}: LP received {}, model {}", label, got, value));
+        }
+        self.after_lp(label, lp, &st, &pos, predicted).await;
+        self.hit("lp_withdraw");
+        Some(got)
+    }
+
+    /// Invariant 14: an LP flow that landed passed every gate of §9 (D17,
+    /// F5, F12), recomputed here from the sim's own schedule and the
+    /// accounts as they were before it: in session (or settled), funding
+    /// current, and for deposits and withdrawals no pending bad debt and not
+    /// inside `Q`; for withdrawals also not inside `W`, past the delay and
+    /// within the claim window, and once settled past the settled quiet time (D41).
+    fn check_lp_gates(&mut self, label: &str, flow: LpFlow, pre: &St, pos: Option<&LpPosition>) {
+        let (now, tick) = (self.now, self.tick);
+        let p = &pre.pool.params;
+        let settled = pre.m.settlement_price > 0;
+        let open = crate::schedule::is_open(now);
+        let mut broken: Vec<String> = Vec::new();
+        if !settled {
+            if !open {
+                broken.push("market closed".into());
+            }
+            let since = open_secs_between(pre.m.last_funding_time, now) + pre.m.funding_carry_secs as i64;
+            if since >= pre.m.funding_interval {
+                broken.push(format!("funding stale ({} open s due)", since));
+            }
+            let quiet = open && p.lp_reopen_quiet_secs > 0 && !crate::schedule::is_open(now - p.lp_reopen_quiet_secs as i64);
+            if quiet && flow != LpFlow::Request {
+                broken.push("inside Q".into());
+            }
+            if flow == LpFlow::Withdraw && crate::schedule::in_pre_close_window(now, p.weekend_cap_window_secs) {
+                broken.push("inside W".into());
+            }
+        }
+        // D41: a settled withdrawal waits out the longer quiet time after settled_at
+        let settled_quiet = p.profit_close_quiet_secs.max(p.lp_reopen_quiet_secs) as i64;
+        if settled && flow == LpFlow::Withdraw && pre.m.settled_at > 0 && now - pre.m.settled_at < settled_quiet {
+            broken.push("inside the settled quiet time".into());
+        }
+        let pending = pre.pool.pending_bad_debt_long + pre.pool.pending_bad_debt_short;
+        if pending > 0 && flow != LpFlow::Request {
+            broken.push(format!("{} bad debt pending", pending));
+        }
+        if let (LpFlow::Withdraw, Some(pos)) = (flow, pos) {
+            if now < pos.unlock_at {
+                broken.push("before the delay".into());
+            }
+            let window = crate::pool_math::effective_claim_window_secs(pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
+            if !settled && window > 0 && open_secs_between(pos.unlock_at, now) as u64 > window {
+                broken.push("after the claim window".into());
+            }
+        }
+        self.checks.check(tick, now, crate::checks::LP_GATES, broken.is_empty(), || format!("{} landed at {}: {}", label, now, broken.join(", ")));
+    }
+
+    /// donate_to_pool of `amount` by agent `donor` (minted to its wallet
+    /// first), checked against the model: `(recovered, vesting)`.
+    pub async fn donate(&mut self, donor: usize, amount: u64, label: &str) -> Option<(u64, u64)> {
+        let (mut st, now) = (self.st().await, self.now);
+        let res = model::donate(&mut st, amount, now);
+        let predicted = res.as_ref().err().copied();
+        if !self.should_send(label, predicted) {
+            return None;
+        }
+        let tokens = self.agents[donor].t.tokens;
+        mint_to(self.chain.base(), tokens, amount).await;
+        self.total_minted += amount;
+        self.agents[donor].minted += amount;
+        let b = &self.chain.base;
+        let accounts = perps_core::accounts::DonateToPool {
+            donor: self.agents[donor].t.key(), market: b.market, lp_pool: b.lp_pool, vault_token_account: b.vault_token,
+            donor_token_account: tokens, token_program: spl_token::ID,
+        };
+        let ix = ix(perps_core::ID, accounts, perps_core::instruction::DonateToPool { amount });
+        let kp = self.agents[donor].t.kp.insecure_clone();
+        let landed = self.run(label, &[ix], &[&kp], predicted).await.is_ok();
+        if !landed {
+            // The tokens stay in the donor's wallet
+            return None;
+        }
+        self.vault_expected += amount as i128;
+        match res {
+            Ok(out) => {
+                self.expect_st(label, &st).await;
+                self.hit("donate_to_pool");
+                Some(out)
+            }
+            Err(_) => {
+                self.resync().await;
+                None
+            }
+        }
+    }
+
+    async fn after_lp(&mut self, label: &str, lp: usize, st: &St, pos: &LpPosition, predicted: Option<Rej>) {
+        if predicted.is_some() {
+            self.resync().await;
+            return;
+        }
+        self.expect_st(label, st).await;
+        let chain = self.lp_position(lp).await;
+        let diffs = model::diff_lp(&chain, pos);
+        let (tick, now) = (self.tick, self.now);
+        self.checks.check(tick, now, "9_settlement_accounting", diffs.is_empty(), || {
+            format!("{}: LpPosition of {} differs from the model: {}", label, self.lps[lp].name, diffs.join("; "))
+        });
+        self.pool_stats.lp_flows.push(json!({ "time": now, "tick": tick, "lp": self.lps[lp].name, "what": label, "shares": chain.shares, "pending": chain.pending_shares }));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LpFlow {
+    Deposit,
+    Request,
+    Withdraw,
+}
+
+/// Open seconds of the CME session in `[from, to)`, from the sim's own
+/// schedule: sessions open and close on whole minutes, so one sample per
+/// minute is exact.
+pub fn open_secs_between(from: i64, to: i64) -> i64 {
+    if to <= from {
+        return 0;
+    }
+    let mut open = 0;
+    let mut t = from;
+    while t < to {
+        let step = (60 - t.rem_euclid(60)).min(to - t);
+        if crate::schedule::is_open(t) {
+            open += step;
+        }
+        t += step;
+    }
+    open
 }
 
 /// The ledger tracks every approval the sim's agents created.
@@ -575,17 +953,7 @@ fn exists_sync(ledger: &crate::ledger::Ledger, address: &Pubkey) -> bool {
 }
 
 pub fn opposite(side: Side) -> Side {
-    match side {
-        Side::Long => Side::Short,
-        Side::Short => Side::Long,
-    }
-}
-
-pub fn open_interest(m: &Market, side: Side) -> u64 {
-    match side {
-        Side::Long => m.long_open_interest,
-        Side::Short => m.short_open_interest,
-    }
+    model::opposite(side)
 }
 
 /// The taker's one-shot allowance: the margin a fill at `price` posts at the
@@ -597,4 +965,42 @@ pub fn worst_case_margin(m: &Market, side: Side, size: u64, price: u64, leverage
     let lo = ((p * 10_000 + 10_000 + b - 1) / (10_000 + b)) as u64;
     let hi = (p * 10_000 / (10_000 - b)) as u64;
     [lo, price, hi].iter().map(|&o| model::venue_margin(m, side, size, price, o, leverage, now).unwrap_or(0)).max().unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_secs_between;
+    use crate::support::WEDNESDAY;
+
+    /// The LP-gate check's open-seconds count (sim schedule) agrees with
+    /// perps-core's session.rs over three weeks, DST change included.
+    #[test]
+    fn open_seconds_match_the_engine() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..400 {
+            let a = WEDNESDAY - 10 * 86_400 + (next() % (21 * 86_400)) as i64 / 60 * 60;
+            let b = a + (next() % (4 * 86_400)) as i64 / 60 * 60;
+            assert_eq!(open_secs_between(a, b), crate::session::open_seconds_between(1, a, b), "{} .. {}", a, b);
+        }
+    }
+
+    /// The gate check's reopen quiet test (open now, closed Q earlier) is
+    /// the engine's `seconds_since_open < Q`.
+    #[test]
+    fn quiet_test_matches_the_engine() {
+        let q = 1_800;
+        let mut t = WEDNESDAY - 7 * 86_400;
+        while t < WEDNESDAY + 7 * 86_400 {
+            let sim = crate::schedule::is_open(t) && !crate::schedule::is_open(t - q);
+            let engine = crate::session::seconds_since_open(1, t).map_or(false, |s| s < q);
+            assert_eq!(sim, engine, "at {}", t);
+            t += 300;
+        }
+    }
 }

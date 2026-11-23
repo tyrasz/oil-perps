@@ -50,11 +50,15 @@ pub struct Oracle {
     pub gaps: Vec<(i64, f64)>,
     pub outages: u32,
     pub wide_conf: u32,
+    /// The next reopen's gap, set by the adversarial scenario (overrides the drawn one)
+    pub forced_gap: Option<f64>,
+    /// Moves the adversarial scenario made inside a session: (time, signed move %)
+    pub shocks: Vec<(i64, f64)>,
 }
 
 impl Oracle {
     pub fn new(cfg: OracleConfig, start_price: f64) -> Oracle {
-        Oracle { cfg, price: start_price, was_open: true, closed_secs: 0, outage_ticks: 0, jumps: Vec::new(), gaps: Vec::new(), outages: 0, wide_conf: 0 }
+        Oracle { cfg, price: start_price, was_open: true, closed_secs: 0, outage_ticks: 0, jumps: Vec::new(), gaps: Vec::new(), outages: 0, wide_conf: 0, forced_gap: None, shocks: Vec::new() }
     }
 
     /// Advance by `dt` seconds to `now`, `open` being the session state at `now`.
@@ -70,13 +74,15 @@ impl Oracle {
                 // Reopen: a weekend closure gaps by the weekend range, a daily break by its own
                 let weekend = self.closed_secs > 6 * 3_600;
                 let range = if weekend { Some(self.cfg.weekend_gap) } else { self.cfg.daily_gap };
-                let gap = match range {
+                let drawn = match range {
                     Some((lo, hi)) => {
                         let g = rng.gen_range(lo..hi);
                         if rng.gen_bool(0.5) { g } else { -g }
                     }
                     None => normal(rng) * 0.0025,
                 };
+                // The draw is made either way, so the path after it does not depend on the override
+                let gap = self.forced_gap.take().unwrap_or(drawn);
                 self.price *= 1.0 + gap;
                 moved = true;
                 self.gaps.push((now, gap * 100.0));
@@ -112,6 +118,16 @@ impl Oracle {
             self.wide_conf += 1;
         }
         Publication { price, conf, published }
+    }
+}
+
+impl Oracle {
+    /// Move the price to `price` (6 dp) now, inside a session: the
+    /// adversarial scenario's flash move. The caller publishes it.
+    pub fn shock_to(&mut self, now: i64, price: u64) {
+        let before = self.price;
+        self.price = price as f64 / 1e6;
+        self.shocks.push((now, (self.price / before - 1.0) * 100.0));
     }
 }
 

@@ -39,11 +39,16 @@ fn request_mark(feed: &AccountInfo, m: &Market, now: i64) -> Result<u64> {
     Ok(mark)
 }
 
-/// Mark for `lp_withdraw` (§9.4 step 3): settled → settlement price;
-/// otherwise in session, a fresh oracle, outside `W` and `Q`, funding current.
+/// Mark for `lp_withdraw` (§9.4 step 3): settled → settlement price, once
+/// the settled quiet time has passed (D41); otherwise in session, a fresh
+/// oracle, outside `W` and `Q`, funding current.
 #[inline(never)]
 fn withdraw_mark(feed: &AccountInfo, m: &Market, p: &PoolParams, now: i64) -> Result<u64> {
     if m.is_settled() {
+        require!(
+            !pool_math::settled_withdraw_quiet(m.settled_at, now, p.profit_close_quiet_secs, p.lp_reopen_quiet_secs),
+            PerpsError::LpFlowWindowClosed
+        );
         return Ok(m.settlement_price);
     }
     require!(m.is_in_session(now), PerpsError::MarketClosed);

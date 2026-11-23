@@ -42,3 +42,13 @@ export const PYTH_PRICE_FEEDS: Record<string, PublicKey> = {
 export const PRICE_DECIMALS = 6; // All prices stored with 6 decimals
 export const LEVERAGE_DECIMALS = 3; // Leverage uses 3 decimals (10x = 10000)
 export const COLLATERAL_DECIMALS = 6; // USDC has 6 decimals
+
+// House trades (docs/lp-pool.md §4.4, §4.5): the worst price a trade accepts
+// is the quoted execution price moved this far against the trader. The quote
+// uses the app's price feed, so this also absorbs its gap to the oracle.
+export const DEFAULT_SLIPPAGE_BPS = 50;
+// TP/SL closes: bound at the trigger price, max_impact_bps plus this much
+// worse (§16.5), so a trigger never closes with no bound at all.
+export const TRIGGER_EXTRA_SLIPPAGE_BPS = 100;
+// LP deposits: minimum shares accepted, this far below the quoted shares.
+export const LP_DEPOSIT_SLIPPAGE_BPS = 50;

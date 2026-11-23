@@ -138,15 +138,18 @@ mod tests {
         let feed = Pubkey::new_from_array([0xab; 32]);
         let m = Market {
             pyth_price_feed: feed, max_leverage: 0x0102_0304, initial_margin_ratio: 0x0506_0708,
-            weekend_initial_margin_ratio: 0x090a_0b0c, funding_carry_secs: 0x1112_1314, ..Default::default()
+            weekend_initial_margin_ratio: 0x090a_0b0c, funding_carry_secs: 0x1112_1314,
+            settled_at: 0x1516_1718_191a_1b1c, ..Default::default()
         };
         let b = bytes(&m);
         assert_eq!(&b[104..136], feed.as_ref());
         assert_eq!(&b[144..148], &0x0102_0304u32.to_le_bytes());
         assert_eq!(&b[152..156], &0x0506_0708u32.to_le_bytes());
         assert_eq!(&b[247..251], &0x090a_0b0cu32.to_le_bytes());
-        // Appended by the LP pool (docs/lp-pool.md §1.1); the SDK does not read it
+        // Appended by the LP pool (docs/lp-pool.md §1.1, D35); the SDK reads
+        // both (sdk/mm-registry PerpsMarketInfo fundingCarrySecs / settledAt)
         assert_eq!(&b[283..287], &0x1112_1314u32.to_le_bytes());
+        assert_eq!(&b[287..295], &0x1516_1718_191a_1b1ci64.to_le_bytes());
 
         let v = Venue { max_price_deviation_bps: 0x0d0e, max_oracle_age_secs: 0x0f10, min_signers: 2, enabled: true, ..Default::default() };
         let b = bytes(&v);

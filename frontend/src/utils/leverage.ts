@@ -34,9 +34,10 @@ export function maxAllowedLeverage(
 }
 
 /**
- * Price at which a new position hits maintenance margin, ignoring fees and
- * funding: equity / entry notional = maintenance margin, with
- * collateral = notional / leverage.
+ * Price at which a new position becomes liquidatable, ignoring fees and
+ * funding: equity / **mark** notional = maintenance margin (docs/lp-pool.md
+ * §6.1), with collateral = entry notional / leverage. Long:
+ * `e·(1 − 1/L) / (1 − m)`; short: `e·(1 + 1/L) / (1 + m)`.
  */
 export function estimateLiquidationPrice(
   entryPrice: number,
@@ -45,8 +46,8 @@ export function estimateLiquidationPrice(
   maintenanceMarginBps: number = DEFAULT_MAINTENANCE_MARGIN_BPS
 ): number {
   if (entryPrice <= 0 || leverage <= 0) return 0;
-  const buffer = 1 / leverage - maintenanceMarginBps / BPS;
-  const price = side === 'long' ? entryPrice * (1 - buffer) : entryPrice * (1 + buffer);
+  const m = maintenanceMarginBps / BPS;
+  const price = side === 'long' ? (entryPrice * (1 - 1 / leverage)) / (1 - m) : (entryPrice * (1 + 1 / leverage)) / (1 + m);
   return Math.max(0, price);
 }
 

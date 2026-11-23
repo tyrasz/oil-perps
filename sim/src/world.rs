@@ -15,7 +15,7 @@ use crate::support::*;
 use mm_registry::instructions::{InitializeRegistryParams, PostQuoteParams, UpdateQuoteParams};
 use orderbook::PlaceOrderParams;
 use perps_core::instructions::{VenueApprovalParams, VenueParams};
-use perps_core::state::{Market, UserAccount};
+use perps_core::state::{LpPool, LpPosition, Market, UserAccount};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use solana_program_test::processor;
@@ -83,11 +83,45 @@ pub struct Sim {
     pub settled: bool,
     /// Session state last tick, and whether this tick is the first one closed
     pub was_open: bool,
+    /// The session reopened at the last clock move (a tick or an unwind warp)
+    pub just_reopened: bool,
     pub at_edge: bool,
     /// Tick of the last reopen after a closed session
     pub last_reopen_tick: u64,
     /// Scripted adversarial actions (adversarial scenario)
     pub adversary: crate::adversary::AdversaryState,
+    /// LP wallets: index 0 is the protocol's seed LP (the admin key)
+    pub lps: Vec<LpWallet>,
+    /// The market and pool as the model left them after the last landed
+    /// transaction that touches them (invariants 2a and 2c compare it with
+    /// the chain every tick: nothing may move the pool unmodelled)
+    pub shadow: Option<crate::model::St>,
+    /// Pool series and counters for the report
+    pub pool_stats: crate::metrics::PoolStats,
+    /// How the last transaction sent failed (None: it landed)
+    pub last_failure: Option<crate::chain::TxFailure>,
+    /// The last transaction's logs (its events)
+    pub last_logs: Vec<String>,
+    /// The end-of-run unwind has started
+    pub unwinding: bool,
+}
+
+/// An LP: the harness's wallet (token account, LpPosition) and what it put in and took out.
+pub struct LpWallet {
+    pub name: String,
+    pub lp: Lp,
+    pub minted: u64,
+    pub persona: crate::agents::LpPersona,
+    /// When it last tried a flow on its own (agents.rs paces itself)
+    pub last_try: i64,
+    /// Flows it sent on its own: (what, outcome) -> count
+    pub tries: std::collections::BTreeMap<String, u64>,
+}
+
+impl LpWallet {
+    pub fn new(name: &str, lp: Lp, minted: u64, persona: crate::agents::LpPersona) -> LpWallet {
+        LpWallet { name: name.into(), lp, minted, persona, last_try: 0, tries: Default::default() }
+    }
 }
 
 struct Spec {
@@ -104,7 +138,8 @@ struct Spec {
 impl Spec {
     fn new(name: &'static str, persona: Persona, usdc: u64, strategy: Strategy) -> Spec {
         let registers_mm = persona == Persona::MarketMaker || name == "colluder-a";
-        let approves_book = matches!(persona, Persona::Limit | Persona::LimitBig) || name.starts_with("colluder");
+        let approves_book = matches!(persona, Persona::Limit | Persona::LimitBig)
+            || ["colluder", "gap-", "cross-"].iter().any(|p| name.starts_with(p));
         Spec { name, persona, usdc, strategy, registers_mm, approves_book }
     }
 }
@@ -113,7 +148,9 @@ impl Sim {
     pub async fn new(cfg: Config) -> Sim {
         let mut pt = ProgramTest::new("mm_registry", mm_registry::ID, processor!(mm_process));
         pt.add_program("orderbook", orderbook::ID, processor!(book_process));
-        let mut base = start(pt).await;
+        // Production pool parameters with a one-day withdrawal delay, seeded
+        // with the protocol's $1M at t0 (D11, docs/lp-pool.md §16.7)
+        let mut base = start_with(pt, crate::chain::pool_params()).await;
         if !is_sbf() {
             crate::quiet_events::install();
         }
@@ -145,6 +182,8 @@ impl Sim {
 
         let mut rng = StdRng::seed_from_u64(cfg.seed);
         let now = now(&mut base).await;
+        let seed_lp = Lp { kp: base.seed_lp.kp.insecure_clone(), tokens: base.seed_lp.tokens, position: base.seed_lp.position };
+        let seed = LpWallet::new("protocol-seed", seed_lp, LP_SEED, crate::agents::LpPersona::Seed);
         let (weekend_gap, daily_gap) = cfg.scenario.gaps();
         let oracle_cfg = OracleConfig { weekend_gap, daily_gap, ..OracleConfig::default() };
         let mut sim = Sim {
@@ -171,9 +210,16 @@ impl Sim {
             paused: false,
             settled: false,
             was_open: true,
+            just_reopened: false,
             at_edge: false,
             last_reopen_tick: 0,
             adversary: Default::default(),
+            lps: vec![seed],
+            shadow: None,
+            pool_stats: Default::default(),
+            last_failure: None,
+            last_logs: Vec::new(),
+            unwinding: false,
             rng: StdRng::seed_from_u64(rng.gen()),
             oracle_rng: StdRng::seed_from_u64(cfg.seed ^ 0x6f72_6163_6c65),
             cfg,
@@ -181,7 +227,24 @@ impl Sim {
         for spec in sim.roster(&mut rng) {
             sim.add_agent(spec).await;
         }
+        // Public LPs (agents.rs), and the adversarial scenario's sandwiching LP
+        let mut lps = vec![
+            ("lp-steady", 200_000 * USDC, crate::agents::LpPersona::Steady),
+            ("lp-gap", 100_000 * USDC, crate::agents::LpPersona::Gap),
+            ("lp-lapse", 50_000 * USDC, crate::agents::LpPersona::Lapse),
+        ];
+        if sim.cfg.scenario == Scenario::Adversarial {
+            lps.push(("lp-sandwich", 300_000 * USDC, crate::agents::LpPersona::Sandwich));
+            // Holds a matured request for the withdrawal-gate probes
+            lps.push(("lp-probe", 50_000 * USDC, crate::agents::LpPersona::Sandwich));
+        }
+        for (name, usdc, persona) in lps {
+            let w = lp(sim.chain.base(), usdc).await;
+            sim.total_minted += usdc;
+            sim.lps.push(LpWallet::new(name, w, usdc, persona));
+        }
         sim.vault_expected = vault_token_balance(sim.chain.base()).await as i128;
+        sim.shadow = Some(sim.st().await);
         sim
     }
 
@@ -232,6 +295,11 @@ impl Sim {
                     specs.push(Spec::new(name, Persona::Colluder, 40_000 * USDC, Strategy::mm(0.0, 0, 0)));
                 }
                 specs.push(Spec::new("prober", Persona::Prober, 20_000 * USDC, Strategy::mm(0.0, 0, 0)));
+                // The probes' own wallets (adversary.rs): a pair carried over a
+                // forced gap, and a pair that self-crosses to push the net
+                for name in ["gap-a", "gap-b", "cross-a", "cross-b"] {
+                    specs.push(Spec::new(name, Persona::Prober, 400_000 * USDC, Strategy::mm(0.0, 0, 0)));
+                }
             }
         }
         specs
@@ -282,6 +350,21 @@ impl Sim {
 
     pub async fn market(&mut self) -> Market {
         market(self.chain.base()).await
+    }
+
+    pub async fn pool(&mut self) -> LpPool {
+        let address = self.chain.base.lp_pool;
+        load(self.chain.base(), address).await
+    }
+
+    /// The market and its pool, as the model takes them.
+    pub async fn st(&mut self) -> crate::model::St {
+        crate::model::St { m: self.market().await, pool: self.pool().await }
+    }
+
+    pub async fn lp_position(&mut self, lp: usize) -> LpPosition {
+        let address = self.lps[lp].lp.position;
+        load(self.chain.base(), address).await
     }
 
     pub async fn user_of(&mut self, agent: usize) -> UserAccount {
@@ -346,14 +429,45 @@ impl Sim {
         ix(perps_core::ID, accounts, perps_core::instruction::WithdrawCollateral { amount })
     }
 
-    pub fn liquidate_ix(&self, owner: &Pubkey, position: Pubkey) -> Instruction {
+    /// liquidate by `liquidator`, its reward to `reward_to` (the keeper's wallet,
+    /// or the owner's own in the self-liquidation probe).
+    pub fn liquidate_ix(&self, liquidator: &Pubkey, reward_to: Pubkey, owner: &Pubkey, position: Pubkey) -> Instruction {
         let b = &self.chain.base;
         let accounts = perps_core::accounts::Liquidate {
-            liquidator: self.keeper.key(), position_owner: *owner, user_account: user_pda(owner, &b.market), market: b.market,
-            position, vault: b.vault, vault_token_account: b.vault_token, liquidator_token_account: self.keeper.tokens,
+            liquidator: *liquidator, position_owner: *owner, user_account: user_pda(owner, &b.market), market: b.market,
+            position, vault: b.vault, vault_token_account: b.vault_token, liquidator_token_account: reward_to,
             pyth_price_feed: b.oracle, token_program: spl_token::ID, lp_pool: b.lp_pool,
         };
         ix(perps_core::ID, accounts, perps_core::instruction::Liquidate {})
+    }
+
+    pub fn settle_pnl_ix(&self, position: Pubkey) -> Instruction {
+        settle_pnl_ix(&self.chain.base, &self.keeper.key(), position)
+    }
+
+    /// adl by `signer` (the keeper for mode 0; the admin, the pool's adl_keeper, for mode 1).
+    pub fn adl_ix(&self, signer: &Pubkey, owner: &Pubkey, position: Pubkey, mode: u8, size: u64) -> Instruction {
+        adl_ix(&self.chain.base, signer, owner, position, mode, size)
+    }
+
+    pub fn close_settled_ix(&self, owner: &Pubkey, position: Pubkey) -> Instruction {
+        let b = &self.chain.base;
+        let accounts = perps_core::accounts::CloseSettledPosition {
+            signer: self.keeper.key(), market: b.market, lp_pool: b.lp_pool, position, position_owner: *owner, user_account: user_pda(owner, &b.market),
+        };
+        ix(perps_core::ID, accounts, perps_core::instruction::CloseSettledPosition {})
+    }
+
+    pub fn sweep_ix(&self) -> Instruction {
+        let b = &self.chain.base;
+        let accounts = perps_core::accounts::SweepInsuranceExcess { signer: self.keeper.key(), market: b.market, lp_pool: b.lp_pool };
+        ix(perps_core::ID, accounts, perps_core::instruction::SweepInsuranceExcess {})
+    }
+
+    pub fn write_off_ix(&self) -> Instruction {
+        let b = &self.chain.base;
+        let accounts = perps_core::accounts::WriteOffBadDebt { signer: self.keeper.key(), market: b.market, lp_pool: b.lp_pool };
+        ix(perps_core::ID, accounts, perps_core::instruction::WriteOffBadDebt {})
     }
 
     pub fn update_funding_ix(&self) -> Instruction {

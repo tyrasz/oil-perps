@@ -2,8 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { PublicKey } from '@solana/web3.js';
 import { usePerpsProgram } from './usePerpsProgram';
-import { commodityForMarket, getCommodityMarket, getUserAccountPDA } from '../utils/pda';
-import { accruedFunding, positionHealth, positionMarketState, type PositionMarketParams } from '../utils/positionHealth';
+import { commodityForMarket, getCommodityMarket, getLpPoolPDA, getUserAccountPDA } from '../utils/pda';
+import {
+  accruedFunding,
+  liquidationPrice,
+  positionHealth,
+  positionMarketState,
+  type PositionMarketParams,
+} from '../utils/positionHealth';
 import { PRICE_DECIMALS, LEVERAGE_DECIMALS } from '../config/program';
 import { useMarketStore } from '../stores/marketStore';
 import type { MarketData, Position, ClosedPosition, UserAccount } from '../types';
@@ -25,7 +31,13 @@ interface OnChainPosition {
     status: { open?: object; closed?: object; liquidated?: object };
     executionSource: { orderBook?: object; amm?: object; venue?: object };
     bump: number;
+    /** Price the position opened at; never changes (docs/lp-pool.md §1.1). */
+    openedPrice?: { toNumber: () => number };
   };
+}
+
+interface OnChainPoolParams {
+  params?: { backstopThresholdBps?: number; liqPenaltyBps?: number };
 }
 
 interface OnChainMarketRisk {
@@ -44,6 +56,7 @@ interface OnChainUserAccount {
   totalTrades: { toNumber: () => number };
   realizedPnl: { toNumber: () => number };
   bump: number;
+  houseEntryNotional?: { toNumber: () => number };
 }
 
 /** An open position as read from chain, before pricing. */
@@ -55,6 +68,8 @@ export interface RawOpenPosition {
   size: number;
   collateral: number;
   entryPrice: number;
+  /** Open price; `entryPrice` is the PnL basis, which settle_position_pnl moves. */
+  openedPrice: number;
   leverage: number;
   openedAt: number;
   /** Funding owed to (+) or by (-) the position as of the fetch, USDC. */
@@ -73,11 +88,8 @@ const toUnits = (n: number) => n / Math.pow(10, PRICE_DECIMALS);
 export function pricePosition(raw: RawOpenPosition, markets: Record<string, MarketData>, now: number): Position {
   const state = positionMarketState(raw.market, now);
   const price = state.settlementPrice ?? (markets[raw.commodity]?.price || raw.entryPrice);
-  const { unrealizedPnl, marginRatio } = positionHealth(
-    { isLong: raw.isLong, size: raw.size, collateral: raw.collateral, entryPrice: raw.entryPrice },
-    price,
-    raw.funding
-  );
+  const amounts = { isLong: raw.isLong, size: raw.size, collateral: raw.collateral, entryPrice: raw.entryPrice };
+  const { unrealizedPnl, marginRatio } = positionHealth(amounts, price, raw.funding);
   return {
     address: raw.address,
     owner: raw.owner,
@@ -86,12 +98,16 @@ export function pricePosition(raw: RawOpenPosition, markets: Record<string, Mark
     size: raw.size,
     collateral: raw.collateral,
     entryPrice: raw.entryPrice,
+    openedPrice: raw.openedPrice,
     leverage: raw.leverage,
     unrealizedPnl,
     marginRatio,
     openedAt: raw.openedAt,
     markPrice: price,
     liquidationThreshold: state.liquidationThreshold,
+    backstopThreshold: state.backstopThreshold,
+    liquidationNote: state.liquidationNote,
+    liquidationPrice: state.settlementPrice !== null ? undefined : liquidationPrice(amounts, state.liquidationThreshold * 100, raw.funding),
     warningThreshold: state.warningThreshold,
     settled: state.settlementPrice !== null,
     closeBlockedReason: state.closeBlockedReason,
@@ -134,9 +150,22 @@ export function useOnChainPositions() {
     const marketAccounts = marketKeys.length
       ? ((await program.account.market.fetchMultiple(marketKeys)) as unknown as (OnChainMarketRisk | null)[])
       : [];
+    // Each market's pool sets the partial-liquidation (backstop) line. A
+    // failed or missing pool leaves the neutral rule: full closes only.
+    let poolAccounts: (OnChainPoolParams | null)[] = [];
+    if (marketKeys.length) {
+      try {
+        const marketByKey = new Map(open.map((acc) => [acc.account.market.toBase58(), acc.account.market]));
+        const poolKeys = marketKeys.map((k) => getLpPoolPDA(marketByKey.get(k)!)[0]);
+        poolAccounts = (await program.account.lpPool.fetchMultiple(poolKeys)) as unknown as (OnChainPoolParams | null)[];
+      } catch (err) {
+        console.warn('Failed to fetch LP pools:', err);
+      }
+    }
     const marketInfo = new Map(
       marketKeys.map((key, i) => {
         const m = marketAccounts[i];
+        const poolParams = poolAccounts[i]?.params;
         return [key, {
           cumulativeFunding: toUnits(m?.cumulativeFunding?.toNumber() ?? 0),
           params: m ? {
@@ -145,6 +174,8 @@ export function useOnChainPositions() {
             sessionSchedule: m.sessionSchedule ?? 0,
             preCloseWindowSecs: m.preCloseWindowSecs ?? 0,
             settlementPrice: m.settlementPrice?.toNumber() ?? 0,
+            backstopThresholdBps: poolParams?.backstopThresholdBps,
+            liqPenaltyBps: poolParams?.liqPenaltyBps,
           } : null,
         }];
       })
@@ -162,6 +193,8 @@ export function useOnChainPositions() {
         size,
         collateral: toUnits(acc.account.collateral.toNumber()),
         entryPrice: toUnits(acc.account.entryPrice.toNumber()),
+        // Zero on accounts written before the field existed: fall back to entry
+        openedPrice: toUnits(acc.account.openedPrice?.toNumber() || acc.account.entryPrice.toNumber()),
         leverage: acc.account.leverage / Math.pow(10, LEVERAGE_DECIMALS),
         openedAt: acc.account.openedAt.toNumber(),
         funding: accruedFunding(isLong, size, info?.cumulativeFunding ?? 0, toUnits(acc.account.lastFundingPayment.toNumber())),
@@ -206,6 +239,7 @@ export function useOnChainPositions() {
         collateralBalance: toUnits(data.collateralBalance.toNumber()),
         totalPositions: data.totalPositions,
         realizedPnl: toUnits(data.realizedPnl.toNumber()),
+        houseEntryNotional: toUnits(data.houseEntryNotional?.toNumber() ?? 0),
       };
     }
 

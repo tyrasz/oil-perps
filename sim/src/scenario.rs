@@ -11,7 +11,12 @@
 //!   requests the engine must reject (excluded side, expired, exhausted and
 //!   revoked approvals, self-trades, a paused market), add_margin and
 //!   withdrawals with positions open; the guardian pauses the market mid-run
-//!   and the admin settles it at the end.
+//!   and the admin settles it at the end. The LP pool's probes
+//!   (adversary.rs) script their own state: a flash move inside a session, a
+//!   self-crossed pair pushing the net to each cap, and a 30% gap at one
+//!   daily reopen under a pair sized to leave bad debt pending.
+//!
+//! Every scenario has the public LP agents (agents.rs).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scenario {
@@ -47,19 +52,38 @@ impl Scenario {
         }
     }
 
-    /// Engine paths each scenario exists to reach; the report lists any that a
-    /// run missed (with too few days or an unlucky seed some cannot happen).
+    /// Engine paths each scenario exists to reach. A run of at least two
+    /// days that misses one fails invariant 16 (coverage); shorter runs only
+    /// report it. Paths a seed can legitimately miss in two days are left out
+    /// (documented where they would be).
     pub fn required_paths(self) -> &'static [&'static str] {
         match self {
-            Scenario::Normal => &["fill.mm_registry", "fill.orderbook", "open_position", "close", "update_funding", "liquidate"],
+            Scenario::Normal => &[
+                "fill.mm_registry", "fill.orderbook", "open_position", "open_position.skew_impact", "close", "close.skew_impact",
+                // "liquidate" is not required here: two days of normal trading
+                // may have no liquidation (seed 1 has none); stress requires it
+                "update_funding", "settle_position_pnl", "lp_deposit", "lp_request", "lp_withdraw", "lp_cancel",
+                "reject.LpFlowWindowClosed", "probe.lp_withdraw_in_q", "probe.lp_withdraw_expired",
+            ],
             Scenario::Stress => &[
-                "close.deficit", "liquidate.deficit", "liquidate.reward_top_up", "bad_debt.uncovered",
+                "close.deficit", "liquidate.deficit", "liquidate.reward_top_up", "bad_debt.lp_absorbed", "liquidate.stage1_partial",
                 "match.split_by_cap", "reject.FillTooLarge", "order.fills>1",
             ],
             Scenario::Adversarial => &[
                 "collusion.round", "wash.round", "reject.ApprovalSideNotAllowed", "reject.ApprovalExpired",
                 "reject.ApprovalAllowanceExceeded", "reject.SelfTrade", "add_margin", "pause_market",
                 "reject.MarketPaused", "settle_market", "close.at_settlement", "withdraw.with_open_positions",
+                // The pool's probes (adversary.rs): each one's outcome checked (invariant 13)
+                "probe.lp_params_w4d_q1d_rejected", "probe.lp_params_q23h_rejected", "probe.lp_params_boundary_accepted",
+                "probe.adl_mode1_unauthorized", "probe.lp_deposit_funding_stale", "probe.funding_catchup_open", "probe.funding_catchup_close",
+                "probe.lp_sandwich_donation", "probe.self_liquidation_loses", "probe.lp_sandwich_liquidation",
+                "probe.selfcross_close_net_cap", "probe.house_open_net_cap", "probe.request_then_mode1_adl",
+                "probe.winner_close_in_quiet", "probe.lp_deposit_in_q", "probe.adl_mode0_below_floor", "probe.opposite_winner_haircut",
+                "probe.lp_withdraw_adl_required", "probe.self_adl_in_quiet", "probe.lp_withdraw_in_w", "probe.dust_pending_slice",
+                "probe.selfcross_close_weekend_cap", "probe.house_open_weekend_cap",
+                "probe.settled_winner_close_quiet", "probe.settled_owner_close_quiet", "probe.lp_sandwich_sweep",
+                "probe.settled_lp_withdraw_quiet",
+                "bad_debt.pending", "adl.mode0", "donate_to_pool",
             ],
         }
     }

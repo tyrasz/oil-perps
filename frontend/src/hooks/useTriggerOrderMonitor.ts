@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback } from 'react';
 import { useTriggerOrderStore } from '../stores/triggerOrderStore';
 import { useMarketStore } from '../stores/marketStore';
 import { useTrading } from './useTrading';
+import { triggerRetryAt } from '../utils/errors';
 import { usePositions } from './usePositions';
 import type { TriggerOrder, Position } from '../types';
 
@@ -13,6 +14,8 @@ export function useTriggerOrderMonitor() {
   const { closePosition } = useTrading();
   const { positions } = usePositions();
   const processingRef = useRef<Set<string>>(new Set());
+  // Order id -> earliest time (ms) to try it again after a failed close
+  const retryAtRef = useRef<Map<string, number>>(new Map());
 
   // Check if a trigger order should be executed
   const checkTriggerOrder = useCallback(
@@ -39,7 +42,7 @@ export function useTriggerOrderMonitor() {
 
   // Execute trigger order
   const executeTriggerOrder = useCallback(
-    async (order: TriggerOrder, position: Position) => {
+    async (order: TriggerOrder, position: Position, currentPrice: number) => {
       if (processingRef.current.has(order.id)) return;
 
       processingRef.current.add(order.id);
@@ -49,8 +52,11 @@ export function useTriggerOrderMonitor() {
         // Mark as triggered before attempting close
         updateTriggerOrderStatus(order.id, 'triggered');
 
-        // Close the position (full close for now, partial close can be added later)
-        await closePosition(position.address);
+        // Close the position (full close for now, partial close can be added
+        // later), bounded at the trigger's price plus max impact and a margin,
+        // never with no bound
+        await closePosition(position.address, { markPrice: currentPrice, trigger: true });
+        retryAtRef.current.delete(order.id);
 
         console.log(`${order.type} executed successfully`);
 
@@ -63,7 +69,9 @@ export function useTriggerOrderMonitor() {
         }
       } catch (error) {
         console.error(`Failed to execute ${order.type}:`, error);
-        // Revert status on failure
+        // Revert status on failure and retry later: a take-profit that hits
+        // the profit-close quiet time after a session open waits it out
+        retryAtRef.current.set(order.id, triggerRetryAt(error, Date.now()));
         updateTriggerOrderStatus(order.id, 'active');
       } finally {
         processingRef.current.delete(order.id);
@@ -92,8 +100,10 @@ export function useTriggerOrderMonitor() {
         const marketPrice = markets[position.commodity]?.price;
         if (!marketPrice) continue;
 
+        if ((retryAtRef.current.get(order.id) ?? 0) > Date.now()) continue;
+
         if (checkTriggerOrder(order, position, marketPrice)) {
-          executeTriggerOrder(order, position);
+          executeTriggerOrder(order, position, marketPrice);
         }
       }
     }, CHECK_INTERVAL_MS);

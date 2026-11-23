@@ -27,6 +27,12 @@ use mm_registry::{MarketMaker, TwoSidedQuote};
 use orderbook::{Order, OrderBook, OrderSide, OrderType, PlaceOrderParams};
 use perps_core::instructions::VenueApprovalParams;
 use perps_core::state::{Side, VenueApproval};
+use crate::actions::open_secs_between;
+use crate::checks::PROBES;
+use crate::pool_math as pm;
+use crate::schedule;
+use perps_core::events::{Adl, FundingUpdated};
+use perps_core::state::{PoolParams, Position};
 use rand::Rng;
 use std::collections::HashSet;
 
@@ -41,6 +47,37 @@ pub struct AdversaryState {
     pub expiring_approval: Option<i64>,
     /// colluder-a's short-lived quote, waiting to expire
     pub expiring_quote: Option<(Pubkey, i64)>,
+    /// Positions the probes hold: the keeper's ADL passes leave them alone
+    pub held: HashSet<usize>,
+    /// Probes that have run (or can no longer run)
+    pub done: HashSet<&'static str>,
+    /// The pair carried over the forced gap, and how far its probes got
+    pub gap: Option<GapPlan>,
+    /// When the run's trading ends (the unwind starts)
+    pub end_time: i64,
+    /// Funding probes so far: LP gates, opens and closes across an overdue period
+    pub funding_gates: u32,
+    pub funding_opens: u32,
+    pub funding_closes: u32,
+    /// The prober's position held across an overdue funding period
+    pub funding_held: Option<usize>,
+    /// The sandwiching LP's deposit before settlement: (lp, shares it minted)
+    pub sweep_sandwich: Option<(usize, u64)>,
+    /// Ticks left for the F7 probe to find a position in profit
+    pub mode1_retries: Option<u32>,
+}
+
+/// The pair carried over the forced gap: gap-a's longs go bankrupt at the
+/// reopen, gap-b's shorts are the opposite-side winners the probes use.
+pub struct GapPlan {
+    pub longs: Vec<usize>,
+    pub shorts: Vec<usize>,
+    /// The oracle before the break
+    pub pre_px: u64,
+    /// When the gapped session opened (0: not yet)
+    pub reopened_at: i64,
+    /// 1 built, 2 reopened, 3 after the quiet time, 4 at the next open, 5 done
+    pub phase: u8,
 }
 
 impl AdversaryState {
@@ -58,6 +95,7 @@ impl Sim {
 
     pub async fn adversary_step(&mut self, total_ticks: u64) {
         self.adversary.steps += 1;
+        self.adversary.end_time = self.now + (total_ticks as i64 - self.tick as i64) * self.cfg.tick_secs;
         self.guardian(total_ticks).await;
         let m = self.market().await;
         if !self.oracle_ok(&m, 15) {
@@ -68,6 +106,9 @@ impl Sim {
             self.probe_paused().await;
             return;
         }
+        // The pool's probes go first in the tick: some need the state the
+        // session opened with, before the keeper has run
+        self.probes_step().await;
         match self.adversary.steps % 6 {
             0 => self.collusion_mm(false).await,
             1 => self.probe_approvals().await,
@@ -93,7 +134,11 @@ impl Sim {
             None if self.tick >= total_ticks * 2 / 5 => {
                 let accounts = perps_core::accounts::PauseMarket { signer: guardian.pubkey(), config: config_pda(), market };
                 let ix = ix(perps_core::ID, accounts, perps_core::instruction::PauseMarket {});
+                let mut st = self.st().await;
+                model::pause_market(&mut st.m);
                 if self.run("pause_market", &[ix], &[&guardian], None).await.is_ok() {
+                    // Predicted, not copied: only is_paused moves (§4.11)
+                    self.expect_st("pause_market", &st).await;
                     self.paused = true;
                     self.adversary.paused_at = Some(self.tick);
                     self.hit("pause_market");
@@ -101,8 +146,13 @@ impl Sim {
             }
             Some(at) if !self.adversary.unpaused && self.tick >= at + PAUSE_TICKS => {
                 let accounts = perps_core::accounts::UpdateMarketConfig { authority: admin.pubkey(), config: config_pda(), market };
-                let ix = ix(perps_core::ID, accounts, perps_core::instruction::UpdateMarketConfig { params: cme_config() });
-                if self.run("update_market_config", &[ix], &[&admin], None).await.is_ok() {
+                let params = cme_config();
+                let ix = ix(perps_core::ID, accounts, perps_core::instruction::UpdateMarketConfig { params });
+                let mut st = self.st().await;
+                let predicted = model::update_market_config(&mut st.m, &params).err();
+                if self.run("update_market_config", &[ix], &[&admin], predicted).await.is_ok() {
+                    // cme_config() passes max_open_interest 0: the cap must be kept (§4.12, F19)
+                    self.expect_st("update_market_config", &st).await;
                     self.paused = false;
                     self.adversary.unpaused = true;
                     self.hit("unpause_market");
@@ -497,23 +547,1046 @@ impl Sim {
         let (admin, market) = (base.admin.insecure_clone(), base.market);
         let accounts = perps_core::accounts::SettleMarket { authority: admin.pubkey(), config: config_pda(), market };
         let ix = ix(perps_core::ID, accounts, perps_core::instruction::SettleMarket { settlement_price });
-        if self.run("settle_market", &[ix], &[&admin], None).await.is_err() {
+        let mut st = self.st().await;
+        let (predicted, funding) = match model::settle_market(&mut st.m, settlement_price, self.now) {
+            Ok(ev) => (None, ev),
+            Err(r) => (Some(r), None),
+        };
+        let Ok(ok) = self.run("settle_market", &[ix], &[&admin], predicted).await else {
             return;
-        }
+        };
+        // Predicted, not copied: the funding due (D42), then settlement_price,
+        // settled_at and is_paused; nothing else in Market or LpPool moves
+        self.check_events("settle_market", &ok.logs, funding, &[]);
+        self.expect_st("settle_market", &st).await;
         self.settled = true;
         self.paused = true;
         self.hit("settle_market");
+        self.probe_settled_winner().await;
+        self.probe_settled_lp_withdraw().await;
         if let Some(&idx) = self.ledger.open.first() {
             let _ = self.liquidate_one(idx, "liquidate_probe").await;
         }
         let p = self.agent_named("prober");
         self.open_house(p, Side::Long, 10 * CONTRACT, 5_000, "open_position_probe").await;
-        let m = self.market().await;
-        if self.now - m.last_funding_time >= m.funding_interval {
-            let predicted: Option<Rej> = predict::update_funding(&m, &self.ov(), self.now);
-            let ix = self.update_funding_ix();
-            let kp = self.keeper.kp.insecure_clone();
-            let _ = self.run("update_funding", &[ix], &[&kp], predicted).await;
+        // Funding stops at settlement, due or not
+        let mut m = self.market().await;
+        let predicted: Option<Rej> = model::update_funding(&mut m, &self.ov(), self.now).err();
+        let ix = self.update_funding_ix();
+        let kp = self.keeper.kp.insecure_clone();
+        let _ = self.run("update_funding_probe", &[ix], &[&kp], predicted).await;
+    }
+}
+
+// --- the pool's probes (docs/lp-pool.md §16.7 and the round-2 fixes) ---------------------
+//
+// Each probe sets up the state its rule is about, sends the transaction, and
+// checks the on-chain outcome the spec requires (invariant 13), apart from
+// the model's own prediction (which invariants 6, 9 and 10 check as for any
+// transaction). A probe whose state could not be reached in a run is
+// counted as not reached, with why, and is not a violation.
+
+/// The forced reopen gap (down): a 10x long loses three times its margin.
+const GAP: f64 = 0.30;
+/// The sandwiching LP's deposit
+const SANDWICH: u64 = 50_000 * USDC;
+/// Fills per orderbook order (orderbook::MAX_FILLS)
+const ORDER_FILLS: u64 = 16;
+
+impl Sim {
+    fn lp_named(&self, name: &str) -> Option<usize> {
+        self.lps.iter().position(|l| l.name == name)
+    }
+
+    /// Probe `name` could not be checked this time, and why.
+    pub fn probe_skip(&mut self, name: &str, why: &str) {
+        *self.metrics.probes.entry(name.into()).or_default().not_reached.entry(why.into()).or_default() += 1;
+    }
+
+    /// Invariant 13: probe `name`'s on-chain outcome is the one the spec requires.
+    pub fn probe_check(&mut self, name: &str, ok: bool, detail: impl FnOnce() -> String) -> bool {
+        let d = detail();
+        let stat = self.metrics.probes.entry(name.into()).or_default();
+        stat.checked += 1;
+        if ok {
+            stat.ok += 1;
         }
+        stat.last = d.clone();
+        if ok {
+            self.hit(format!("probe.{}", name));
+        }
+        let (tick, now) = (self.tick, self.now);
+        self.checks.check(tick, now, PROBES, ok, || format!("{}: {}", name, d))
+    }
+
+    /// The probe's transaction (the last one sent since `from`) must have
+    /// been refused with `code`.
+    pub fn probe_rejected(&mut self, name: &str, from: u64, code: &str) -> bool {
+        if self.chain.transactions == from {
+            self.probe_skip(name, "not sent: the model predicts a rejection the label never sends");
+            return false;
+        }
+        let got = self.last_failure.as_ref().map(|f| f.key());
+        let want = format!("perps_core:{}", code);
+        self.probe_check(name, got.as_deref() == Some(want.as_str()), || format!("required {}, chain: {}", want, got.clone().unwrap_or_else(|| "landed".into())))
+    }
+
+    /// In session and within `secs` of the session's open (the sim's own schedule).
+    fn within_open(&self, secs: i64) -> bool {
+        schedule::is_open(self.now) && !schedule::is_open(self.now - secs)
+    }
+
+    fn in_w(&self) -> bool {
+        schedule::in_pre_close_window(self.now, crate::chain::pool_params().weekend_cap_window_secs)
+    }
+
+    /// Seconds until the session next closes (daily break or weekly close).
+    fn secs_to_close(&self) -> i64 {
+        let mut t = self.now;
+        while schedule::is_open(t) && t < self.now + 2 * 86_400 {
+            t += 60;
+        }
+        t - self.now
+    }
+
+    async fn pending_total(&mut self) -> u64 {
+        let p = self.pool().await;
+        p.pending_bad_debt_long + p.pending_bad_debt_short
+    }
+
+    /// What the model says a close of `idx` now would do.
+    async fn predict_close(&mut self, idx: usize) -> Result<model::CloseOut, Rej> {
+        let address = self.ledger.positions[idx].address;
+        let user = self.agents[self.ledger.positions[idx].owner].t.user;
+        let (mut st, mut u) = (self.st().await, self.user_at(user).await);
+        let mut p: Position = load(self.chain.base(), address).await;
+        model::close_position(&mut st, &mut p, &mut u, &self.ov(), self.now, 0)
+    }
+
+    pub async fn probes_step(&mut self) {
+        if self.settled {
+            return;
+        }
+        if !self.adversary.done.contains("lp_params") {
+            self.probe_lp_params().await;
+        }
+        if !self.adversary.done.contains("adl_unauthorized") {
+            self.probe_adl_unauthorized().await;
+        }
+        self.probe_funding().await;
+        if self.adversary.mode1_retries.is_some() {
+            self.retry_request_then_mode1().await;
+            return;
+        }
+        // Reopen-time probes come before anything else in the tick
+        self.gap_step().await;
+        self.probe_lp_withdraw_gates().await;
+        let pending = self.pending_total().await;
+        let q = crate::chain::pool_params().lp_reopen_quiet_secs as i64;
+        let calm = pending == 0 && !self.within_open(q) && self.secs_to_close() >= 7_200;
+        let gap_over = self.adversary.gap.as_ref().map_or(true, |g| g.phase >= 5);
+        if !self.adversary.done.contains("donation") {
+            if calm {
+                self.probe_donation().await;
+            }
+        } else if !self.adversary.done.contains("flash") {
+            if calm && !self.in_w() {
+                self.probe_flash().await;
+            }
+        } else if !self.adversary.done.contains("net_cap") {
+            if calm && !self.in_w() {
+                self.probe_caps(false).await;
+            }
+        } else if !self.adversary.done.contains("weekend_cap") && gap_over && calm && self.in_w() {
+            self.probe_caps(true).await;
+        }
+    }
+
+    // --- params (D38) and signers (D16) ------------------------------------------------------
+
+    /// LP params whose W and Q together would shut lp_withdraw for whole
+    /// weeks must be refused (InvalidPoolParams), and the boundary (one CME
+    /// week of open time exactly) accepted, then cancelled.
+    async fn probe_lp_params(&mut self) {
+        self.adversary.done.insert("lp_params");
+        let admin = self.chain.base.admin.insecure_clone();
+        let cur = crate::chain::pool_params();
+        let with = |w: u32, q: u32| PoolParams {
+            weekend_cap_window_secs: w,
+            lp_reopen_quiet_secs: q,
+            // Long enough that only the weekly bound can fail
+            withdrawal_claim_window_secs: cur.withdrawal_claim_window_secs.max((pm::min_claim_window_secs(w, q)).min(u32::MAX as u64) as u32),
+            ..cur
+        };
+        let propose = |s: &Sim, params: PoolParams| {
+            let b = &s.chain.base;
+            ix(perps_core::ID, perps_core::accounts::ProposePoolParams { admin: b.admin.pubkey(), config: config_pda(), market: b.market, lp_pool: b.lp_pool },
+                perps_core::instruction::ProposePoolParams { params })
+        };
+        // W = 4 days with Q = 1 day, and Q = 23 h alone (D38's examples)
+        for (name, w, q) in [("lp_params_w4d_q1d_rejected", 4 * 86_400, 86_400), ("lp_params_q23h_rejected", cur.weekend_cap_window_secs, 82_800)] {
+            let n0 = self.chain.transactions;
+            let ix = propose(self, with(w, q));
+            let _ = self.run("propose_pool_params_probe", &[ix], &[&admin], Some(crate::predict::core("InvalidPoolParams"))).await;
+            self.probe_rejected(name, n0, "InvalidPoolParams");
+        }
+        // W + 5·Q + 1 day = one CME week of open time: allowed (then cancelled)
+        let q = ((pm::WEEK_OPEN_SECS - pm::LP_UNGATED_SECS - cur.weekend_cap_window_secs as u64) / 5) as u32;
+        let params = with(cur.weekend_cap_window_secs, q);
+        let boundary = propose(self, params);
+        let mut st = self.st().await;
+        model::propose_pool_params(&mut st.pool, params, self.now);
+        let landed = self.run("propose_pool_params", &[boundary], &[&admin], None).await.is_ok();
+        if landed {
+            // Only pending_params and pending_params_at move (D32)
+            self.expect_st("propose_pool_params", &st).await;
+        }
+        self.probe_check("lp_params_boundary_accepted", landed, || format!("W {} + 5 x Q {} + 1 day = {} open s: landed {}", cur.weekend_cap_window_secs, q, pm::WEEK_OPEN_SECS, landed));
+        if landed {
+            let b = &self.chain.base;
+            let accounts = perps_core::accounts::PoolAdminOnly { admin: admin.pubkey(), config: config_pda(), lp_pool: b.lp_pool };
+            let cancel = ix(perps_core::ID, accounts, perps_core::instruction::CancelPoolParams {});
+            let mut st = self.st().await;
+            let predicted = model::cancel_pool_params(&mut st.pool).err();
+            if self.run("cancel_pool_params", &[cancel], &[&admin], predicted).await.is_ok() {
+                self.expect_st("cancel_pool_params", &st).await;
+            }
+        }
+    }
+
+    /// Mode-1 (exposure) ADL signed by anyone but adl_keeper or the admin: AdlUnauthorized.
+    async fn probe_adl_unauthorized(&mut self) {
+        let Some(&idx) = self.ledger.open.first() else { return };
+        self.adversary.done.insert("adl_unauthorized");
+        let p = self.agent_named("prober");
+        let kp = self.agents[p].t.kp.insecure_clone();
+        let n0 = self.chain.transactions;
+        self.adl_by(idx, model::ADL_EXPOSURE, 0, "adl_probe", &kp).await;
+        self.probe_rejected("adl_mode1_unauthorized", n0, "AdlUnauthorized");
+    }
+
+    // --- funding (D17 / F12, D40) --------------------------------------------------------------
+
+    /// When a funding period is due and not yet cranked (the adversary acts
+    /// before the keeper): LP flows must be refused (FundingStale), a house
+    /// open must crank first and start from the cranked index, and a close
+    /// of a position held across the period must pay it.
+    async fn probe_funding(&mut self) {
+        let m = self.market().await;
+        if model::settled(&m) || model::funding_current(&m, self.now) {
+            return;
+        }
+        let q = crate::chain::pool_params().lp_reopen_quiet_secs as i64;
+        let open = open_secs_between(m.last_funding_time, self.now) + m.funding_carry_secs as i64;
+        let due = (open / m.funding_interval).min(pm::MAX_FUNDING_CATCHUP_PERIODS as i64) as u64;
+        if self.adversary.funding_gates < 3 && !self.within_open(q) {
+            self.adversary.funding_gates += 1;
+            if let Some(l) = self.lp_named("lp-sandwich") {
+                let n0 = self.chain.transactions;
+                self.lp_deposit(l, 1_000 * USDC, 0, "lp_deposit_probe").await;
+                self.probe_rejected("lp_deposit_funding_stale", n0, "FundingStale");
+                let pos = self.lp_position(l).await;
+                if pos.shares > 0 && pos.pending_shares == 0 {
+                    let n0 = self.chain.transactions;
+                    self.lp_request(l, 1, "lp_request_probe").await;
+                    self.probe_rejected("lp_request_funding_stale", n0, "FundingStale");
+                }
+            }
+        }
+        let p = self.agent_named("prober");
+        let held = self.adversary.funding_held.filter(|&i| self.ledger.positions[i].is_open());
+        if let Some(idx) = held {
+            if self.adversary.funding_closes >= 3 {
+                return;
+            }
+            if self.predict_close(idx).await.is_err() {
+                return;
+            }
+            self.adversary.funding_closes += 1;
+            self.adversary.funding_held = None;
+            if self.close_tracked(idx, "close_position").await {
+                let ev = crate::chain::events::<FundingUpdated>(&self.last_logs);
+                let after = self.market().await;
+                let ok = ev.len() == 1 && ev[0].periods == due && ev[0].cumulative_funding == after.cumulative_funding;
+                self.probe_check("funding_catchup_close", ok, || format!("{} periods due: the close cranked {:?}", due, ev.iter().map(|e| (e.periods, e.cumulative_funding)).collect::<Vec<_>>()));
+            }
+            return;
+        }
+        if self.adversary.funding_opens >= 3 {
+            return;
+        }
+        self.adversary.funding_opens += 1;
+        // The side that lowers |net|: no pool cap or freeze applies to it
+        let side = if model::net(&m) > 0 { Side::Short } else { Side::Long };
+        let n = self.ledger.positions.len();
+        if !self.open_house(p, side, 10 * CONTRACT, 5_000, "open_position").await || self.ledger.positions.len() == n {
+            self.probe_skip("funding_catchup_open", "the open did not land");
+            return;
+        }
+        let idx = n;
+        let ev = crate::chain::events::<FundingUpdated>(&self.last_logs);
+        let after = self.market().await;
+        let basis = self.ledger.positions[idx].state.last_funding_payment;
+        let ok = ev.len() == 1 && ev[0].periods == due && basis == after.cumulative_funding;
+        self.probe_check("funding_catchup_open", ok, || format!("{} periods due: cranked {:?}, new position's basis {} (market {})", due, ev.iter().map(|e| e.periods).collect::<Vec<_>>(), basis, after.cumulative_funding));
+        self.adversary.funding_held = Some(idx);
+    }
+
+    // --- LP sandwiches (D18, F6, F11) ------------------------------------------------------------
+
+    /// The sandwiching LP's deposit; Some(shares minted).
+    async fn sandwich_deposit(&mut self, l: usize, amount: u64) -> Option<u64> {
+        let before = self.lp_position(l).await.shares;
+        if !self.lp_deposit(l, amount, 0, "lp_deposit").await {
+            return None;
+        }
+        Some(self.lp_position(l).await.shares - before)
+    }
+
+    /// Request `shares`, read the requested value, cancel: Some(value).
+    async fn sandwich_exit(&mut self, l: usize, shares: u64) -> Option<u64> {
+        if !self.lp_request(l, shares, "lp_request").await {
+            return None;
+        }
+        let value = self.lp_position(l).await.requested_value;
+        self.lp_cancel(l, "lp_cancel").await;
+        Some(value)
+    }
+
+    /// Deposit, a donation, request: the request is worth no more than the
+    /// deposit (the donation vests into NAV_redeem, D18).
+    async fn probe_donation(&mut self) {
+        if !model::funding_current(&self.market().await, self.now) {
+            return;
+        }
+        self.adversary.done.insert("donation");
+        let Some(l) = self.lp_named("lp-sandwich") else { return };
+        let Some(shares) = self.sandwich_deposit(l, SANDWICH).await else {
+            self.probe_skip("lp_sandwich_donation", "deposit refused");
+            return;
+        };
+        let p = self.agent_named("prober");
+        let lp_shares = self.pool().await.lp_shares;
+        let Some((_, vesting)) = self.donate(p, 20_000 * USDC, "donate").await else {
+            self.probe_skip("lp_sandwich_donation", "donation refused");
+            return;
+        };
+        if let Some(value) = self.sandwich_exit(l, shares).await {
+            let captured = vesting as u128 * shares as u128 / lp_shares as u128;
+            self.probe_check("lp_sandwich_donation", value <= SANDWICH, || {
+                format!("deposited {}, requested {} right after a {} donation (its share unvested: {})", SANDWICH, value, 20_000 * USDC, captured)
+            });
+        }
+    }
+
+    /// A flash move inside the session that makes the prober's 10x long
+    /// stage-1 liquidatable: the prober liquidating itself must come out
+    /// worse than closing (validate rule, F42), and an LP that deposits just
+    /// before the keeper's liquidations and requests just after gains nothing.
+    async fn probe_flash(&mut self) {
+        self.adversary.done.insert("flash");
+        if !model::funding_current(&self.market().await, self.now) {
+            self.crank_funding().await;
+        }
+        let p = self.agent_named("prober");
+        let m = self.market().await;
+        let lev = model::max_leverage(&m, self.now);
+        let size = (40_000 * USDC) as u128 * 1_000_000 / self.px as u128 / CONTRACT as u128 * CONTRACT as u128;
+        let n = self.ledger.positions.len();
+        if !self.open_house(p, Side::Long, size as u64, lev, "open_position").await || self.ledger.positions.len() == n {
+            self.probe_skip("self_liquidation_loses", "the prober's open did not land");
+            return;
+        }
+        let idx = n;
+        let pos = self.ledger.positions[idx].state.clone();
+        // The mark at which equity is 4.2% of mark notional (between ⅔·MM and MM)
+        let (c, q, e) = (pos.collateral as f64, pos.size as f64 / 1e6, pos.entry_price as f64);
+        let target = ((e * q - c) / (q * (1.0 - 0.042))).round() as u64;
+        let st = self.st().await;
+        let (_, mmr) = model::margin_ratios(&st.m, self.now);
+        let eq = model::equity(&pos, target, st.m.cumulative_funding);
+        let stage1 = eq > 0 && eq as u128 * 10_000 * 10_000 >= mmr as u128 * st.pool.params.backstop_threshold_bps as u128 * model::mark_notional(pos.size, target);
+        if target >= self.px || !model::liquidatable(&st.m, &pos, target, self.now) || !stage1 {
+            self.probe_skip("self_liquidation_loses", "no flash price makes the position stage-1 liquidatable");
+            return;
+        }
+        self.oracle.shock_to(self.now, target);
+        self.publish(target, target / 5_000).await;
+        self.history.push(target);
+        self.hit("oracle.flash_move");
+        // The LP sandwich: in before the liquidations
+        let l = self.lp_named("lp-sandwich");
+        let minted = match l {
+            Some(l) => self.sandwich_deposit(l, SANDWICH).await,
+            None => None,
+        };
+        let liquidations = self.metrics.liquidations;
+        // Self-liquidation against a close, both valued at this mark
+        let user = self.agents[p].t.user;
+        let (mut st, mut u, mut pp) = (self.st().await, self.user_at(user).await, pos.clone());
+        let close = model::close_position(&mut st, &mut pp, &mut u, &self.ov(), self.now, 0);
+        let (kp, tokens) = (self.agents[p].t.kp.insecure_clone(), self.agents[p].t.tokens);
+        match (close, self.liquidate_by(idx, "liquidate", &kp, tokens).await) {
+            (Ok(c), Ok(Some(out))) => {
+                let rest = if out.size_remaining > 0 { self.predict_close(idx).await.map(|o| o.payout).ok() } else { Some(0) };
+                match rest {
+                    Some(rest) => {
+                        let value = out.keeper_reward + out.owner_leftover + rest;
+                        self.probe_check("self_liquidation_loses", out.stage == 1 && value < c.payout, || {
+                            format!("stage {}: reward {} + leftover {} + remainder {} = {} vs closing {}", out.stage, out.keeper_reward, out.owner_leftover, rest, value, c.payout)
+                        });
+                    }
+                    None => self.probe_skip("self_liquidation_loses", "the remainder cannot be valued by a close"),
+                }
+            }
+            (Err(r), _) => self.probe_skip("self_liquidation_loses", &format!("a close would fail with {}", r.1)),
+            (_, other) => self.probe_skip("self_liquidation_loses", &format!("the self-liquidation did not land: {:?}", other.err())),
+        }
+        if self.ledger.positions[idx].is_open() {
+            self.close_tracked(idx, "close_position").await;
+        }
+        self.liquidate_all().await;
+        let (Some(l), Some(shares)) = (l, minted) else {
+            self.probe_skip("lp_sandwich_liquidation", "the deposit before the liquidations was refused");
+            return;
+        };
+        let n_liq = self.metrics.liquidations - liquidations;
+        if let Some(value) = self.sandwich_exit(l, shares).await {
+            if n_liq == 0 {
+                self.probe_skip("lp_sandwich_liquidation", "no liquidation between the deposit and the request");
+            } else {
+                self.probe_check("lp_sandwich_liquidation", value <= SANDWICH, || format!("deposited {}, {} liquidations, requested {}", SANDWICH, n_liq, value));
+            }
+        }
+    }
+
+    // --- caps (D14, F1, F7) -------------------------------------------------------------------
+
+    /// Self-cross `size` contracts at the oracle on the orderbook, `long`
+    /// buying from `short`, one fill per venue cap. Returns the new legs.
+    async fn build_cross(&mut self, long: usize, short: usize, size: u64) -> (Vec<usize>, Vec<usize>) {
+        for who in [long, short] {
+            self.limit_refill(who).await;
+        }
+        let m = self.market().await;
+        let leverage = model::max_leverage(&m, self.now);
+        let venue = load_venue(self.chain.base(), &orderbook::ID).await;
+        let price = self.px;
+        let fill = (venue.max_fill_notional as u128 * 1_000_000 / price as u128) as u64 / CONTRACT * CONTRACT;
+        let (mut longs, mut shorts) = (Vec::new(), Vec::new());
+        let mut left = size / CONTRACT * CONTRACT;
+        while left >= CONTRACT {
+            let chunk = left.min(fill * ORDER_FILLS);
+            let Some(ob) = self.place(long, OrderSide::Bid, price, chunk, leverage, ORDER_FILLS as u8).await else { break };
+            let Some(oa) = self.place(short, OrderSide::Ask, price, chunk, leverage, ORDER_FILLS as u8).await else {
+                self.cancel(long, ob).await;
+                break;
+            };
+            let mut filled = 0;
+            for _ in 0..ORDER_FILLS {
+                let n = self.ledger.positions.len();
+                if !self.match_tracked(ob, oa, "match_orders").await {
+                    break;
+                }
+                for i in n..self.ledger.positions.len() {
+                    let pos = &self.ledger.positions[i];
+                    if pos.owner == long {
+                        filled += pos.state.size;
+                        longs.push(i);
+                    } else if pos.owner == short {
+                        shorts.push(i);
+                    }
+                }
+                if !self.ledger.orders[ob].live || filled >= chunk {
+                    break;
+                }
+            }
+            for o in [ob, oa] {
+                if self.ledger.orders[o].live && exists(self.chain.base(), self.ledger.orders[o].address).await {
+                    self.cancel(self.ledger.orders[o].owner, o).await;
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            left = left.saturating_sub(filled);
+        }
+        (longs, shorts)
+    }
+
+    /// Close every open position of `who` the model lets close now, those
+    /// that lower |net| first (a few rounds: one leg's close frees the next).
+    async fn unwind_probe_positions(&mut self, who: &[usize]) {
+        for _ in 0..4 {
+            let m = self.market().await;
+            let net = model::net(&m);
+            let mut legs: Vec<(bool, usize)> = self.ledger.open.iter().copied().filter(|&i| who.contains(&self.ledger.positions[i].owner))
+                .map(|i| (model::sign(self.ledger.positions[i].side()) * net <= 0, i)).collect();
+            if legs.is_empty() {
+                return;
+            }
+            legs.sort();
+            for (_, idx) in legs {
+                if self.ledger.positions[idx].is_open() && self.predict_close(idx).await.is_ok() {
+                    self.close_tracked(idx, "close_position").await;
+                }
+            }
+        }
+    }
+
+    /// Push the net to the net cap (`weekend` false: k_net·B, outside W) or
+    /// the weekend cap (α·B/G, inside W) by self-crossing a venue pair and
+    /// closing the legs on the side that raises |net| (F1, D14): every close
+    /// that lands fits the cap; the one past it is refused with
+    /// PoolExposureLimit / PoolWeekendExposureLimit. A house open past it is
+    /// refused the same way. Outside W, a free withdrawal request then must
+    /// not make exposure ADL eligible (F7: triggers use B, not capNAV).
+    async fn probe_caps(&mut self, weekend: bool) {
+        let (name, open_name, code) = if weekend {
+            ("selfcross_close_weekend_cap", "house_open_weekend_cap", "PoolWeekendExposureLimit")
+        } else {
+            ("selfcross_close_net_cap", "house_open_net_cap", "PoolExposureLimit")
+        };
+        self.adversary.done.insert(if weekend { "weekend_cap" } else { "net_cap" });
+        let st = self.st().await;
+        let Ok(v) = model::view(&st.pool, &st.m, self.px, self.now) else { return };
+        let params = st.pool.params;
+        let g = model::g_bps(&st.m, &params) as u128;
+        let cap = |b: u128| if weekend { b * params.weekend_lp_loss_bps as u128 / g } else { b * params.k_net_bps as u128 / 10_000 };
+        let dir: i128 = if v.net >= 0 { 1 } else { -1 };
+        let px = self.px as u128;
+        let fill = 45_000 * USDC as u128 * 1_000_000 / px;
+        let need = (cap(v.b) * 1_000_000 / px).saturating_sub(v.net.unsigned_abs()) + 2 * fill;
+        let (a, b) = (self.agent_named("cross-a"), self.agent_named("cross-b"));
+        let (longs, shorts) = self.build_cross(a, b, need as u64).await;
+        let raise = if dir > 0 { shorts } else { longs };
+        let mut refused = false;
+        for idx in raise {
+            if !self.ledger.positions[idx].is_open() {
+                continue;
+            }
+            let pre = self.st().await;
+            let Ok(vb) = model::view(&pre.pool, &pre.m, self.px, self.now) else { break };
+            match self.predict_close(idx).await {
+                Ok(_) => {
+                    if !self.close_tracked(idx, "close_position").await {
+                        continue;
+                    }
+                    // A close that raised |net| fits the cap on B before it
+                    let m = self.market().await;
+                    let nn = (model::net(&m).unsigned_abs() * px + 999_999) / 1_000_000;
+                    let limit = cap(vb.b);
+                    if nn > limit {
+                        self.probe_check(name, false, || format!("a close landed with net notional {} over the cap {}", nn, limit));
+                    }
+                }
+                Err(r) if r.1 == code || r.1 == "PoolExposureLimit" => {
+                    let n0 = self.chain.transactions;
+                    self.close_bounded(idx, 0, "close_position_probe").await;
+                    self.probe_rejected(name, n0, code);
+                    refused = true;
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+        if !refused {
+            self.probe_skip(name, "the cap was not reached with the pair built");
+        } else {
+            // A house open past the same cap (capNAV ≤ B): refused at the cap, before the per-account limit
+            let st = self.st().await;
+            let p = self.agent_named("prober");
+            let free = self.user_of(p).await.collateral_balance;
+            if let Ok(v) = model::view(&st.pool, &st.m, self.px, self.now) {
+                let dd = model::dd_now(&st.pool, &v);
+                let room = cap(v.cap_nav).saturating_sub(v.net_notional);
+                let size = ((room + 1_000 * USDC as u128) * 1_000_000 / px) as u64 / CONTRACT * CONTRACT + CONTRACT;
+                let lev = model::max_leverage(&st.m, self.now);
+                let margin = model::notional(size, self.px) as u64 / (lev as u64 / 1_000).max(1);
+                if dd >= params.dd_freeze_bps as u64 && params.dd_freeze_bps > 0 {
+                    self.probe_skip(open_name, "drawdown freeze in force");
+                } else if margin * 11 / 10 > free {
+                    self.probe_skip(open_name, "the prober cannot margin an open past the cap");
+                } else {
+                    let side = if dir > 0 { Side::Long } else { Side::Short };
+                    let n0 = self.chain.transactions;
+                    self.open_house(p, side, size, lev, "open_position_probe").await;
+                    self.probe_rejected(open_name, n0, code);
+                }
+            }
+            if !weekend && !self.probe_request_then_mode1().await {
+                // Hold the net at the cap for a few ticks until some position is in profit
+                self.adversary.mode1_retries = Some(6);
+                return;
+            }
+        }
+        self.unwind_probe_positions(&[a, b]).await;
+    }
+
+    /// F7: the seed LP requests half its shares (capNAV falls, B does not);
+    /// exposure ADL must still be refused with AdlNotRequired.
+    /// Returns false when no position is in profit to target (the caller
+    /// keeps the net at the cap and tries again a tick later).
+    async fn probe_request_then_mode1(&mut self) -> bool {
+        let name = "request_then_mode1_adl";
+        self.crank_funding().await;
+        // ADL refuses an unprofitable target before it looks at the triggers
+        let f = self.market().await.cumulative_funding;
+        let candidate = self.ledger.open.iter().copied().filter(|i| !self.adversary.held.contains(i)).find(|&i| {
+            let p = &self.ledger.positions[i].state;
+            model::slice_profit(p, p.size, self.px, f) > 0 && model::equity(p, self.px, f) > 0
+        });
+        if candidate.is_none() {
+            return false;
+        }
+        let shares = self.lp_position(0).await.shares / 2;
+        if !self.lp_request(0, shares, "lp_request").await {
+            self.probe_skip(name, "the seed's request was refused");
+            return true;
+        }
+        let st = self.st().await;
+        let Ok(v) = model::view(&st.pool, &st.m, self.px, self.now) else { return true };
+        let (triggers, _) = model::exposure_triggers(&st.m, &st.pool, &v, self.now);
+        let hard = st.pool.params.hard_net_bps as u128;
+        let on_cap_nav = hard > 0 && v.net_notional * 10_000 > hard * v.cap_nav;
+        match (triggers, candidate) {
+            (0, Some(idx)) => {
+                let admin = self.chain.base.admin.insecure_clone();
+                let n0 = self.chain.transactions;
+                self.adl_by(idx, model::ADL_EXPOSURE, 0, "adl_probe", &admin).await;
+                if self.probe_rejected(name, n0, "AdlNotRequired") && !on_cap_nav {
+                    self.probe_skip(name, "checked, but the hard-net line would not have held on capNAV either");
+                }
+            }
+            (0, None) => self.probe_skip(name, "no profitable position to target"),
+            _ => self.probe_skip(name, "an exposure trigger already holds on B"),
+        }
+        self.lp_cancel(0, "lp_cancel").await;
+        true
+    }
+
+    /// The F7 probe waiting for a position in profit, with the net still at the cap.
+    async fn retry_request_then_mode1(&mut self) {
+        let Some(left) = self.adversary.mode1_retries else { return };
+        let done = self.probe_request_then_mode1().await;
+        if done || left <= 1 {
+            if !done {
+                self.probe_skip("request_then_mode1_adl", "no profitable position to target");
+            }
+            self.adversary.mode1_retries = None;
+            let (a, b) = (self.agent_named("cross-a"), self.agent_named("cross-b"));
+            self.unwind_probe_positions(&[a, b]).await;
+        } else {
+            self.adversary.mode1_retries = Some(left - 1);
+        }
+    }
+
+    // --- the forced gap: pending bad debt and the D13/D23/D37 rules ----------------------------
+
+    async fn gap_step(&mut self) {
+        let phase = self.adversary.gap.as_ref().map_or(0, |g| g.phase);
+        match phase {
+            0 => self.gap_build().await,
+            1 => self.gap_reopen().await,
+            2 => self.gap_after_quiet().await,
+            3 => self.gap_next_open().await,
+            4 => self.gap_dust().await,
+            _ => {}
+        }
+    }
+
+    /// Mon-Thu in the hour before the daily break, with a day of the run
+    /// left: gap-a buys from gap-b at 10x, enough that a 30% gap at the
+    /// reopen leaves bad debt pending beyond insurance and the LP window cap,
+    /// and more than the other winners can repay before the next open.
+    async fn gap_build(&mut self) {
+        if self.adversary.done.contains("gap") || !self.adversary.done.contains("net_cap") {
+            return;
+        }
+        let to_close = self.secs_to_close();
+        let reopen = self.now + to_close + 3_600;
+        let daily = to_close <= 3_600 && to_close >= 900 && schedule::is_open(reopen);
+        if !daily || self.adversary.end_time < reopen + 25 * 3_600 || self.pending_total().await > 0 {
+            return;
+        }
+        self.adversary.done.insert("gap");
+        let st = self.st().await;
+        let Ok(v) = model::view(&st.pool, &st.m, self.px, self.now) else { return };
+        let params = st.pool.params;
+        let lp_room = if st.pool.loss_window_start != 0 && reopen < st.pool.loss_window_start + pm::LOSS_WINDOW_SECS {
+            pm::lp_window_cap(st.pool.loss_window_nav, params.lp_loss_cap_window_bps, st.pool.lp_absorbed_window)
+        } else {
+            (v.nav_redeem.max(0) as u128 * params.lp_loss_cap_window_bps as u128 / 10_000) as u64
+        };
+        let gapped = (self.px as f64 * (1.0 - GAP)) as u64;
+        // What the other winners could repay: every other short's profit at the gap
+        let (a, b) = (self.agent_named("gap-a"), self.agent_named("gap-b"));
+        let others: i128 = self.ledger.open.iter().map(|&i| &self.ledger.positions[i]).filter(|p| p.side() == Side::Short && p.owner != b)
+            .map(|p| model::pnl(Side::Short, p.state.size, p.state.entry_price, gapped).max(0)).sum();
+        let target = st.m.insurance_fund as i128 + lp_room as i128 + (others * 3 / 2).max(0) + 80_000 * USDC as i128;
+        let pre_px = self.px;
+        let (mut longs, mut shorts) = (Vec::new(), Vec::new());
+        let fill = 45_000 * USDC as u128 * 1_000_000 / pre_px as u128;
+        for _ in 0..4 {
+            let (l, s) = self.build_cross(a, b, (fill * ORDER_FILLS as u128) as u64).await;
+            if l.is_empty() {
+                break;
+            }
+            longs.extend(l);
+            shorts.extend(s);
+            let deficit: i128 = longs.iter().map(|&i| -model::equity(&self.ledger.positions[i].state, gapped, st.m.cumulative_funding)).filter(|&d| d > 0).sum();
+            if deficit >= target {
+                break;
+            }
+        }
+        if longs.is_empty() {
+            self.probe_skip("gap", "the pair could not be built");
+            return;
+        }
+        self.oracle.forced_gap = Some(-GAP);
+        self.hit("oracle.forced_gap");
+        self.adversary.gap = Some(GapPlan { longs, shorts, pre_px, reopened_at: 0, phase: 1 });
+    }
+
+    /// The first tick of the gapped session, inside the profit-close quiet
+    /// time and before the keeper: the winner's close is refused
+    /// (ProfitCloseQuiet, D23/F48), an LP deposit is refused (Q), the
+    /// bankrupt longs are liquidated (pending), and a mode-0 ADL of a winner
+    /// whose score is under the fresh floor is refused (AdlScoreBelowFloor).
+    async fn gap_reopen(&mut self) {
+        if !schedule::is_open(self.now) || self.tick != self.last_reopen_tick {
+            return;
+        }
+        let g = self.adversary.gap.as_mut().unwrap();
+        g.phase = 2;
+        g.reopened_at = self.now;
+        let (pre_px, longs, shorts) = (g.pre_px, g.longs.clone(), g.shorts.clone());
+        if (self.px as f64) > pre_px as f64 * (1.0 - GAP * 0.7) {
+            self.probe_skip("gap", "the reopen did not gap");
+            self.adversary.gap.as_mut().unwrap().phase = 5;
+            return;
+        }
+        let quiet = crate::chain::pool_params().profit_close_quiet_secs as i64;
+        let q = crate::chain::pool_params().lp_reopen_quiet_secs as i64;
+        let m = self.market().await;
+        let winner = |s: &Sim, i: usize| {
+            let p = &s.ledger.positions[i];
+            p.is_open() && model::pnl(p.side(), p.state.size, p.state.entry_price, s.px) > 0
+        };
+        // F48: the winner tries to close before its bankrupt counterparty is liquidated
+        if let Some(&s1) = shorts.iter().find(|&&i| winner(self, i)) {
+            if self.within_open(quiet) && self.oracle_ok(&m, 60) {
+                let n0 = self.chain.transactions;
+                self.close_bounded(s1, 0, "close_position_probe").await;
+                self.probe_rejected("winner_close_in_quiet", n0, "ProfitCloseQuiet");
+            } else {
+                self.probe_skip("winner_close_in_quiet", "not inside the quiet time");
+            }
+        }
+        // Q: LP deposits wait for the keeper's liquidations to reprice NAV
+        if let Some(l) = self.lp_named("lp-sandwich") {
+            if self.within_open(q) {
+                let n0 = self.chain.transactions;
+                self.lp_deposit(l, 1_000 * USDC, 0, "lp_deposit_probe").await;
+                self.probe_rejected("lp_deposit_in_q", n0, "LpFlowWindowClosed");
+            }
+        }
+        for &i in &longs {
+            if self.ledger.positions[i].is_open() {
+                let _ = self.liquidate_one(i, "liquidate").await;
+            }
+        }
+        let pool = self.pool().await;
+        if pool.pending_bad_debt_long == 0 {
+            self.probe_skip("gap", "the gap left no bad debt pending");
+            self.adversary.gap.as_mut().unwrap().phase = 5;
+            return;
+        }
+        self.hit("gap.pending");
+        // The opposite-side winners stay out of the keeper's ADL until the probes are done
+        for &i in &shorts {
+            self.adversary.held.insert(i);
+        }
+        // D16: a mode-0 ADL under the floor, which starts at 100x and decays over 6 open hours
+        let st = self.st().await;
+        let below = shorts.iter().copied().find(|&i| {
+            let p = &self.ledger.positions[i].state;
+            self.ledger.positions[i].is_open() && model::slice_profit(p, p.size, self.px, st.m.cumulative_funding) > 0
+                && model::equity(p, self.px, st.m.cumulative_funding) > 0
+                && model::adl_score(&st.m, p, self.px) < model::adl_floor(&st.m, &st.pool, Side::Short, self.now) as u128
+        });
+        match below {
+            Some(i) => {
+                let kp = self.agents[self.agent_named("prober")].t.kp.insecure_clone();
+                let n0 = self.chain.transactions;
+                self.adl_by(i, model::ADL_DEFICIT, 0, "adl_probe", &kp).await;
+                self.probe_rejected("adl_mode0_below_floor", n0, "AdlScoreBelowFloor");
+            }
+            None => self.probe_skip("adl_mode0_below_floor", "no winner under the floor"),
+        }
+    }
+
+    /// Past the quiet time, pending > 0: an opposite-side winner's close is
+    /// haircut by min(pending, profit) (D13/F4).
+    async fn gap_after_quiet(&mut self) {
+        let quiet = crate::chain::pool_params().profit_close_quiet_secs as i64;
+        if self.within_open(quiet) || !schedule::is_open(self.now) {
+            return;
+        }
+        self.adversary.gap.as_mut().unwrap().phase = 3;
+        let shorts = self.adversary.gap.as_ref().unwrap().shorts.clone();
+        let before = self.pool().await;
+        if before.pending_bad_debt_long == 0 {
+            self.probe_skip("opposite_winner_haircut", "the pending was repaid before the quiet time ended");
+            return;
+        }
+        for i in shorts {
+            if !self.ledger.positions[i].is_open() {
+                continue;
+            }
+            let Ok(out) = self.predict_close(i).await else { continue };
+            if out.p <= 0 {
+                continue;
+            }
+            self.adversary.held.remove(&i);
+            if !self.close_tracked(i, "close_position").await {
+                continue;
+            }
+            let after = self.pool().await;
+            let hc = before.pending_bad_debt_long - after.pending_bad_debt_long;
+            let want = (before.pending_bad_debt_long as i128).min(out.p - out.solvency_hc as i128).max(0) as u64;
+            self.probe_check("opposite_winner_haircut", hc > 0 && hc == want, || {
+                format!("profit {} (solvency haircut {}), pending {} -> {}: haircut {}, required {}", out.p, out.solvency_hc, before.pending_bad_debt_long, after.pending_bad_debt_long, hc, want)
+            });
+            return;
+        }
+        self.probe_skip("opposite_winner_haircut", "no winner could close");
+    }
+
+    /// At the next session open, still inside its quiet time and with the
+    /// pending old enough that the floor is 0: the winner's own mode-0 ADL
+    /// is refused (ProfitCloseQuiet, D23 second review).
+    async fn gap_next_open(&mut self) {
+        let quiet = crate::chain::pool_params().profit_close_quiet_secs as i64;
+        let reopened_at = self.adversary.gap.as_ref().unwrap().reopened_at;
+        if self.now < reopened_at + 3_600 || !self.within_open(quiet) || self.tick != self.last_reopen_tick {
+            if self.now >= self.adversary.end_time - self.cfg.tick_secs {
+                self.probe_skip("self_adl_in_quiet", "the run ended before the next open");
+            }
+            return;
+        }
+        self.adversary.gap.as_mut().unwrap().phase = 4;
+        let st = self.st().await;
+        if st.pool.pending_bad_debt_long == 0 {
+            self.probe_skip("self_adl_in_quiet", "the pending was repaid before the next open");
+            return;
+        }
+        let shorts = self.adversary.gap.as_ref().unwrap().shorts.clone();
+        let floor = model::adl_floor(&st.m, &st.pool, Side::Short, self.now) as u128;
+        let f = st.m.cumulative_funding;
+        let pick = shorts.into_iter().find(|&i| {
+            let p = &self.ledger.positions[i].state;
+            self.ledger.positions[i].is_open() && model::slice_profit(p, p.size, self.px, f) > 0 && model::equity(p, self.px, f) > 0
+                && model::adl_score(&st.m, p, self.px) >= floor
+        });
+        let Some(i) = pick else {
+            self.probe_skip("self_adl_in_quiet", "no winner over the floor");
+            return;
+        };
+        let owner = self.agents[self.agent_named("gap-b")].t.kp.insecure_clone();
+        let n0 = self.chain.transactions;
+        self.adl_by(i, model::ADL_DEFICIT, 0, "adl_probe", &owner).await;
+        self.probe_rejected("self_adl_in_quiet", n0, "ProfitCloseQuiet");
+    }
+
+    /// After that quiet time: a donation repays all but one unit of the
+    /// pending, and a mode-0 ADL asking for a whole winner closes only the
+    /// slice the dust needs (D37), paying the close fee on that slice only
+    /// (D22). Then gap-b closes its winners.
+    async fn gap_dust(&mut self) {
+        let quiet = crate::chain::pool_params().profit_close_quiet_secs as i64;
+        if self.within_open(quiet) || !schedule::is_open(self.now) {
+            return;
+        }
+        self.adversary.gap.as_mut().unwrap().phase = 5;
+        let shorts = self.adversary.gap.as_ref().unwrap().shorts.clone();
+        let pending = self.pool().await.pending_bad_debt_long;
+        let p = self.agent_named("prober");
+        if pending > 1 {
+            self.donate(p, pending - 1, "donate").await;
+        }
+        let st = self.st().await;
+        if st.pool.pending_bad_debt_long != 1 {
+            self.probe_skip("dust_pending_slice", "no dust pending");
+        } else {
+            let floor = model::adl_floor(&st.m, &st.pool, Side::Short, self.now) as u128;
+            let f = st.m.cumulative_funding;
+            let pick = shorts.iter().copied().find(|&i| {
+                let q = &self.ledger.positions[i].state;
+                self.ledger.positions[i].is_open() && model::slice_profit(q, q.size, self.px, f) > 0 && model::equity(q, self.px, f) > 0
+                    && model::adl_score(&st.m, q, self.px) >= floor && model::notional(q.size, self.px) > 1_000 * USDC as i128
+            });
+            match pick {
+                Some(i) => {
+                    let before = self.ledger.positions[i].state.clone();
+                    let kp = self.agents[p].t.kp.insecure_clone();
+                    let landed = self.adl_by(i, model::ADL_DEFICIT, 0, "adl", &kp).await.is_some();
+                    let ev = crate::chain::events::<Adl>(&self.last_logs);
+                    let after = self.pool().await;
+                    let fee = |x: u64| model::slice_close_fee(&before, x, st.m.taker_fee);
+                    let ok = landed && ev.len() == 1 && ev[0].size_closed < before.size && ev[0].fee == fee(ev[0].size_closed)
+                        && self.ledger.positions[i].is_open() && after.pending_bad_debt_long == 0;
+                    let still_open = self.ledger.positions[i].is_open();
+                    let detail = format!("1 unit pending, whole position of {} asked: closed {:?} (fee {:?}, slice fee {}), pending after {}, still open {}", before.size,
+                        ev.first().map(|e| e.size_closed), ev.first().map(|e| e.fee), ev.first().map_or(0, |e| fee(e.size_closed)), after.pending_bad_debt_long, still_open);
+                    self.probe_check("dust_pending_slice", ok, || detail);
+                }
+                None => self.probe_skip("dust_pending_slice", "no winner over the floor"),
+            }
+        }
+        for &i in &shorts {
+            self.adversary.held.remove(&i);
+        }
+        let b = self.agent_named("gap-b");
+        let a = self.agent_named("gap-a");
+        self.unwind_probe_positions(&[a, b]).await;
+    }
+
+    // --- LP withdrawal gates (§9.4, D17, F5) ------------------------------------------------
+
+    /// lp-probe deposits and requests at once, so its request matures a
+    /// day later; then a withdrawal inside W, inside Q alone, and while bad
+    /// debt is pending (outside both) must each be refused.
+    async fn probe_lp_withdraw_gates(&mut self) {
+        let Some(l) = self.lp_named("lp-probe") else { return };
+        let pos = self.lp_position(l).await;
+        if pos.shares == 0 && pos.deposited_cum == 0 {
+            self.lp_deposit(l, 50_000 * USDC, 0, "lp_deposit").await;
+            return;
+        }
+        if pos.pending_shares == 0 {
+            if pos.shares > 0 && pos.requested_at == 0 {
+                self.lp_request(l, pos.shares, "lp_request").await;
+            }
+            return;
+        }
+        let p = crate::chain::pool_params();
+        let window = pm::effective_claim_window_secs(pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
+        if self.now < pos.unlock_at || (window > 0 && open_secs_between(pos.unlock_at, self.now) as u64 > window) || !schedule::is_open(self.now) {
+            return;
+        }
+        let (in_w, in_q) = (self.in_w(), self.within_open(p.lp_reopen_quiet_secs as i64));
+        let pending = self.pending_total().await;
+        let (name, code) = if in_w {
+            ("lp_withdraw_in_w", "LpFlowWindowClosed")
+        } else if in_q {
+            ("lp_withdraw_in_q", "LpFlowWindowClosed")
+        } else if pending > 0 {
+            ("lp_withdraw_adl_required", "PoolAdlPending")
+        } else {
+            return;
+        };
+        if self.adversary.done.contains(name) {
+            return;
+        }
+        self.adversary.done.insert(name);
+        if code == "PoolAdlPending" {
+            // Funding stale would be refused first
+            self.crank_funding().await;
+        }
+        let n0 = self.chain.transactions;
+        self.lp_withdraw(l, "lp_withdraw_probe").await;
+        self.probe_rejected(name, n0, code);
+    }
+
+    // --- settlement (D35, D18) ----------------------------------------------------------------
+
+    /// Before settlement: the sandwiching LP deposits, to request right after
+    /// the settled market's whole-fund sweep (sweep_pass checks it).
+    pub async fn arm_sweep_sandwich(&mut self) {
+        let Some(l) = self.lp_named("lp-sandwich") else { return };
+        self.crank_funding().await;
+        if self.pending_total().await > 0 || !self.in_session() {
+            self.probe_skip("lp_sandwich_sweep", "no deposit before settlement");
+            return;
+        }
+        match self.sandwich_deposit(l, SANDWICH).await {
+            Some(shares) => self.adversary.sweep_sandwich = Some((l, shares)),
+            None => self.probe_skip("lp_sandwich_sweep", "the deposit before settlement was refused"),
+        }
+    }
+
+    /// Right after settlement: a matured LP request is refused inside the
+    /// settled quiet time (D41), so the losers' deficits are booked before
+    /// an LP exits at a NAV that still counts their losses.
+    async fn probe_settled_lp_withdraw(&mut self) {
+        let m = self.market().await;
+        let p = crate::chain::pool_params();
+        let quiet = p.profit_close_quiet_secs.max(p.lp_reopen_quiet_secs) as i64;
+        if m.settled_at == 0 || self.now - m.settled_at >= quiet {
+            self.probe_skip("settled_lp_withdraw_quiet", "past the quiet time");
+            return;
+        }
+        let mut matured = None;
+        for l in 0..self.lps.len() {
+            let pos = self.lp_position(l).await;
+            if pos.pending_shares > 0 && self.now >= pos.unlock_at {
+                matured = Some(l);
+                break;
+            }
+        }
+        let Some(l) = matured else {
+            self.probe_skip("settled_lp_withdraw_quiet", "no matured request at settlement");
+            return;
+        };
+        let n0 = self.chain.transactions;
+        self.lp_withdraw(l, "lp_withdraw_probe").await;
+        self.probe_rejected("settled_lp_withdraw_quiet", n0, "LpFlowWindowClosed");
+    }
+
+    /// Right after settlement: a winner's settled close and its owner's own
+    /// close are both refused inside the quiet time (D35), so the keeper
+    /// books the losers' deficits first.
+    async fn probe_settled_winner(&mut self) {
+        let m = self.market().await;
+        let quiet = crate::chain::pool_params().profit_close_quiet_secs as i64;
+        let winner = self.ledger.open.iter().copied().map(|i| (model::realized(&self.ledger.positions[i].state, m.settlement_price, m.cumulative_funding), i))
+            .filter(|&(r, _)| r > 0).max();
+        let Some((_, idx)) = winner else {
+            self.probe_skip("settled_winner_close_quiet", "no winner at the settlement price");
+            return;
+        };
+        if m.settled_at == 0 || self.now - m.settled_at >= quiet {
+            self.probe_skip("settled_winner_close_quiet", "past the quiet time");
+            return;
+        }
+        let n0 = self.chain.transactions;
+        self.close_settled_one(idx).await;
+        self.probe_rejected("settled_winner_close_quiet", n0, "ProfitCloseQuiet");
+        let n0 = self.chain.transactions;
+        self.close_bounded(idx, 0, "close_position_probe").await;
+        self.probe_rejected("settled_owner_close_quiet", n0, "ProfitCloseQuiet");
+    }
+
+    /// The sweep sandwich's check, after the settled market's whole-fund
+    /// sweep: the LP's request is worth no more than its shares were just
+    /// before the sweep, plus their share of the pending the sweep repaid
+    /// (the rest vests, D18).
+    pub async fn check_sweep_sandwich(&mut self, value_before: u64, recovered: u64, lp_shares: u64) {
+        let Some((l, shares)) = self.adversary.sweep_sandwich.take() else { return };
+        let Some(value) = self.sandwich_exit(l, shares).await else {
+            self.probe_skip("lp_sandwich_sweep", "the request after the sweep was refused");
+            return;
+        };
+        let allowed = value_before as u128 + (recovered as u128 * shares as u128 + lp_shares as u128) / lp_shares.max(1) as u128 + 1;
+        self.probe_check("lp_sandwich_sweep", (value as u128) <= allowed, || format!("worth {} before the sweep (+{} recovered pending), requested {} after", value_before, recovered, value));
+    }
+
+    /// The sandwiching LP's shares at NAV_redeem now, if a sweep sandwich is armed.
+    pub async fn sweep_sandwich_value(&mut self) -> Option<(u64, u64)> {
+        let (_, shares) = self.adversary.sweep_sandwich?;
+        let st = self.st().await;
+        let v = model::view(&st.pool, &st.m, st.m.settlement_price.max(1), self.now).ok()?;
+        Some((pm::redeem_value(shares, st.pool.lp_shares, v.nav_redeem), st.pool.lp_shares))
     }
 }

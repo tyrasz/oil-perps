@@ -26,20 +26,42 @@ impl Route {
     }
 }
 
-/// How a position ended, with what was observed on chain when it did.
-#[derive(Clone, Copy, Debug)]
+/// What a position's settlements realized, summed over every piece (a close,
+/// a liquidation or its stage-1 slices, ADL slices, settle_position_pnl).
+/// Per piece, and so in total (invariant 4):
+/// `paid + fees − top_up == collateral + realized − haircut + deficit`.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Settlement {
     pub liquidated: bool,
-    /// Tokens the vault paid out: the owner's payout, or the liquidator's reward
+    /// Paid out of the position: to the owner (tokens or free collateral) and to liquidators
     pub paid: i128,
-    /// Observed change of market.insurance_fund
-    pub insurance_delta: i128,
-    /// Collateral at settlement (add_margin included)
-    pub collateral: u64,
+    /// Close fees and penalties kept (insurance, treasury, cash)
+    pub fees: i128,
+    /// Stage-2 liquidator reward the insurance fund paid
+    pub top_up: i128,
+    /// Collateral released (add_margin included)
+    pub collateral: i128,
+    /// pnl + funding realized, before haircuts
+    pub realized: i128,
+    /// Solvency, bad-debt and cash haircuts on profits
+    pub haircut: i128,
+    /// Negative equity booked through the waterfall
+    pub deficit: i128,
+    /// Insurance's own draw (deficits it paid, reward top-ups)
+    pub insurance_draw: i128,
+    /// Last piece: the price it settled at (exec), the oracle, cumulative funding
     pub mark: u64,
+    pub oracle: u64,
     pub cumulative_funding: i64,
-    /// Bad debt the fund could not absorb (model)
-    pub uncovered: u64,
+    pub pieces: u32,
+    /// Fully settled (no size left)
+    pub done: bool,
+}
+
+impl Settlement {
+    pub fn balanced(&self) -> bool {
+        self.paid + self.fees - self.top_up == self.collateral + self.realized - self.haircut + self.deficit
+    }
 }
 
 pub struct TrackedPosition {
@@ -50,11 +72,7 @@ pub struct TrackedPosition {
     pub opened_tick: u64,
     /// Last state read from chain
     pub state: Position,
-    /// Where the vault became this position's counterparty: (price, cumulative
-    /// funding). The entry for house positions; the partner's settlement mark
-    /// for a venue leg whose partner has settled; None while paired.
-    pub vault_basis: Option<(u64, i64)>,
-    pub settled: Option<Settlement>,
+    pub settled: Settlement,
 }
 
 impl TrackedPosition {
@@ -127,8 +145,7 @@ pub struct Ledger {
 impl Ledger {
     pub fn add_position(&mut self, address: Pubkey, owner: usize, route: Route, tick: u64, state: Position) -> usize {
         let idx = self.positions.len();
-        let vault_basis = (route == Route::House).then_some((state.entry_price, state.last_funding_payment));
-        self.positions.push(TrackedPosition { address, owner, route, pair: None, opened_tick: tick, state, vault_basis, settled: None });
+        self.positions.push(TrackedPosition { address, owner, route, pair: None, opened_tick: tick, state, settled: Settlement::default() });
         self.by_address.insert(address, idx);
         self.open.push(idx);
         idx
@@ -142,11 +159,6 @@ impl Ledger {
         pair
     }
 
-    pub fn partner(&self, idx: usize) -> Option<usize> {
-        let p = &self.pairs[self.positions[idx].pair?];
-        Some(if p.taker == idx { p.maker } else { p.taker })
-    }
-
     /// Record a new state for `idx`; drops it from the open set once it is not open.
     pub fn update(&mut self, idx: usize, state: Position) {
         let open = state.status == PositionStatus::Open;
@@ -156,34 +168,27 @@ impl Ledger {
         }
     }
 
-    /// `idx` settled: record how, and hand its partner (if still open) to the vault.
-    pub fn settle(&mut self, idx: usize, s: Settlement) {
-        self.positions[idx].settled = Some(s);
-        if let Some(other) = self.partner(idx) {
-            if self.positions[other].is_open() && self.positions[other].vault_basis.is_none() {
-                self.positions[other].vault_basis = Some((s.mark, s.cumulative_funding));
-            }
-        }
+    /// One settlement piece of `idx` landed.
+    pub fn settle(&mut self, idx: usize, piece: Settlement) {
+        let s = &mut self.positions[idx].settled;
+        s.liquidated |= piece.liquidated;
+        s.paid += piece.paid;
+        s.fees += piece.fees;
+        s.top_up += piece.top_up;
+        s.collateral += piece.collateral;
+        s.realized += piece.realized;
+        s.haircut += piece.haircut;
+        s.deficit += piece.deficit;
+        s.insurance_draw += piece.insurance_draw;
+        s.mark = piece.mark;
+        s.oracle = piece.oracle;
+        s.cumulative_funding = piece.cumulative_funding;
+        s.pieces += 1;
+        s.done = piece.done;
     }
 
     pub fn open_of(&self, owner: usize) -> Vec<usize> {
         self.open.iter().copied().filter(|&i| self.positions[i].owner == owner).collect()
-    }
-
-    /// The vault's exposure as counterparty of unpaired open positions: (their
-    /// net signed size, what the vault owes them at `mark` since it took them
-    /// over, how many).
-    pub fn vault_exposure(&self, mark: u64, cumulative_funding: i64) -> (i128, i128, usize) {
-        let mut out = (0i128, 0i128, 0usize);
-        for &idx in &self.open {
-            let t = &self.positions[idx];
-            let Some((basis, basis_funding)) = t.vault_basis else { continue };
-            let p = &t.state;
-            out.0 += t.signed_size();
-            out.1 += crate::model::pnl(p.side, p.size, basis, mark) + crate::model::funding(p.side, p.size, basis_funding, cumulative_funding);
-            out.2 += 1;
-        }
-        out
     }
 
     /// The owner granted `cap` (approve or update), or the account now holds it.

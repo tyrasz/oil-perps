@@ -5,14 +5,18 @@ export interface Position {
   side: 'long' | 'short';
   size: number;
   collateral: number;
-  entryPrice: number;
+  entryPrice: number;               // PnL basis; settle_position_pnl moves it to the mark
+  openedPrice?: number;             // Price it opened at; never changes
   leverage: number;
   unrealizedPnl: number;
-  marginRatio: number;
+  marginRatio: number;              // Equity / mark notional, percent (liquidation's rule)
   openedAt: number;
   // From the position's own market (see utils/positionHealth.ts)
   markPrice?: number;               // Price the position is valued at (settlement price if settled)
   liquidationThreshold?: number;    // Margin ratio (%) below which it can be liquidated now
+  backstopThreshold?: number;       // Margin ratio (%) below which liquidation closes it in full
+  liquidationPrice?: number;        // Mark price at the liquidation threshold
+  liquidationNote?: string;         // Partial vs full liquidation, for display
   warningThreshold?: number;        // Margin ratio (%) to warn below
   settled?: boolean;                // Market settled: closes at the settlement price
   closeBlockedReason?: string | null; // Why it can't be closed right now
@@ -88,6 +92,8 @@ export interface UserAccount {
   collateralBalance: number;
   totalPositions: number;
   realizedPnl: number;
+  /** Opened notional of open house (LP-pool) positions, USDC: the per-account cap's measure. */
+  houseEntryNotional?: number;
 }
 
 export type OrderSide = 'long' | 'short';

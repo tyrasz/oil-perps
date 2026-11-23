@@ -1,12 +1,8 @@
+use crate::ix;
+use crate::liquidator::{for_each_market, MarketData};
 use crate::KeeperConfig;
-use crate::liquidator::{anchor_discriminator, for_each_market, MarketData};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{
-    instruction::{AccountMeta, Instruction},
-    pubkey::Pubkey,
-    signature::Signer,
-    transaction::Transaction,
-};
+use solana_sdk::{pubkey::Pubkey, signature::Signer};
 use std::{sync::Arc, time::Duration};
 use tokio::time::interval;
 use tracing::{info, error, warn, debug};
@@ -76,31 +72,24 @@ async fn update_market_funding(
     // Pausing only stops new positions; the program still accepts liquidations
     // and funding updates, and skipping them would let bad debt build up.
 
-    if market_data.is_settled() || !market_data.is_in_session(crate::liquidator::unix_now()) {
+    let now = crate::liquidator::unix_now();
+    if market_data.is_settled() || !market_data.is_in_session(now) {
         debug!("Market is settled or outside trading hours, skipping funding update");
         return Ok(false);
     }
 
-    // Check if enough time has passed since last funding update
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64;
-
-    let time_since_last_funding = current_time.saturating_sub(market_data.last_funding_time);
-    let time_until_next = market_data.funding_interval.saturating_sub(time_since_last_funding);
-
-    if time_until_next > 0 {
-        debug!(
-            "Next funding update in {} seconds ({} minutes)",
-            time_until_next,
-            time_until_next / 60
-        );
+    // Due on open seconds since the last crank plus the carried remainder
+    // (§8), not wall clock: the weekend and the daily break do not count
+    let open_secs = market_data.funding_open_secs(now);
+    if !market_data.funding_due(now) {
+        let left = market_data.funding_interval.saturating_sub(open_secs);
+        debug!("Next funding update in {} open seconds ({} minutes)", left, left / 60);
         return Ok(false);
     }
 
     info!(
-        "Funding interval elapsed ({}s since last update), triggering update",
-        time_since_last_funding
+        "Funding interval elapsed ({} open seconds incl. carry since last update), triggering update",
+        open_secs
     );
 
     // Log current OI for transparency
@@ -122,49 +111,8 @@ async fn execute_funding_update(
     market_pda: &Pubkey,
     market_data: &MarketData,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let discriminator = anchor_discriminator("global", "update_funding");
-
-    let instruction = Instruction {
-        program_id: config.perps_program_id,
-        accounts: vec![
-            AccountMeta::new(config.keypair.pubkey(), true),           // keeper (signer)
-            AccountMeta::new(*market_pda, false),                      // market
-            AccountMeta::new_readonly(market_data.pyth_price_feed, false), // pyth_price_feed
-        ],
-        data: discriminator.to_vec(),
-    };
-
-    // Get recent blockhash
-    let recent_blockhash = client.get_latest_blockhash()?;
-
-    // Build and sign transaction
-    let transaction = Transaction::new_signed_with_payer(
-        &[instruction],
-        Some(&config.keypair.pubkey()),
-        &[&config.keypair],
-        recent_blockhash,
-    );
-
-    // Send transaction
-    let signature = client.send_and_confirm_transaction(&transaction)?;
+    let instruction = ix::update_funding(&config.perps_program_id, &config.keypair.pubkey(), market_pda, &market_data.pyth_price_feed);
+    let signature = ix::send(client, &config.keypair, instruction)?;
     info!("Funding update tx: {}", signature);
-
     Ok(())
-}
-
-// Calculate what the next funding rate will be (for logging)
-pub fn estimate_funding_rate(long_oi: u64, short_oi: u64) -> i64 {
-    let long = long_oi as i128;
-    let short = short_oi as i128;
-    let total = long + short;
-
-    if total == 0 {
-        return 0;
-    }
-
-    // Funding rate = (long_oi - short_oi) / total_oi * base_rate
-    // Using 0.01% per hour as base rate = 100 (6 decimals)
-    let imbalance = ((long - short) * 1_000_000) / total;
-    let base_rate: i128 = 100;
-    ((imbalance * base_rate) / 1_000_000) as i64
 }

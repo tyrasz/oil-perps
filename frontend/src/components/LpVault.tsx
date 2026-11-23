@@ -1,83 +1,144 @@
 import { useState } from 'react';
-import { useWallet } from '@solana/wallet-adapter-react';
 import { useVault } from '../hooks/useVault';
+import { useMarketStore } from '../stores/marketStore';
+import { adlRequired, drawdownNow, fromUnits, isSettled, toUnits, depositShares } from '../utils/pool';
+import { redeemValue, unvested } from '../utils/poolMath';
+import { explainProgramError, type ErrorContext } from '../utils/errors';
+import { formatDuration } from '../utils/session';
+
+const usd = (x: bigint) =>
+  `$${fromUnits(x).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const shares = (x: bigint) => fromUnits(x).toLocaleString(undefined, { maximumFractionDigits: 6 });
+const perShare = (x: bigint) => `$${fromUnits(x).toFixed(6)}`;
+const when = (t: number) => new Date(t * 1000).toLocaleString();
+const bps = (x: bigint) => `${(Number(x) / 100).toFixed(2)}%`;
 
 export function LpVault() {
-  const { connected } = useWallet();
-  const { vault, lpPosition, deposit, withdraw, requestWithdrawal, isLoading } = useVault();
+  const {
+    connected,
+    market,
+    pool,
+    view,
+    gates,
+    lpPosition,
+    request,
+    summary,
+    now,
+    isLoading,
+    error,
+    deposit,
+    requestWithdrawal,
+    cancelWithdrawal,
+    withdraw,
+  } = useVault();
+  const selectedCommodity = useMarketStore((s) => s.selectedCommodity);
   const [amount, setAmount] = useState('');
   const [action, setAction] = useState<'deposit' | 'withdraw'>('deposit');
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const amountNum = parseFloat(amount);
-    if (isNaN(amountNum) || amountNum <= 0) return;
-
-    try {
-      if (action === 'deposit') {
-        await deposit(amountNum);
-      } else {
-        await withdraw(amountNum);
-      }
-      setAmount('');
-    } catch (error) {
-      console.error('Transaction failed:', error);
-    }
-  };
 
   if (!connected) {
     return (
       <div className="lp-vault">
+        <div className="vault-connect-prompt">Connect your wallet to provide liquidity</div>
+      </div>
+    );
+  }
+
+  if (!market || !pool) {
+    return (
+      <div className="lp-vault">
         <div className="vault-connect-prompt">
-          Connect your wallet to provide liquidity
+          {error ?? `Loading the ${selectedCommodity.id} LP pool...`}
         </div>
       </div>
     );
   }
 
-  const shareValue = vault ? vault.totalShares > 0
-    ? (vault.totalAssets / vault.totalShares).toFixed(4)
-    : '1.0000' : '1.0000';
+  const p = pool.params;
+  const settled = isSettled(market);
+  const dd = view ? drawdownNow(pool, view, now) : 0n;
+  const status = settled
+    ? 'Settled'
+    : pool.lpShares === 0n
+    ? 'Not seeded'
+    : adlRequired(pool)
+    ? 'ADL pending'
+    : p.ddFreezeBps > 0n && dd >= p.ddFreezeBps
+    ? 'Drawdown freeze'
+    : 'Active';
+  const quietSecs = Number(p.lpReopenQuietSecs);
+  const explain = (names: string[], a: ErrorContext['action']) =>
+    names.map((n) => explainProgramError(n, { action: a, inWindow: gates?.inWindow, inQuiet: gates?.inQuiet, quietSecs }));
 
-  const userValue = lpPosition && vault
-    ? (lpPosition.shares * parseFloat(shareValue)).toFixed(2)
-    : '0.00';
+  const amountNum = parseFloat(amount);
+  const amountUnits = amountNum > 0 ? toUnits(amountNum) : 0n;
+  const expectedShares = action === 'deposit' && view && amountUnits > 0n ? depositShares(pool, view, amountUnits) : null;
+  const requestValue =
+    action === 'withdraw' && view && amountUnits > 0n ? redeemValue(amountUnits, pool.lpShares, view.navRedeem) : null;
+  const hasRequest = !!request && request.state !== 'none';
+  const freeShares = summary?.freeShares ?? 0n;
 
-  const userPnl = lpPosition
-    ? (parseFloat(userValue) - lpPosition.depositedAmount).toFixed(2)
-    : '0.00';
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!(amountNum > 0)) return;
+    try {
+      if (action === 'deposit') await deposit(amountNum);
+      else await requestWithdrawal(amountUnits > freeShares ? freeShares : amountUnits);
+      setAmount('');
+    } catch (err) {
+      console.error('Transaction failed:', err);
+    }
+  };
 
-  const canWithdraw = lpPosition && lpPosition.withdrawalRequestedAt > 0 &&
-    Date.now() / 1000 > lpPosition.withdrawalRequestedAt + (vault?.withdrawalDelay || 0);
+  const netSide = view ? (view.net > 0n ? 'SHORT' : view.net < 0n ? 'LONG' : 'FLAT') : 'FLAT';
+  const flowGates = action === 'deposit' ? gates?.deposit ?? [] : gates?.request ?? [];
 
   return (
     <div className="lp-vault">
       <div className="vault-header">
-        <h3>LP Vault</h3>
-        <span className="vault-status active">Active</span>
+        <h3>LP Pool · {selectedCommodity.id}</h3>
+        <span className={`vault-status ${status === 'Active' ? 'active' : 'warning'}`}>{status}</span>
       </div>
 
       <div className="vault-stats-grid">
         <div className="vault-stat">
-          <span className="stat-label">Total Value Locked</span>
-          <span className="stat-value">${vault?.totalAssets.toLocaleString() || '0'}</span>
+          <span className="stat-label" title="NAV_redeem: what withdrawals are valued at">Pool NAV</span>
+          <span className="stat-value">{view ? usd(view.b) : '-'}</span>
         </div>
         <div className="vault-stat">
-          <span className="stat-label">Share Value</span>
-          <span className="stat-value">${shareValue}</span>
+          <span className="stat-label" title="NAV_redeem per share (withdrawals); deposits pay NAV_mint per share">Share Value</span>
+          <span className="stat-value">{summary ? perShare(summary.navRedeemPerShare) : '-'}</span>
+          {summary && <span className="stat-sub">deposit at {perShare(summary.navMintPerShare)}</span>}
         </div>
         <div className="vault-stat">
-          <span className="stat-label">Net Exposure</span>
-          <span className={`stat-value ${(vault?.netExposure || 0) > 0 ? 'short' : 'long'}`}>
-            {vault?.netExposure || 0 > 0 ? 'SHORT' : 'LONG'} ${Math.abs(vault?.netExposure || 0).toLocaleString()}
+          <span className="stat-label" title="The pool holds the opposite of the traders' net position">Pool Net Exposure</span>
+          <span className={`stat-value ${netSide === 'SHORT' ? 'short' : netSide === 'LONG' ? 'long' : ''}`}>
+            {netSide} {view ? usd(view.netNotional) : ''}
           </span>
         </div>
         <div className="vault-stat">
-          <span className="stat-label">Utilization</span>
-          <span className="stat-value">
-            {vault ? ((vault.totalLongSize + vault.totalShortSize) / vault.totalAssets * 100).toFixed(1) : '0'}%
-          </span>
+          <span className="stat-label">Cash</span>
+          <span className="stat-value">{usd(pool.cash)}</span>
         </div>
+        <div className="vault-stat">
+          <span className="stat-label">Insurance Fund</span>
+          <span className="stat-value">{usd(market.insuranceFund)}</span>
+        </div>
+        <div className="vault-stat">
+          <span className="stat-label" title="Per-share NAV against its 7-day peak">Drawdown</span>
+          <span className="stat-value">{bps(dd)}</span>
+        </div>
+        {adlRequired(pool) && (
+          <div className="vault-stat">
+            <span className="stat-label">Pending Bad Debt</span>
+            <span className="stat-value negative">{usd(pool.pendingBadDebtLong + pool.pendingBadDebtShort)}</span>
+          </div>
+        )}
+        {unvested(pool.vestAmount, pool.vestStart, pool.vestEnd, BigInt(now)) > 0n && (
+          <div className="vault-stat">
+            <span className="stat-label" title="Donations and insurance sweeps vest into NAV_redeem over the withdrawal delay">Vesting</span>
+            <span className="stat-value">{usd(unvested(pool.vestAmount, pool.vestStart, pool.vestEnd, BigInt(now)))}</span>
+          </div>
+        )}
       </div>
 
       <div className="vault-divider" />
@@ -87,35 +148,79 @@ export function LpVault() {
         <div className="position-stats">
           <div className="position-stat">
             <span className="stat-label">Shares</span>
-            <span className="stat-value">{lpPosition?.shares.toLocaleString() || '0'}</span>
+            <span className="stat-value">{lpPosition ? shares(lpPosition.shares) : '0'}</span>
           </div>
           <div className="position-stat">
             <span className="stat-label">Value</span>
-            <span className="stat-value">${userValue}</span>
+            <span className="stat-value">{summary ? usd(summary.positionValue) : '$0.00'}</span>
           </div>
           <div className="position-stat">
-            <span className="stat-label">PnL</span>
-            <span className={`stat-value ${parseFloat(userPnl) >= 0 ? 'positive' : 'negative'}`}>
-              ${userPnl}
+            <span className="stat-label">Deposited / Withdrawn</span>
+            <span className="stat-value">
+              {lpPosition ? `${usd(lpPosition.depositedCum)} / ${usd(lpPosition.withdrawnCum)}` : '-'}
             </span>
           </div>
         </div>
+
+        {hasRequest && request && (
+          <div className={`withdrawal-request ${request.state}`}>
+            <h4>Withdrawal Request</h4>
+            <div className="info-item">
+              <span>Shares</span>
+              <span>{shares(request.pendingShares)}</span>
+            </div>
+            <div className="info-item">
+              <span title="Fixed at request time; you get the lower of this and the value when you claim">Requested value</span>
+              <span>{usd(request.requestedValue)}</span>
+            </div>
+            <div className="info-item">
+              <span>Payout now</span>
+              <span>{usd(request.payout)}</span>
+            </div>
+            <div className="info-item">
+              <span>Unlocks</span>
+              <span>
+                {when(request.unlockAt)}
+                {request.state === 'waiting' && ` (in ${formatDuration(request.unlockAt - now)})`}
+              </span>
+            </div>
+            <div className="info-item">
+              <span title="Counted in open market hours after the unlock">Claim by</span>
+              <span>{request.claimDeadline ? when(request.claimDeadline) : 'no deadline'}</span>
+            </div>
+            {request.state === 'lapsed' && (
+              <div className="cooldown-notice">
+                This request lapsed: its claim window passed. Cancel it and request again.
+              </div>
+            )}
+            {request.state === 'claimable' &&
+              explain(gates?.withdraw ?? [], 'lpWithdraw').map((m) => (
+                <div key={m} className="cooldown-notice">
+                  {m}
+                </div>
+              ))}
+            <div className="request-actions">
+              {request.state === 'claimable' && (
+                <button className="submit-btn withdraw" onClick={() => withdraw().catch(() => {})} disabled={isLoading}>
+                  Claim {usd(request.payout)}
+                </button>
+              )}
+              <button className="request-btn" onClick={() => cancelWithdrawal().catch(() => {})} disabled={isLoading}>
+                Cancel request
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="vault-divider" />
 
       <div className="vault-actions">
         <div className="action-tabs">
-          <button
-            className={`action-tab ${action === 'deposit' ? 'active' : ''}`}
-            onClick={() => setAction('deposit')}
-          >
+          <button className={`action-tab ${action === 'deposit' ? 'active' : ''}`} onClick={() => setAction('deposit')}>
             Deposit
           </button>
-          <button
-            className={`action-tab ${action === 'withdraw' ? 'active' : ''}`}
-            onClick={() => setAction('withdraw')}
-          >
+          <button className={`action-tab ${action === 'withdraw' ? 'active' : ''}`} onClick={() => setAction('withdraw')}>
             Withdraw
           </button>
         </div>
@@ -126,56 +231,82 @@ export function LpVault() {
               type="number"
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
-              placeholder={action === 'deposit' ? 'Amount to deposit' : 'Shares to burn'}
+              placeholder={action === 'deposit' ? 'Amount to deposit' : 'Shares to withdraw'}
               min="0"
-              step="0.01"
+              step="0.000001"
             />
             <span className="input-suffix">{action === 'deposit' ? 'USDC' : 'shares'}</span>
+            {action === 'withdraw' && freeShares > 0n && (
+              <button type="button" className="max-btn" onClick={() => setAmount(fromUnits(freeShares).toString())}>
+                Max
+              </button>
+            )}
           </div>
 
-          {action === 'withdraw' && lpPosition && lpPosition.withdrawalRequestedAt === 0 && (
-            <button
-              type="button"
-              className="request-btn"
-              onClick={requestWithdrawal}
-              disabled={isLoading || !lpPosition.shares}
-            >
-              Request Withdrawal (24h cooldown)
-            </button>
+          {expectedShares !== null && expectedShares !== undefined && (
+            <div className="info-item">
+              <span>You receive</span>
+              <span>{shares(expectedShares)} shares</span>
+            </div>
+          )}
+          {requestValue !== null && (
+            <div className="info-item">
+              <span>Value at request</span>
+              <span>{usd(requestValue)}</span>
+            </div>
           )}
 
-          {action === 'withdraw' && lpPosition && lpPosition.withdrawalRequestedAt > 0 && !canWithdraw && (
-            <div className="cooldown-notice">
-              Withdrawal available in {Math.ceil((lpPosition.withdrawalRequestedAt + (vault?.withdrawalDelay || 86400) - Date.now() / 1000) / 3600)}h
-            </div>
+          {flowGates.length > 0 &&
+            explain(flowGates, action === 'deposit' ? 'lpDeposit' : 'lpRequest').map((m) => (
+              <div key={m} className="cooldown-notice">
+                {m}
+              </div>
+            ))}
+          {gates?.needsFundingCrank && (
+            <div className="info-notice">Funding is due: it will be cranked first, in its own transaction (one extra signature).</div>
+          )}
+          {action === 'withdraw' && hasRequest && (
+            <div className="info-notice">One request at a time: claim or cancel the pending one first.</div>
           )}
 
           <button
             type="submit"
             className={`submit-btn ${action}`}
-            disabled={isLoading || !amount || (action === 'withdraw' && !canWithdraw)}
+            disabled={
+              isLoading ||
+              !(amountNum > 0) ||
+              flowGates.length > 0 ||
+              (action === 'withdraw' && (hasRequest || freeShares === 0n))
+            }
           >
-            {isLoading ? 'Processing...' : action === 'deposit' ? 'Deposit USDC' : 'Withdraw'}
+            {isLoading ? 'Processing...' : action === 'deposit' ? 'Deposit USDC' : 'Request Withdrawal'}
           </button>
+          {error && <div className="error-message">{error}</div>}
         </form>
       </div>
 
       <div className="vault-info">
         <div className="info-item">
-          <span>Base Spread</span>
-          <span>{vault?.baseSpread || 5} bps</span>
+          <span>Withdrawal delay</span>
+          <span>{formatDuration(Number(p.withdrawalDelaySecs))}</span>
         </div>
         <div className="info-item">
-          <span>Trading Fee</span>
-          <span>{vault?.tradingFee || 5} bps</span>
+          <span title="Open market hours after the unlock to claim; then the request lapses">Claim window</span>
+          <span>{p.withdrawalClaimWindowSecs > 0n ? `${formatDuration(Number(p.withdrawalClaimWindowSecs))} open` : 'none'}</span>
         </div>
         <div className="info-item">
-          <span>LP Fee Share</span>
-          <span>{vault?.lpFeeShare || 70}%</span>
+          <span title="No LP withdrawals this long before the weekly close (W)">Pre-close exit block</span>
+          <span>{p.weekendCapWindowSecs > 0n ? formatDuration(Number(p.weekendCapWindowSecs)) : 'off'}</span>
         </div>
         <div className="info-item">
-          <span>Withdrawal Delay</span>
-          <span>24 hours</span>
+          <span title="No LP deposits or withdrawals this long after each session open (Q)">Reopen quiet</span>
+          <span>{quietSecs > 0 ? formatDuration(quietSecs) : 'off'}</span>
+        </div>
+        <div className="info-item">
+          <span>Open fee / impact cap</span>
+          <span>
+            {bps(p.openFeeBps)} / {bps(p.maxImpactBps)}
+          </span>
         </div>
       </div>
     </div>

@@ -7,6 +7,7 @@
 //! one when it would otherwise repeat a signature already sent with it.
 
 use crate::support::{Base, Instruction, Keypair, Pubkey, Signer, Transaction, TransactionError};
+use perps_core::state::PoolParams;
 use solana_program_test::ProgramTestBanksClientExt;
 use solana_sdk::hash::Hash;
 use solana_sdk::instruction::InstructionError;
@@ -55,6 +56,8 @@ pub struct Chain {
     pub compute: BTreeMap<String, CuStat>,
     pub transactions: u64,
     pub failed_transactions: u64,
+    /// Resends after the test bank's AccountInUse lock race (reported)
+    pub lock_retries: u64,
     /// Program id -> short name, for decoding logs
     names: Vec<(Pubkey, &'static str)>,
 }
@@ -70,7 +73,7 @@ impl Chain {
             (solana_sdk::system_program::ID, "system"),
             (solana_sdk::compute_budget::ID, "compute_budget"),
         ];
-        Chain { base, blockhash, sent: HashSet::new(), compute: BTreeMap::new(), transactions: 0, failed_transactions: 0, names }
+        Chain { base, blockhash, sent: HashSet::new(), compute: BTreeMap::new(), transactions: 0, failed_transactions: 0, lock_retries: 0, names }
     }
 
     fn program_name(&self, id: &str) -> String {
@@ -97,13 +100,34 @@ impl Chain {
             tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &all, self.blockhash);
         }
         self.sent.insert(tx.signatures[0]);
-        let out = self
+        let mut out = self
             .base
             .ctx
             .banks_client
             .process_transaction_with_metadata(tx)
             .await
             .unwrap_or_else(|e| panic!("transport error in {}: {:?} (a native program may have panicked)", label, e));
+        // AccountInUse is the test bank's account-lock race, not an outcome of
+        // the programs: the transaction was never executed (locks are taken
+        // before it runs), so it is resent on a fresh blockhash (seen once,
+        // under load, in a 2-day adversarial run: a donate right after a mint_to)
+        for _ in 0..5 {
+            if !matches!(out.result, Err(TransactionError::AccountInUse)) {
+                break;
+            }
+            self.blockhash = self.base.ctx.banks_client.get_new_latest_blockhash(&self.blockhash).await.expect("new blockhash");
+            self.sent.clear();
+            let retry = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &all, self.blockhash);
+            self.sent.insert(retry.signatures[0]);
+            self.lock_retries += 1;
+            out = self
+                .base
+                .ctx
+                .banks_client
+                .process_transaction_with_metadata(retry)
+                .await
+                .unwrap_or_else(|e| panic!("transport error in {}: {:?} (a native program may have panicked)", label, e));
+        }
         let (units, logs) = out.metadata.map(|m| (m.compute_units_consumed, m.log_messages)).unwrap_or((0, Vec::new()));
         self.transactions += 1;
         let stat = self.compute.entry(label.to_string()).or_default();
@@ -189,26 +213,61 @@ fn anchor_error_name(line: &str) -> Option<String> {
     }
 }
 
-/// The `Bad debt: deficit=D, uncovered=U` line close_position and liquidate
-/// log when a position's losses exceed its collateral.
-pub fn bad_debt_log(logs: &[String]) -> Option<(u64, u64)> {
-    logs.iter().find_map(|line| {
-        let rest = &line[line.find("Bad debt: deficit=")? + "Bad debt: deficit=".len()..];
-        let (deficit, rest) = rest.split_once(", uncovered=")?;
-        let uncovered: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        Some((deficit.parse().ok()?, uncovered.parse().ok()?))
-    })
+/// The sim's pool parameters: production defaults (docs/lp-pool.md §15.1)
+/// with a one-day withdrawal delay, so the end-of-run unwind fits (§16.7).
+/// The harness applies them before the protocol's $1M seed, which goes in
+/// with `initialize_market` and `initialize_pool` at t0 (D11).
+pub fn pool_params() -> PoolParams {
+    PoolParams { withdrawal_delay_secs: 86_400, ..PoolParams::production() }
+}
+
+/// Anchor events of type `T` a transaction emitted: "Program data: <base64>"
+/// on SBF, and the same line as a program log in native mode
+/// (quiet_events.rs), CPIs included, in emission order.
+pub fn events<T: anchor_lang::Event>(logs: &[String]) -> Vec<T> {
+    use anchor_lang::__private::base64;
+    let mut out = Vec::new();
+    for line in logs {
+        let Some(b64) = line.strip_prefix("Program data: ").or_else(|| line.strip_prefix("Program log: Program data: ")) else { continue };
+        let Ok(data) = base64::decode(b64.trim()) else { continue };
+        if data.len() >= 8 && data[..8] == T::discriminator() {
+            if let Ok(e) = T::try_from_slice(&data[8..]) {
+                out.push(e);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{anchor_error_name, bad_debt_log};
+    use super::{anchor_error_name, events, pool_params};
+    use anchor_lang::{AnchorSerialize, Discriminator};
+    use perps_core::events::FundingUpdated;
 
     #[test]
-    fn reads_bad_debt_lines() {
-        let logs = vec!["Program log: Instruction: Liquidate".to_string(), "Program log: Bad debt: deficit=1234, uncovered=56".to_string()];
-        assert_eq!(bad_debt_log(&logs), Some((1234, 56)));
-        assert_eq!(bad_debt_log(&logs[..1]), None);
+    fn reads_events_in_both_modes() {
+        use anchor_lang::__private::base64;
+        let ev = FundingUpdated { periods: 2, periods_dropped: 0, rate: 50, step: 4_000, cumulative_funding: 8_000, carry_secs: 17 };
+        let mut data = FundingUpdated::discriminator().to_vec();
+        data.extend(ev.try_to_vec().unwrap());
+        let b64 = base64::encode(&data);
+        let logs = vec![
+            "Program log: Instruction: UpdateFunding".to_string(),
+            format!("Program data: {}", b64),
+            format!("Program log: Program data: {}", b64),
+        ];
+        let got = events::<FundingUpdated>(&logs);
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].periods, got[1].carry_secs), (2, 17));
+    }
+
+    /// Production defaults with the one-day delay must pass the engine's own validation.
+    #[test]
+    fn sim_pool_params_validate() {
+        let m = perps_core::state::Market { maintenance_margin_ratio: 500, initial_margin_ratio: 1_000, taker_fee: 5, ..Default::default() };
+        assert!(pool_params().validate(&m));
+        assert_eq!(pool_params().withdrawal_delay_secs, 86_400);
     }
 
     #[test]

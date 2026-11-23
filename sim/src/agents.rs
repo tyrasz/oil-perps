@@ -9,6 +9,7 @@ use crate::model;
 use crate::support::*;
 use crate::world::{maker_approval, Sim, MAX_QUOTE_SIZE};
 use crate::schedule;
+use crate::session;
 use mm_registry::instructions::{PostQuoteParams, UpdateQuoteParams};
 use mm_registry::{MarketMaker, TwoSidedQuote};
 use orderbook::{OrderBook, OrderSide, OrderType, PlaceOrderParams};
@@ -51,6 +52,44 @@ impl Persona {
             Persona::LimitBig => "limit_big",
             Persona::Colluder => "colluder",
             Persona::Prober => "prober",
+        }
+    }
+}
+
+/// The public LPs (docs/lp-pool.md §16.7). Each acts at most once an hour on
+/// its own, in session, and the gates refuse what they must (the model
+/// predicts each refusal; invariant 14 recomputes the gates on every flow
+/// that lands):
+///
+/// - Seed: the protocol's $1M; only the unwind and the probes move it.
+/// - Steady: deposits half its wallet, now and then requests a fifth of its
+///   shares, withdraws once the delay is over (or now and then cancels).
+/// - Gap: tries to exit around the weekend gap. It requests all its shares
+///   so the delay ends inside `W` (the last day before the weekly close),
+///   then tries to withdraw in `W` and at the reopen inside `Q`, which the
+///   gates refuse; it gets out after `Q` and deposits again before the next
+///   weekly close to ride the gap.
+/// - Lapse: requests half its shares and never claims; the unwind checks
+///   the request has lapsed after the claim window (WithdrawalExpired).
+/// - Sandwich: the adversarial scenario's LP around liquidations, a
+///   donation, a funding crank and the settled sweep (adversary.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LpPersona {
+    Seed,
+    Steady,
+    Gap,
+    Lapse,
+    Sandwich,
+}
+
+impl LpPersona {
+    pub fn name(self) -> &'static str {
+        match self {
+            LpPersona::Seed => "seed",
+            LpPersona::Steady => "steady",
+            LpPersona::Gap => "gap",
+            LpPersona::Lapse => "lapse",
+            LpPersona::Sandwich => "sandwich",
         }
     }
 }
@@ -279,6 +318,20 @@ impl Sim {
         (want.min(cap), want > cap)
     }
 
+    /// A house trader's `acceptable_price` (§4.4, §4.5) for opening (or
+    /// closing) a `side` position: a tolerance of 10-80 bps around the
+    /// oracle, so the skew impact of a large trade is now and then refused
+    /// (SlippageExceeded); a fifth of the time no bound (0).
+    pub fn acceptable(&mut self, side: Side, opening: bool) -> u64 {
+        if self.rng.gen_bool(0.2) {
+            return 0;
+        }
+        let tol = self.rng.gen_range(10.0..80.0) / 10_000.0;
+        let buy = (side == Side::Long) == opening;
+        let px = self.px as f64;
+        (if buy { px * (1.0 + tol) } else { px * (1.0 - tol) }).round() as u64
+    }
+
     fn contracts_for(&self, free: u64, fraction: f64, leverage: u32) -> u64 {
         let notional = free as f64 * fraction * leverage as f64 / 1_000.0;
         let size = notional / self.px as f64 * 1e6;
@@ -456,7 +509,10 @@ impl Sim {
                 _ => moved >= s.take_profit || moved <= -s.stop_loss || held >= s.max_hold_ticks,
             };
             if exit {
-                self.close_tracked(idx, "close_position").await;
+                // House traders bound their closes too (§4.5); a refused close waits a tick
+                let (route, side) = (p.route, p.side());
+                let bound = if route == Route::House { self.acceptable(side, false) } else { 0 };
+                self.close_bounded(idx, bound, "close_position").await;
                 continue;
             }
             let ratio = model::margin_ratio_bps(&p.state, self.px, m.cumulative_funding);
@@ -562,7 +618,9 @@ impl Sim {
         // degen-1 and the takers fill MM quotes; degen-2 and house traders open at the oracle
         let house = persona == Persona::House || (persona == Persona::Degen && self.agents[i].name.ends_with('2'));
         let opened = if house {
-            self.open_house(i, side, size, leverage, if probe { "open_position_probe" } else { "open_position" }).await
+            let label = if probe { "open_position_probe" } else { "open_position" };
+            let bound = self.acceptable(side, true);
+            self.open_house_bounded(i, side, size, leverage, bound, label).await
         } else if persona == Persona::Whale {
             self.whale_entry(i, side, size, leverage).await
         } else {
@@ -692,6 +750,144 @@ impl Sim {
             left = left.saturating_sub(filled.max(CONTRACT));
         }
         any
+    }
+
+    // --- public LPs (§9, §16.7) -----------------------------------------------------------
+
+    /// The LPs' turn, in session (on a settled or paused market they wait for the unwind).
+    pub async fn act_lps(&mut self) {
+        if !self.in_session() || self.paused || self.settled {
+            return;
+        }
+        for l in 0..self.lps.len() {
+            match self.lps[l].persona {
+                LpPersona::Steady => self.lp_steady(l).await,
+                LpPersona::Gap => self.lp_gap(l).await,
+                LpPersona::Lapse => self.lp_lapse(l).await,
+                LpPersona::Seed | LpPersona::Sandwich => {}
+            }
+        }
+    }
+
+    fn lp_paced(&self, l: usize) -> bool {
+        self.lps[l].last_try + 3_600 <= self.now
+    }
+
+    fn lp_tried(&mut self, l: usize, what: &str, ok: bool, sent_from: u64) {
+        self.lps[l].last_try = self.now;
+        let outcome = if ok {
+            "ok".to_string()
+        } else if self.chain.transactions == sent_from {
+            "not_sent".to_string()
+        } else {
+            self.last_failure.as_ref().map_or("failed".into(), |f| f.code.clone())
+        };
+        *self.lps[l].tries.entry(format!("{}:{}", what, outcome)).or_default() += 1;
+    }
+
+    async fn lp_wallet(&mut self, l: usize) -> u64 {
+        let tokens = self.lps[l].lp.tokens;
+        token_balance(self.chain.base(), tokens).await
+    }
+
+    /// Deposit `amount` with a 0.5% slippage bound on the shares the model expects.
+    pub async fn lp_deposit_bounded(&mut self, l: usize, amount: u64, label: &str) -> bool {
+        let (mut st, mut pos) = (self.st().await, self.lp_position(l).await);
+        let expect = model::lp_deposit(&mut st, &mut pos, amount, 0, &self.ov(), self.now).unwrap_or(0);
+        let n0 = self.chain.transactions;
+        let ok = self.lp_deposit(l, amount, expect - expect / 200, label).await;
+        self.lp_tried(l, "deposit", ok, n0);
+        ok
+    }
+
+    async fn lp_steady(&mut self, l: usize) {
+        if !self.lp_paced(l) {
+            return;
+        }
+        let pos = self.lp_position(l).await;
+        let wallet = self.lp_wallet(l).await;
+        if pos.shares == 0 {
+            if wallet > 0 {
+                self.lp_deposit_bounded(l, wallet / 2, "lp_deposit").await;
+            }
+            return;
+        }
+        if pos.pending_shares == 0 {
+            // About every six hours: add to the position or ask for a fifth of it back
+            if !self.rng.gen_bool(1.0 / 6.0) {
+                return;
+            }
+            if wallet > 20_000 * USDC && self.rng.gen_bool(0.5) {
+                self.lp_deposit_bounded(l, wallet / 4, "lp_deposit").await;
+            } else {
+                let n0 = self.chain.transactions;
+                let landed = self.lp_request(l, pos.shares / 5, "lp_request").await;
+                self.lp_tried(l, "request", landed, n0);
+            }
+            return;
+        }
+        if self.now < pos.unlock_at {
+            return;
+        }
+        if self.rng.gen_bool(0.15) {
+            let n0 = self.chain.transactions;
+            let landed = self.lp_cancel(l, "lp_cancel").await;
+            self.lp_tried(l, "cancel", landed, n0);
+        } else {
+            let n0 = self.chain.transactions;
+            let landed = self.lp_withdraw(l, "lp_withdraw").await.is_some();
+            self.lp_tried(l, "withdraw", landed, n0);
+        }
+    }
+
+    /// Exits timed around the weekend gap, which `W` and `Q` must refuse.
+    async fn lp_gap(&mut self, l: usize) {
+        let pos = self.lp_position(l).await;
+        let wallet = self.lp_wallet(l).await;
+        let p = crate::chain::pool_params();
+        let delay = p.withdrawal_delay_secs as i64;
+        let in_quiet = session::seconds_since_open(1, self.now).map_or(false, |t| t < p.lp_reopen_quiet_secs as i64);
+        let to_weekly_close = schedule::next_weekly_close(self.now) - self.now;
+        if pos.pending_shares > 0 {
+            // At the reopen (inside Q) and hourly otherwise, once the delay is over
+            if self.now >= pos.unlock_at && (in_quiet || self.lp_paced(l)) {
+                let n0 = self.chain.transactions;
+                let landed = self.lp_withdraw(l, "lp_withdraw").await.is_some();
+                self.lp_tried(l, "withdraw", landed, n0);
+            }
+            return;
+        }
+        if pos.shares > 0 {
+            // Request so the delay ends in the last day before the weekly close
+            let unlock = self.now + delay;
+            if schedule::in_pre_close_window(unlock, p.weekend_cap_window_secs) && schedule::is_open(unlock) && self.lp_paced(l) {
+                let n0 = self.chain.transactions;
+                let landed = self.lp_request(l, pos.shares, "lp_request").await;
+                self.lp_tried(l, "request", landed, n0);
+            }
+            return;
+        }
+        // Out: in again at the start, and in the last six hours before each weekly close
+        let first = self.lps[l].last_try == 0;
+        if wallet > 0 && (first || to_weekly_close <= 6 * 3_600) && self.lp_paced(l) {
+            self.lp_deposit_bounded(l, wallet * 4 / 5, "lp_deposit").await;
+        }
+    }
+
+    /// Deposits once, requests half once, never claims.
+    async fn lp_lapse(&mut self, l: usize) {
+        if !self.lp_paced(l) {
+            return;
+        }
+        let pos = self.lp_position(l).await;
+        let wallet = self.lp_wallet(l).await;
+        if pos.shares == 0 && pos.deposited_cum == 0 && wallet > 0 {
+            self.lp_deposit_bounded(l, wallet, "lp_deposit").await;
+        } else if pos.shares > 0 && pos.pending_shares == 0 && pos.requested_at == 0 && !self.lps[l].tries.keys().any(|k| k == "request:ok") {
+            let n0 = self.chain.transactions;
+            let landed = self.lp_request(l, pos.shares / 2, "lp_request").await;
+            self.lp_tried(l, "request", landed, n0);
+        }
     }
 
     /// A gap holder opens at the highest leverage the market allows in the

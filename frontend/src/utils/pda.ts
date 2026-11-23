@@ -143,3 +143,33 @@ export function bytesToCode(bytes: number[]): string {
 export function isProgramAccount(info: { owner: PublicKey; data: { length: number } } | null): boolean {
   return !!info && info.owner.equals(PERPS_CORE_PROGRAM_ID) && info.data.length > 0;
 }
+
+/**
+ * The market's LP pool, the house counterparty (docs/lp-pool.md §1.2).
+ * Seeds: ["lp_pool", market_pubkey]
+ */
+export function getLpPoolPDA(market: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync([Buffer.from('lp_pool'), market.toBuffer()], PERPS_CORE_PROGRAM_ID);
+}
+
+/** Only share class the program accepts (§9.6 reserves 1 for a junior tranche). */
+export const LP_CLASS_COMMON = 0;
+
+/**
+ * An LP's position in a pool (§1.3).
+ * Seeds: ["lp_position", lp_pool_pubkey, owner_pubkey, class_byte]
+ */
+export function getLpPositionPDA(lpPool: PublicKey, owner: PublicKey, lpClass: number = LP_CLASS_COMMON): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('lp_position'), lpPool.toBuffer(), owner.toBuffer(), Buffer.from([lpClass])],
+    PERPS_CORE_PROGRAM_ID
+  );
+}
+
+/**
+ * The protocol config (admin, guardian, oracle program).
+ * Seeds: ["config"]
+ */
+export function getConfigPDA(): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync([Buffer.from('config')], PERPS_CORE_PROGRAM_ID);
+}

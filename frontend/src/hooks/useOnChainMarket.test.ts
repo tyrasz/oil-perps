@@ -19,13 +19,14 @@ vi.mock('../utils/pda', () => ({ getCommodityMarket }));
 
 const { useOnChainMarket } = await import('./useOnChainMarket');
 
-function fakeMarket(maxLeverage: number) {
+function fakeMarket(maxLeverage: number, extra: Record<string, unknown> = {}) {
   const bn = (n: number) => ({ toNumber: () => n });
   return {
     fundingRate: bn(0), lastFundingTime: bn(0), fundingInterval: bn(3600), longOpenInterest: bn(0),
     shortOpenInterest: bn(0), maxOpenInterest: bn(0), totalPositions: bn(0), totalTrades: bn(0),
     insuranceFund: bn(0), isPaused: false, maxLeverage, initialMarginRatio: 1000, maintenanceMarginRatio: 500,
     takerFee: 5, makerFee: 2, liquidationFee: 100,
+    ...extra,
   };
 }
 
@@ -49,5 +50,19 @@ describe('useOnChainMarket', () => {
 
     await waitFor(() => expect(result.current.marketData?.maxLeverage).toBe(15_000));
     expect(result.current.marketData?.address).toBe(getCommodityMarket(GOLD.id).toBase58());
+  });
+
+  it('counts open seconds and the carry to the next funding time', async () => {
+    const { result } = renderHook(() => useOnChainMarket());
+    const oilFetch = pending.find((p) => p.address === getCommodityMarket(OIL.id).toBase58())!;
+    // Cranked a minute before the Friday 17:00 ET close with 600 s carried:
+    // due 49 open minutes after the Sunday 18:00 ET reopen, not an hour later
+    const close = 1_794_607_200;
+    const bn = (n: number) => ({ toNumber: () => n });
+    await act(async () =>
+      oilFetch.resolve(fakeMarket(20_000, { lastFundingTime: bn(close - 60), sessionSchedule: 1, fundingCarrySecs: 600 }))
+    );
+    await waitFor(() => expect(result.current.marketData?.fundingCarrySecs).toBe(600));
+    expect(result.current.marketData?.nextFundingTime).toBe(close + 49 * 3_600 + 2_940);
   });
 });

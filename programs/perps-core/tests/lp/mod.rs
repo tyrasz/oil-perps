@@ -626,6 +626,72 @@ async fn settled_market_positions_are_closed_by_anyone_and_lps_exit() {
     assert_eq!(pool(&mut base).await.lp_shares, LP_DEAD_SHARES);
 }
 
+/// D41 (third review): a settled market's `lp_withdraw` waits out
+/// `max(profit_close_quiet_secs, lp_reopen_quiet_secs)` after `settled_at`,
+/// so the keeper books the deficits of losers the settlement price
+/// bankrupted before an LP exits at a NAV that still counts their losses.
+#[tokio::test]
+async fn settled_lp_withdrawals_wait_out_the_settled_quiet_time() {
+    let p = PoolParams { profit_close_quiet_secs: 300, lp_reopen_quiet_secs: 1_800, ..PoolParams::neutral() };
+    let mut base = base_with(p).await;
+    let seed = seed_lp(&base);
+    let alice = trader(&mut base, 1_000 * USDC).await;
+    open(&mut base, &alice, 0, 10, 5).await.unwrap();
+    // A matured request from before the settlement (neutral delay 0)
+    let shares = (LP_SEED - LP_DEAD_SHARES) / 2;
+    lp_request(&mut base, &seed, shares).await.unwrap();
+
+    settle(&mut base, usd(60.0)).await.unwrap();
+    let t = market(&mut base).await.settled_at;
+    assert!(t > 0);
+    assert_eq!(custom_error(lp_withdraw(&mut base, &seed).await), perr(PerpsError::LpFlowWindowClosed));
+    // The longer of the two quiet times (1,800 s here) applies
+    set_time(&mut base, t + 1_799).await;
+    assert_eq!(custom_error(lp_withdraw(&mut base, &seed).await), perr(PerpsError::LpFlowWindowClosed));
+    set_time(&mut base, t + 1_800).await;
+    lp_withdraw(&mut base, &seed).await.unwrap();
+    assert_eq!(lp_position(&mut base, &seed).await.pending_shares, 0);
+
+    // settled_at == 0 (settled before the field existed): no settled quiet time
+    lp_request(&mut base, &seed, 1_000).await.unwrap();
+    patch_market(&mut base, |m| m.settled_at = 0).await;
+    lp_withdraw(&mut base, &seed).await.unwrap();
+}
+
+/// D42 (third review): settle_market charges the funding periods due since
+/// the last crank, at the settlement price, before it freezes the market;
+/// afterwards nothing can crank (update_funding fails MarketSettled), so
+/// without it the payers escaped funding for hours they held.
+#[tokio::test]
+async fn settle_market_charges_the_funding_due() {
+    let mut base = base_with(PoolParams::neutral()).await;
+    let alice = trader(&mut base, 1_000 * USDC).await;
+    let pa = open(&mut base, &alice, 0, 10, 5).await.unwrap();
+    let before = market(&mut base).await;
+    // Three periods and 600 s overdue, nobody cranked
+    let t = now(&mut base).await + 3 * HOUR + 600;
+    set_time(&mut base, t).await;
+    let mut expected = before.clone();
+    let ev = perps_core::instructions::update_funding::apply_funding(&mut expected, usd(76.0), t).unwrap();
+    assert_eq!((ev.periods, ev.carry_secs), (3, 600));
+    settle(&mut base, usd(76.0)).await.unwrap();
+    let m = market(&mut base).await;
+    assert_eq!((m.cumulative_funding, m.last_funding_time, m.funding_carry_secs), (expected.cumulative_funding, t, 600));
+    assert_ne!(m.cumulative_funding, before.cumulative_funding);
+    assert_eq!(custom_error(update_funding(&mut base).await), perr(PerpsError::MarketSettled));
+
+    // The long (alone, so it pays) is charged those periods when it closes
+    let held: Position = load(&mut base, pa).await;
+    let f = held.accrued_funding(m.cumulative_funding);
+    assert!(f < 0, "the lone long pays funding");
+    close_settled(&mut base, &alice.key(), pa).await.unwrap();
+    let pos: Position = load(&mut base, pa).await;
+    // realized = PnL at the settlement price + funding (to the settled index) − close fee
+    let pnl = held.unrealized_pnl(usd(76.0));
+    let fee = 375_000; // 0.05% of the $750 opened notional
+    assert_eq!(pos.realized_pnl, pnl + f - fee);
+}
+
 // ---------------------------------------------------------------------------
 // Params (§5, §17.2 #18)
 // ---------------------------------------------------------------------------

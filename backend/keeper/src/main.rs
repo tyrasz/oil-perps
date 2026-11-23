@@ -7,15 +7,27 @@ use solana_sdk::{
 use std::{str::FromStr, sync::Arc};
 use tracing::{info, error};
 
+mod adl;
 mod funding;
+mod ix;
 mod liquidator;
+mod mirror;
+mod settle;
+mod state;
+#[cfg(test)]
+mod testkit;
 // Compiled from the program's sources so the keeper makes the same decisions.
-#[allow(dead_code)]
+// All three are dependency-free (docs/lp-pool.md §2.7, D29). They build with
+// Rust 1.75 on-chain, so newer clippy lints are allowed here.
+#[allow(dead_code, clippy::unnecessary_map_or)]
 #[path = "../../../programs/perps-core/src/session.rs"]
 mod session;
 #[allow(dead_code)]
 #[path = "../../../programs/perps-core/src/price.rs"]
 mod price;
+#[allow(dead_code, clippy::manual_is_multiple_of)]
+#[path = "../../../programs/perps-core/src/pool_math.rs"]
+mod pool_math;
 
 // Program configuration
 pub struct KeeperConfig {
@@ -101,6 +113,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let funding_config = config.clone();
     let liquidator_client = client.clone();
     let liquidator_config = config.clone();
+    let adl_client = client.clone();
+    let adl_config = config.clone();
+    let pool_client = client.clone();
+    let pool_config = config.clone();
 
     info!("Starting keeper services...");
 
@@ -112,13 +128,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         liquidator::run_liquidation_keeper(liquidator_client, liquidator_config).await;
     });
 
-    // Wait for both tasks
+    // ADL and bad-debt write-off (docs/lp-pool.md §7, §16.4)
+    let adl_handle = tokio::spawn(async move {
+        adl::run_adl_keeper(adl_client, adl_config).await;
+    });
+
+    // settle_position_pnl, settled-market closes and insurance sweeps (§6.6, §10)
+    let pool_handle = tokio::spawn(async move {
+        settle::run_pool_keeper(pool_client, pool_config).await;
+    });
+
+    // Run until any task exits
     tokio::select! {
         result = funding_handle => {
             error!("Funding keeper exited: {:?}", result);
         }
         result = liquidator_handle => {
             error!("Liquidation keeper exited: {:?}", result);
+        }
+        result = adl_handle => {
+            error!("ADL keeper exited: {:?}", result);
+        }
+        result = pool_handle => {
+            error!("Pool keeper exited: {:?}", result);
         }
     }
 
@@ -153,6 +185,11 @@ pub fn get_vault_token_pda(program_id: &Pubkey, market: &Pubkey) -> (Pubkey, u8)
         &[b"vault_token", market.as_ref()],
         program_id,
     )
+}
+
+/// The market's LP pool (docs/lp-pool.md §1.2).
+pub fn get_lp_pool_pda(program_id: &Pubkey, market: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"lp_pool", market.as_ref()], program_id)
 }
 
 /// User accounts are per market.

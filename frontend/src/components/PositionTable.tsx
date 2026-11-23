@@ -9,10 +9,14 @@ import { formatLeverage } from '../utils/leverage';
 
 const DEFAULT_MAINTENANCE_MARGIN_PCT = 5;
 
+/** Whether settle_position_pnl has moved the PnL basis away from the open price. */
+const basisMoved = (p: Position) => p.openedPrice !== undefined && Math.abs(p.openedPrice - p.entryPrice) > 1e-9;
+
 export function PositionTable() {
   const { positions } = usePositions();
   const { markets } = useMarketStore();
-  const { closePosition, error, clearError, getExplorerUrl } = useTrading();
+  const { closePosition, addMargin, error, clearError, getExplorerUrl } = useTrading();
+  const [marginInput, setMarginInput] = useState('');
   const { getTriggerOrdersForPosition } = useTriggerOrderStore();
 
   // Thresholds, settlement and trading hours come from each position's own
@@ -42,7 +46,8 @@ export function PositionTable() {
     setSuccessMessage(null);
 
     try {
-      const signature = await closePosition(position.address);
+      // Quoted at the price the table shows; settled markets use the settlement price
+      const signature = await closePosition(position.address, { markPrice: position.markPrice ?? markets[position.commodity]?.price });
       setLastSignature(signature);
       setSuccessMessage('Position closed successfully!');
       setTimeout(() => setSuccessMessage(null), 10000);
@@ -50,6 +55,22 @@ export function PositionTable() {
       console.error('Failed to close position:', err);
     } finally {
       setClosingPositionId(null);
+    }
+  };
+
+  const handleAddMargin = async (position: Position) => {
+    const amount = parseFloat(marginInput);
+    if (!(amount > 0)) return;
+    clearError();
+    setSuccessMessage(null);
+    try {
+      const signature = await addMargin(position.address, amount);
+      setLastSignature(signature);
+      setSuccessMessage(`Added $${amount.toFixed(2)} margin`);
+      setMarginInput('');
+      setTimeout(() => setSuccessMessage(null), 10000);
+    } catch (err) {
+      console.error('Failed to add margin:', err);
     }
   };
 
@@ -72,6 +93,7 @@ export function PositionTable() {
             <p>
               {criticalPositions.length} position{criticalPositions.length > 1 ? 's' : ''} below the liquidation margin ({criticalPositions.map(p => `${p.commodity} ${thresholdOf(p)}%`).join(', ')}).
               Add collateral or close position{criticalPositions.length > 1 ? 's' : ''} immediately to avoid liquidation.
+              {' '}Above the backstop line a keeper closes only part of a position, with a penalty; below it, all of it.
             </p>
           </div>
         </div>
@@ -96,8 +118,9 @@ export function PositionTable() {
           <tr>
             <th>Side</th>
             <th>Size</th>
-            <th>Entry Price</th>
+            <th title="Price the position opened at. The entry (PnL basis) moves when a keeper settles an unrealized loss.">Opened @</th>
             <th>Mark Price</th>
+            <th title="Mark price at which the position becomes liquidatable (equity / mark notional below maintenance margin)">Liq. Price</th>
             <th>Leverage</th>
             <th>PnL</th>
             <th>Margin Ratio</th>
@@ -124,10 +147,16 @@ export function PositionTable() {
                     {position.side.toUpperCase()} <span className="position-commodity">{position.commodity}</span>
                   </td>
                   <td>{position.size.toFixed(4)}</td>
-                  <td>${position.entryPrice.toFixed(2)}</td>
+                  <td title={basisMoved(position) ? `PnL basis $${position.entryPrice.toFixed(2)}: a loss was settled into the pool` : undefined}>
+                    ${(position.openedPrice ?? position.entryPrice).toFixed(2)}
+                    {basisMoved(position) && <span className="pnl-percent"> (basis ${position.entryPrice.toFixed(2)})</span>}
+                  </td>
                   <td title={position.settled ? 'Settlement price' : undefined}>
                     {markPrice !== undefined ? `$${markPrice.toFixed(2)}` : '-'}
                     {position.settled && ' (settled)'}
+                  </td>
+                  <td title={position.liquidationNote}>
+                    {position.liquidationPrice !== undefined && position.liquidationPrice > 0 ? `$${position.liquidationPrice.toFixed(2)}` : '-'}
                   </td>
                   <td>{formatLeverage(position.leverage)}x</td>
                   <td className={pnlClass}>
@@ -136,7 +165,9 @@ export function PositionTable() {
                       ({((position.unrealizedPnl / position.collateral) * 100).toFixed(2)}%)
                     </span>
                   </td>
-                  <td className={marginClass}>{position.marginRatio.toFixed(2)}%</td>
+                  <td className={marginClass} title={`Equity / mark notional. ${position.liquidationNote ?? ''}`}>
+                    {position.marginRatio.toFixed(2)}%
+                  </td>
                   <td className="tpsl-cell">
                     <div className="tpsl-indicators">
                       {activeTp && (
@@ -174,11 +205,31 @@ export function PositionTable() {
                 </tr>
                 {isExpanded && (
                   <tr className="expanded-row">
-                    <td colSpan={9}>
+                    <td colSpan={11}>
                       <TpSlManager
                         position={position}
                         onClose={() => setExpandedPositionId(null)}
                       />
+                      {!position.settled && (
+                        <div className="add-margin-row">
+                          <span className="liquidation-note">{position.liquidationNote}</span>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            placeholder="USDC"
+                            value={marginInput}
+                            onChange={(e) => setMarginInput(e.target.value)}
+                          />
+                          <button
+                            className="action-btn"
+                            onClick={() => handleAddMargin(position)}
+                            disabled={!(parseFloat(marginInput) > 0)}
+                          >
+                            Add margin
+                          </button>
+                        </div>
+                      )}
                     </td>
                   </tr>
                 )}

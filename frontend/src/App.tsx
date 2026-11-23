@@ -15,11 +15,12 @@ import { TradeHistory } from './components/TradeHistory';
 import { PortfolioAnalytics } from './components/PortfolioAnalytics';
 import { PriceAlerts } from './components/PriceAlerts';
 import { ReferralPanel } from './components/ReferralPanel';
+import { AdminPanel } from './components/AdminPanel';
 import { useTriggerOrderMonitor } from './hooks/useTriggerOrderMonitor';
 import { useMarketFeed } from './hooks/useMarket';
 import './App.css';
 
-type Tab = 'positions' | 'orders' | 'trades' | 'account' | 'vault' | 'mm' | 'analytics' | 'alerts' | 'referrals';
+type Tab = 'positions' | 'orders' | 'trades' | 'account' | 'vault' | 'mm' | 'analytics' | 'alerts' | 'referrals' | 'admin';
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('positions');
@@ -122,6 +123,12 @@ function App() {
             >
               Referrals
             </button>
+            <button
+              className={`tab ${activeTab === 'admin' ? 'active' : ''}`}
+              onClick={() => setActiveTab('admin')}
+            >
+              Admin
+            </button>
           </div>
 
           <div className="tab-content">
@@ -134,6 +141,7 @@ function App() {
             {activeTab === 'analytics' && <PortfolioAnalytics />}
             {activeTab === 'alerts' && <PriceAlerts />}
             {activeTab === 'referrals' && <ReferralPanel />}
+            {activeTab === 'admin' && <AdminPanel />}
           </div>
         </div>
       </main>

@@ -29,14 +29,17 @@ describe('maxAllowedLeverage', () => {
 });
 
 describe('estimateLiquidationPrice', () => {
-  it('matches the program margin rule for longs and shorts', () => {
-    // 10x with 5% maintenance: liquidated after a 5% adverse move
-    expect(estimateLiquidationPrice(75, 10, 'long', 500)).toBeCloseTo(71.25);
-    expect(estimateLiquidationPrice(75, 10, 'short', 500)).toBeCloseTo(78.75);
+  it('matches the program margin rule (mark notional) for longs and shorts', () => {
+    // 10x with 5% maintenance: $750 collateral on 100 contracts at $75.
+    // Long at $71.0526: equity $355.26 = 5% of $7,105.26 mark notional
+    expect(estimateLiquidationPrice(75, 10, 'long', 500)).toBeCloseTo(67.5 / 0.95);
+    expect(estimateLiquidationPrice(75, 10, 'short', 500)).toBeCloseTo(82.5 / 1.05);
+    const p = estimateLiquidationPrice(75, 10, 'long', 500);
+    expect(750 + 100 * (p - 75)).toBeCloseTo(0.05 * 100 * p);
   });
 
   it('gives more room at lower leverage', () => {
-    expect(estimateLiquidationPrice(75, 2, 'long', 500)).toBeCloseTo(41.25);
+    expect(estimateLiquidationPrice(75, 2, 'long', 500)).toBeCloseTo(37.5 / 0.95);
   });
 
   it('never goes below zero', () => {

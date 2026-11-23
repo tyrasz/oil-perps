@@ -25,6 +25,8 @@ export const PERPS_SEEDS = {
   VENUE_APPROVAL: Buffer.from("venue_approval"),
   VPOSITION: Buffer.from("vposition"),
   VMAKER: Buffer.from("vmaker"),
+  LP_POOL: Buffer.from("lp_pool"),
+  LP_POSITION: Buffer.from("lp_position"),
 } as const;
 
 /** Which side of a venue fill a VenueApproval lets the venue put its owner on */
@@ -211,6 +213,30 @@ export function findVMakerPda(
 ): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
     [PERPS_SEEDS.VMAKER, takerPosition.toBuffer()],
+    perpsProgramId
+  );
+}
+
+/** The market's LP pool, the house counterparty: `[b"lp_pool", market]` (docs/lp-pool.md §1.2) */
+export function findLpPoolPda(
+  market: PublicKey,
+  perpsProgramId: PublicKey = PERPS_CORE_PROGRAM_ID
+): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [PERPS_SEEDS.LP_POOL, market.toBuffer()],
+    perpsProgramId
+  );
+}
+
+/** An LP's position in `lpPool`: `[b"lp_position", lp_pool, owner, &[class]]`; class 0 only (§1.3) */
+export function findLpPositionPda(
+  lpPool: PublicKey,
+  owner: PublicKey,
+  lpClass: number = 0,
+  perpsProgramId: PublicKey = PERPS_CORE_PROGRAM_ID
+): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [PERPS_SEEDS.LP_POSITION, lpPool.toBuffer(), owner.toBuffer(), Buffer.from([lpClass])],
     perpsProgramId
   );
 }

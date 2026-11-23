@@ -2,7 +2,16 @@
 // web3.js address derivation fails under jsdom (mixed Buffer/Uint8Array realms).
 import { describe, it, expect } from 'vitest';
 import { PublicKey } from '@solana/web3.js';
-import { commodityForMarket, getCommodityMarket, getMarketPDA, getUserAccountPDA, isProgramAccount } from './pda';
+import {
+  commodityForMarket,
+  getCommodityMarket,
+  getConfigPDA,
+  getLpPoolPDA,
+  getLpPositionPDA,
+  getMarketPDA,
+  getUserAccountPDA,
+  isProgramAccount,
+} from './pda';
 import { COMMODITIES } from '../config/commodities';
 import { PERPS_CORE_PROGRAM_ID, USDC_MINT } from '../config/program';
 
@@ -43,5 +52,24 @@ describe('market PDAs', () => {
     // Lamports sent to an unused address: system-owned and empty
     expect(isProgramAccount({ owner: PublicKey.default, data: { length: 0 } })).toBe(false);
     expect(isProgramAccount({ owner: PERPS_CORE_PROGRAM_ID, data: { length: 0 } })).toBe(false);
+  });
+});
+
+describe('LP pool PDAs', () => {
+  // Same seeds as programs/perps-core (LpPool::SEED, LpPosition::SEED); the
+  // values match sdk/mm-registry findLpPoolPda / findLpPositionPda.
+  const OIL_POOL = '4SxeFLkptGSn7G3pQR6RQ3zTAf4A422wtc3hXzbHFBz1';
+
+  it('derives the pool, LP position and config addresses', () => {
+    expect(getLpPoolPDA(new PublicKey(OIL_MARKET))[0].toBase58()).toBe(OIL_POOL);
+    expect(getLpPositionPDA(new PublicKey(OIL_POOL), OWNER)[0].toBase58()).toBe('BavfATnpsDTr8HfFn44rDmZuQhrLj2SFmewZU9Cswfs3');
+    expect(getConfigPDA()[0].toBase58()).toBe('4rLtKGqsrPZzMgSw8mhD4G8sSqRyjWDSqrDD3aHL2VfX');
+  });
+
+  it('gives each market its own pool and each class its own position', () => {
+    const pools = COMMODITIES.map((c) => getLpPoolPDA(getCommodityMarket(c.id))[0].toBase58());
+    expect(new Set(pools).size).toBe(COMMODITIES.length);
+    const pool = new PublicKey(OIL_POOL);
+    expect(getLpPositionPDA(pool, OWNER, 1)[0].equals(getLpPositionPDA(pool, OWNER, 0)[0])).toBe(false);
   });
 });

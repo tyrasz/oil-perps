@@ -571,6 +571,16 @@ pub fn effective_claim_window_secs(stored: u32, window: u32, quiet: u32) -> u64 
     }
 }
 
+/// A settled market's LP exit quiet time (D41): `lp_withdraw` waits
+/// `max(profit_close_quiet_secs, lp_reopen_quiet_secs)` of wall time after
+/// `settled_at`, so the losers the settlement price bankrupted are closed
+/// and their deficits booked before an LP exits at a NAV that still counts
+/// their losses. `settled_at == 0` (settled before the field existed): none.
+pub fn settled_withdraw_quiet(settled_at: i64, now: i64, profit_close_quiet_secs: u32, lp_reopen_quiet_secs: u32) -> bool {
+    let q = profit_close_quiet_secs.max(lp_reopen_quiet_secs) as i64;
+    settled_at > 0 && now.saturating_sub(settled_at) < q
+}
+
 /// `floor(size·price / 1e6)`, saturating at u64::MAX (only reachable far
 /// beyond `MAX_OPEN_INTEREST` at realistic prices).
 pub fn notional_floor(size: u64, price: u64) -> u64 {
@@ -580,6 +590,20 @@ pub fn notional_floor(size: u64, price: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn settled_withdraw_quiet_is_the_longer_quiet_time_from_settlement() {
+        // max(300, 1_800) = 1_800 s of wall time after settled_at
+        assert!(settled_withdraw_quiet(1_000, 1_000, 300, 1_800));
+        assert!(settled_withdraw_quiet(1_000, 2_799, 300, 1_800));
+        assert!(!settled_withdraw_quiet(1_000, 2_800, 300, 1_800));
+        assert!(settled_withdraw_quiet(1_000, 1_299, 300, 0));
+        assert!(!settled_withdraw_quiet(1_000, 1_300, 300, 0));
+        // Neutral params, and markets settled before settled_at existed
+        assert!(!settled_withdraw_quiet(1_000, 1_000, 0, 0));
+        assert!(!settled_withdraw_quiet(0, 1, 300, 1_800));
+    }
+
     use super::*;
 
     /// xorshift64*: deterministic randomness without a dev-dependency.

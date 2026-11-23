@@ -39,6 +39,17 @@ impl Sim {
             }));
         }
         let keeper_tokens = crate::support::token_balance(self.chain.base(), self.keeper.tokens).await;
+        let mut lps = Vec::new();
+        for l in 0..self.lps.len() {
+            let tokens = crate::support::token_balance(self.chain.base(), self.lps[l].lp.tokens).await as i128;
+            let pos = self.lp_position(l).await;
+            let w = &self.lps[l];
+            lps.push(json!({
+                "name": w.name, "persona": w.persona.name(), "minted_usdc": usdc(w.minted), "final_tokens_usdc": usdc(tokens), "pnl_usdc": usdc(tokens - w.minted as i128),
+                "deposited_usdc": usdc(pos.deposited_cum), "withdrawn_usdc": usdc(pos.withdrawn_cum), "shares_left": pos.shares,
+                "own_flows": w.tries,
+            }));
+        }
         let persona_json: Vec<Value> = personas
             .iter()
             .map(|(p, (pnl, n))| json!({ "persona": p.name(), "agents": n, "pnl_usdc": usdc(*pnl) }))
@@ -109,23 +120,19 @@ impl Sim {
         for (_, n) in &self.ledger.quote_fills {
             *quote_hist.entry(format!("{}", n)).or_default() += 1;
         }
-        let multi = self.ledger.orders.iter().filter(|o| o.fills > 1).count() as u64;
-        if multi > 0 {
-            self.metrics.paths.insert("order.fills>1".into(), multi);
-        }
-        let missing: Vec<&str> = self.cfg.scenario.required_paths().iter().copied().filter(|p| !self.metrics.paths.contains_key(*p)).collect();
+        let missing: Vec<String> = self.cfg.scenario.required_paths().iter().copied().filter(|p| !self.metrics.paths.contains_key(*p)).map(String::from).collect();
         let fatal = self.checks.fatal_count();
         let solvency_failures = self.checks.results.get(crate::checks::SOLVENCY).map_or(0, |r| r.1);
+        let pool = self.pool_report().await;
         let m = &self.metrics;
-        let funding_paid: f64 = m.funding_updates.iter().map(|f| f["paid_by_longs_usdc"].as_f64().unwrap_or(0.0)).sum();
-        let funding_received: f64 = m.funding_updates.iter().map(|f| f["paid_to_shorts_usdc"].as_f64().unwrap_or(0.0)).sum();
         json!({
             "config": { "scenario": self.cfg.scenario.name(), "strict_solvency": self.cfg.strict_solvency, "seed": self.cfg.seed, "days": self.cfg.days, "tick_secs": self.cfg.tick_secs, "mode": info.mode, "start_time": info.start_time, "end_time": self.now, "ticks": info.ticks },
-            "runtime": { "wall_secs": info.wall_secs, "transactions": self.chain.transactions, "failed_transactions": self.chain.failed_transactions },
+            "runtime": { "wall_secs": info.wall_secs, "transactions": self.chain.transactions, "failed_transactions": self.chain.failed_transactions, "account_in_use_retries": self.chain.lock_retries },
             "oracle": {
                 "start": 75.0, "end": self.px as f64 / 1e6, "min": info.price_min as f64 / 1e6, "max": info.price_max as f64 / 1e6,
                 "jumps": self.oracle.jumps.iter().map(|(t, j)| json!({ "time": t, "move_pct": j })).collect::<Vec<_>>(), "outages": self.oracle.outages, "wide_confidence": self.oracle.wide_conf,
                 "gaps": self.oracle.gaps.iter().map(|(t, g)| json!({ "time": t, "move_pct": g })).collect::<Vec<_>>(),
+                "adversary_moves": self.oracle.shocks.iter().map(|(t, g)| json!({ "time": t, "move_pct": g })).collect::<Vec<_>>(),
             },
             "volume": m.volume_json(),
             "orderbook": { "orders_placed": m.orders_placed, "orders_cancelled": m.orders_cancelled, "expired_closed": m.expired_orders_closed, "matches": m.matches, "match_skips": m.match_skips },
@@ -139,8 +146,8 @@ impl Sim {
             },
             "bad_debt": { "events": m.bad_debt_events, "uncovered_usdc": usdc(m.uncovered_bad_debt) },
             "funding": {
-                "updates": m.funding_updates.len(), "paid_by_longs_usdc": funding_paid, "paid_to_shorts_usdc": funding_received,
-                "kept_by_vault_usdc": usdc(m.funding_imbalance), "events": m.funding_updates,
+                "updates": m.funding_updates.len(), "periods": m.funding_updates.iter().map(|f| f["periods"].as_u64().unwrap_or(0)).sum::<u64>(),
+                "periods_dropped": m.funding_periods_dropped, "pool_carry_from_keeper_cranks_usdc": usdc(m.funding_imbalance), "events": m.funding_updates,
             },
             "insurance": {
                 "final_usdc": usdc(m.final_insurance), "final_vault_usdc": usdc(m.final_vault),
@@ -148,17 +155,19 @@ impl Sim {
                 "hourly": m.insurance_series.iter().map(|(t, f)| json!([t, *f as f64 / 1e6])).collect::<Vec<_>>(),
             },
             "solvency": {
-                "finding": "house positions and orphaned venue legs have the shared vault as counterparty, backed only by the insurance fund (engine design issue, being escalated); non-fatal unless --strict-solvency",
+                "rule": "vault - free collateral - every open position's claim at the solvency haircut >= 0, or bad debt pending (docs/lp-pool.md §16.7); fatal unless --lenient-solvency",
                 "failed_checks": solvency_failures, "insolvent_ticks": self.checks.insolvent_ticks,
                 "stuck_free_collateral_usdc": usdc(m.stuck_free),
                 "min_surplus_usdc": self.checks.min_surplus.map(usdc), "min_surplus_minus_insurance_usdc": self.checks.min_surplus_minus_insurance.map(usdc),
                 "ticks_insurance_not_backed": self.checks.unbacked_insurance_ticks,
                 "first_insolvent_tick": m.first_insolvent,
-                "vault_counterparty_peak": {
-                    "positions": m.peak_unpaired_count, "net_contracts": m.peak_unpaired_net as f64 / 1e6, "vault_owes_usdc": usdc(m.peak_unpaired_pnl),
-                },
             },
+            "pool": pool,
+            "probes": self.metrics.probes.iter().map(|(k, p)| (k.clone(), json!({
+                "checked": p.checked, "ok": p.ok, "not_reached": p.not_reached, "last": p.last,
+            }))).collect::<serde_json::Map<_, _>>(),
             "agents": agents,
+            "lps": lps,
             "personas": persona_json,
             "market_makers": mms,
             "leverage_clamped_entries": m.leverage_clamps,
@@ -175,6 +184,46 @@ impl Sim {
             },
             "compute_units": compute,
             "samples": m.samples,
+        })
+    }
+}
+
+impl Sim {
+    /// The report's pool section (docs/lp-pool.md §16.7): NAV path,
+    /// drawdown, capital use, haircuts, ADL, funding drops and the weekend
+    /// criterion per weekly close.
+    async fn pool_report(&mut self) -> Value {
+        let st = self.st().await;
+        let v = crate::model::view(&st.pool, &st.m, crate::predict::close_mark(&st.m, &self.ov()), self.now).ok();
+        let p = &self.pool_stats;
+        let first = p.series.first().map(|s| s["pool"].clone()).unwrap_or(Value::Null);
+        json!({
+            "params": format!("{:?}", st.pool.params),
+            "nav_redeem_start_usdc": first["nav_redeem_usdc"], "nps_start": first["nps"],
+            "nav_redeem_end_usdc": p.before_redeem.as_ref().map(|b| usdc(b["nav_redeem"].as_i64().unwrap_or(0))),
+            "nps_end": p.before_redeem.as_ref().map(|b| b["nps"].clone()),
+            "after_redemption": { "nav_redeem_usdc": v.map(|v| usdc(v.nav_redeem)), "cash_usdc": usdc(st.pool.cash), "lp_shares": st.pool.lp_shares },
+            "cash_end_usdc": usdc(st.pool.cash),
+            "treasury_usdc": usdc(st.pool.treasury), "lp_shares_end": st.pool.lp_shares,
+            "min_nav_redeem_usdc": p.min_nav_redeem.map(usdc), "peak_drawdown_bps": p.peak_dd_bps,
+            "peak_net_notional_usdc": usdc(p.peak_net_notional as i128), "peak_net_over_cap_nav": p.peak_net_over_cap_nav, "peak_net_over_b": p.peak_net_over_b,
+            "house_opens": p.house_opens, "open_fees_usdc": usdc(p.open_fees),
+            "haircuts": p.haircuts.iter().map(|(k, (a, n))| (k.clone(), json!({ "usdc": usdc(*a), "count": n }))).collect::<serde_json::Map<_, _>>(),
+            "pool_cash_insufficient": p.cash_insufficient,
+            "liquidation_stages": p.liquidation_stages,
+            "settle_pnl": { "count": p.settle_pnl.0, "usdc": usdc(p.settle_pnl.1) },
+            "deficits": {
+                "total_usdc": usdc(p.deficit_total), "beyond_insurance_usdc": usdc(p.deficit_beyond_insurance),
+                "lp_absorbed_usdc": usdc(p.deficit_lp_absorbed), "pending_usdc": usdc(p.deficit_pending), "events": p.deficits,
+            },
+            "bad_debt_cum_usdc": usdc(st.pool.bad_debt_cum), "bad_debt_recovered_usdc": usdc(st.pool.bad_debt_recovered_cum),
+            "written_off_usdc": usdc(p.written_off), "swept_usdc": usdc(p.swept),
+            "adl": { "by_kind": p.adl_by_kind, "events": p.adl_events },
+            "funding_periods_dropped": self.metrics.funding_periods_dropped,
+            "weekly_closes": p.weekly_closes,
+            "lp_flows": p.lp_flows.len(),
+            "lp_flow_events": p.lp_flows,
+            "hourly": p.series,
         })
     }
 }
@@ -200,22 +249,34 @@ pub fn print_summary(r: &Value) {
     let bd = r["bad_debt"]["events"].as_array().cloned().unwrap_or_default();
     let kind = |k: &str| bd.iter().filter(|e| e["kind"].as_str() == Some(k)).count();
     println!("bad debt: {} close deficits (${:.2}), {} liquidation deficits, reward top-ups ${:.2}, uncovered ${:.2}", kind("close"), f(&r["closes"]["deficit_usdc"]), kind("liquidation"),
-        bd.iter().map(|e| f(&e["reward_top_up_usdc"])).sum::<f64>(), f(&r["bad_debt"]["uncovered_usdc"]));
+        reward_top_ups(r), f(&r["bad_debt"]["uncovered_usdc"]));
     let fu = &r["funding"];
-    println!("funding: {} updates, longs paid ${:.2}, shorts received ${:.2}, vault kept ${:.2}", fu["updates"], f(&fu["paid_by_longs_usdc"]), f(&fu["paid_to_shorts_usdc"]), f(&fu["kept_by_vault_usdc"]));
+    println!("funding: {} cranks, {} periods charged, {} dropped (must be 0)", fu["updates"], fu["periods"], fu["periods_dropped"]);
     let ins = &r["insurance"];
     println!("insurance fund ${:.2}, vault at end ${:.2} (vault - insurance ${:.2}); close fees ${:.2}", f(&ins["final_usdc"]), f(&ins["final_vault_usdc"]), f(&ins["vault_minus_insurance_usdc"]), f(&r["closes"]["fees_usdc"]));
     let s = &r["solvency"];
-    let vc = &s["vault_counterparty_peak"];
-    println!();
-    println!("!!! FINDING (solvency, invariant 2; {}): {} failed checks, insolvent at the mark on {} ticks, min surplus ${:.2},",
-        if r["config"]["strict_solvency"].as_bool() == Some(true) { "fatal: --strict-solvency" } else { "non-fatal by default" },
-        s["failed_checks"], s["insolvent_ticks"], f(&s["min_surplus_usdc"]));
-    println!("!!!   min surplus - insurance ${:.2}, {} ticks with the insurance fund not backed, ${:.2} free collateral stuck after unwind;",
-        f(&s["min_surplus_minus_insurance_usdc"]), s["ticks_insurance_not_backed"], f(&s["stuck_free_collateral_usdc"]));
-    println!("!!!   cause: house positions and orphaned venue legs have the shared vault as counterparty (peak {} positions, |net| {:.1} contracts, vault owing ${:.2})",
-        vc["positions"], f(&vc["net_contracts"]), f(&vc["vault_owes_usdc"]));
-    println!("!!!   first insolvent: {}", s["first_insolvent_tick"]);
+    println!("solvency (invariant 2, {}): {} failed checks, {} ticks short at the mark, min surplus ${:.2} (${:.2} over insurance), ${:.2} free collateral stuck after unwind",
+        if r["config"]["strict_solvency"].as_bool() == Some(true) { "fatal" } else { "--lenient-solvency" },
+        s["failed_checks"], s["insolvent_ticks"], f(&s["min_surplus_usdc"]), f(&s["min_surplus_minus_insurance_usdc"]), f(&s["stuck_free_collateral_usdc"]));
+    let p = &r["pool"];
+    println!("\nLP pool: NAV_redeem ${:.2} -> ${:.2} before the LPs redeem (min ${:.2}), per-share {} -> {}, peak drawdown {} bps; LP flows {}",
+        f(&p["nav_redeem_start_usdc"]), f(&p["nav_redeem_end_usdc"]), f(&p["min_nav_redeem_usdc"]), p["nps_start"], p["nps_end"], p["peak_drawdown_bps"], p["lp_flows"]);
+    println!("  capital use: peak net ${:.2}, {:.3} of the net cap (k_net x capNAV), {:.3} x B; house opens {}, open fees ${:.2}, treasury ${:.2}, cash at end ${:.2}",
+        f(&p["peak_net_notional_usdc"]), f(&p["peak_net_over_cap_nav"]), f(&p["peak_net_over_b"]), p["house_opens"], f(&p["open_fees_usdc"]), f(&p["treasury_usdc"]), f(&p["cash_end_usdc"]));
+    println!("  haircuts {} | PoolCashInsufficient {} | liquidations {} | settle_pnl {} (${:.2})",
+        p["haircuts"], p["pool_cash_insufficient"], p["liquidation_stages"], p["settle_pnl"]["count"], f(&p["settle_pnl"]["usdc"]));
+    println!("  deficits ${:.2} (${:.2} beyond insurance: ${:.2} LP-absorbed, ${:.2} pending), written off ${:.2}, swept ${:.2}; ADL {}",
+        f(&p["deficits"]["total_usdc"]), f(&p["deficits"]["beyond_insurance_usdc"]), f(&p["deficits"]["lp_absorbed_usdc"]), f(&p["deficits"]["pending_usdc"]),
+        f(&p["written_off_usdc"]), f(&p["swept_usdc"]), p["adl"]["by_kind"]);
+    for w in p["weekly_closes"].as_array().cloned().unwrap_or_default() {
+        println!("  weekly close {}{}: net ${:.2}, B ${:.2}, G·net/B {:.4}, carried excess ${:.2}; reopen gap {}%, weekend drawdown {} (bound {}, ok {}), deficits beyond insurance ${:.2}",
+            w["close_time"], if w["in_unwind"].as_bool() == Some(true) { " (unwind)" } else { "" }, f(&w["net_notional_at_close_usdc"]), f(&w["b_at_close_usdc"]), f(&w["g_net_over_b"]),
+            f(&w["carried_excess_usdc"]), w["reopen_gap_pct"], w["drawdown"], w["bound"], w["criterion_ok"], f(&w["deficits_beyond_insurance_usdc"]));
+        let wk = &w["week"];
+        println!("    week to this close: {} liquidations, ADL {} (mode 0) / {} (mode 1), haircuts ${:.2}, deficits ${:.2} (${:.2} beyond insurance), {} LP flows, peak drawdown {} bps, NAV_redeem ${:.2} -> ${:.2}",
+            wk["liquidations"], wk["adl_mode0"], wk["adl_mode1"], f(&wk["haircuts_usdc"]), f(&wk["deficits_usdc"]), f(&wk["deficits_beyond_insurance_usdc"]), wk["lp_flows"], wk["peak_drawdown_bps"],
+            f(&wk["nav_redeem_start_usdc"]), f(&wk["nav_redeem_at_close_usdc"]));
+    }
 
     println!("\nPnL by agent:");
     for a in r["agents"].as_array().unwrap() {
@@ -223,6 +284,10 @@ pub fn print_summary(r: &Value) {
         println!("  {:<11} {:<15} ${:>11.2} ({:>+7.2}%)  opens {:>4} maker {:>4} closes {:>4} liq {:>2} fees ${:.2}{}",
             a["name"].as_str().unwrap(), a["persona"].as_str().unwrap(), f(&a["pnl_usdc"]), f(&a["pnl_pct"]), a["opens"], a["maker_fills"], a["closes"], a["liquidated"], f(&a["close_fees_usdc"]),
             if stuck > 0.0 { format!("  (${:.2} stuck: withdraw failed)", stuck) } else { String::new() });
+    }
+    for a in r["lps"].as_array().cloned().unwrap_or_default() {
+        println!("  {:<11} {:<15} ${:>11.2} (deposited ${:.2}, withdrew ${:.2}, {} shares left) own flows {}",
+            a["name"].as_str().unwrap_or(""), format!("lp-{}", a["persona"].as_str().unwrap_or("")), f(&a["pnl_usdc"]), f(&a["deposited_usdc"]), f(&a["withdrawn_usdc"]), a["shares_left"], a["own_flows"]);
     }
     println!("PnL by persona:");
     for p in r["personas"].as_array().unwrap() {
@@ -254,6 +319,13 @@ pub fn print_summary(r: &Value) {
     println!("  not sent (predicted rejection): {}", cov["skipped_by_prediction"]);
     let missing = cov["missing_required_paths"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
     println!("  scenario paths not reached: {}", if missing.is_empty() { "none".to_string() } else { missing });
+    if let Some(pr) = r["probes"].as_object().filter(|p| !p.is_empty()) {
+        println!("\nprobes (invariant 13: the on-chain outcome the spec requires):");
+        for (k, v) in pr {
+            let nr = v["not_reached"].as_object().map(|m| m.iter().map(|(why, n)| format!("{} x{}", why, n)).collect::<Vec<_>>().join("; ")).unwrap_or_default();
+            println!("  {:<32} {:>3} checked {:>3} ok{}", k, v["checked"], v["ok"], if nr.is_empty() { String::new() } else { format!("  not reached: {}", nr) });
+        }
+    }
     println!("\ninvariants:");
     let strict = r["config"]["strict_solvency"].as_bool() == Some(true);
     for (k, v) in r["invariants"].as_object().unwrap() {
@@ -273,6 +345,27 @@ pub fn print_summary(r: &Value) {
             println!("  tick {} [{}] {}", v["tick"], v["invariant"].as_str().unwrap(), v["detail"].as_str().unwrap());
         }
     } else {
-        println!("\nno violations (solvency is reported above as a finding)");
+        println!("\nno violations");
+    }
+}
+
+/// Insurance-paid keeper reward top-ups: only the liquidation events carry
+/// them (keeper.rs), not the bad-debt events.
+pub fn reward_top_ups(r: &Value) -> f64 {
+    // + 0.0: an empty f64 sum is -0.0
+    r["liquidations"]["events"].as_array().map_or(0.0, |ev| ev.iter().map(|e| e["reward_top_up_usdc"].as_f64().unwrap_or(0.0)).sum::<f64>()) + 0.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reward_top_ups_sum_the_liquidation_events() {
+        let r = json!({
+            "liquidations": { "events": [ { "reward_top_up_usdc": 1.5 }, { "reward_top_up_usdc": 0.25 }, { "stage": 1 } ] },
+            "bad_debt": { "events": [ { "kind": "liquidation", "deficit_usdc": 9.0 } ] },
+        });
+        assert_eq!(reward_top_ups(&r), 1.75);
     }
 }

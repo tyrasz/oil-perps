@@ -1,7 +1,9 @@
 //! Native mode only: solana-program-test leaves `sol_log_data` at
 //! solana-program's default stub, which println!s every Anchor event (one per
-//! venue fill). Wrap the installed stubs and drop event data; everything else
-//! goes to program-test's stubs unchanged. SBF runs log events normally.
+//! venue fill) instead of putting it in the transaction log. Wrap the
+//! installed stubs and log event data as "Program data: <base64>" (the SBF
+//! runtime's format, as a program log line), where `chain::events` reads it;
+//! everything else goes to program-test's stubs unchanged.
 
 use solana_sdk::account_info::AccountInfo;
 use solana_sdk::entrypoint::ProgramResult;
@@ -59,7 +61,10 @@ impl SyscallStubs for QuietEvents {
     fn sol_set_return_data(&self, data: &[u8]) {
         self.inner(|s| s.sol_set_return_data(data))
     }
-    fn sol_log_data(&self, _fields: &[&[u8]]) {}
+    fn sol_log_data(&self, fields: &[&[u8]]) {
+        let parts: Vec<String> = fields.iter().map(|f| anchor_lang::__private::base64::encode(f)).collect();
+        self.inner(|s| s.sol_log(&format!("Program data: {}", parts.join(" "))))
+    }
     fn sol_get_processed_sibling_instruction(&self, index: usize) -> Option<Instruction> {
         self.inner(|s| s.sol_get_processed_sibling_instruction(index))
     }

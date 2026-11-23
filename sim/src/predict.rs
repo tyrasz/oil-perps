@@ -1,12 +1,15 @@
 //! Which error, if any, each instruction the simulation sends must fail with,
-//! predicted from the model and the spec's check order (docs/venue-settlement.md
-//! 1.5, 5.3, 6.2 and the handlers' documented gates). Every transaction carries
+//! predicted from the spec's check order (docs/venue-settlement.md 1.5, 5.3,
+//! 6.2; docs/lp-pool.md §4-§10 and §12 for every pool rejection). The venue
+//! and approval checks are here; every instruction that touches the LP pool
+//! (open, close, liquidate, funding, ADL, settle_pnl, LP flows, ...) is run
+//! through `model`, whose Err is the prediction. Every transaction carries
 //! its prediction: a failure with any other error is unexpected (invariant 6),
 //! and a predicted rejection that lands is a violation (invariant 10).
 
 use crate::model;
 use perps_core::instructions::VenueApprovalParams;
-use perps_core::state::{Market, Position, Side, Venue, VenueApproval};
+use perps_core::state::{Market, Side, Venue, VenueApproval};
 
 /// `(program, error)` as the chain decoder names a failure.
 pub type Rej = (&'static str, &'static str);
@@ -46,84 +49,13 @@ fn settled(m: &Market) -> bool {
     m.settlement_price > 0
 }
 
-pub fn open_position(m: &Market, o: &OracleView, now: i64, free: u64, side: Side, size: u64, leverage: u32) -> Option<Rej> {
-    if m.is_paused {
-        return Some(core("MarketPaused"));
-    }
-    if leverage == 0 || leverage > m.max_leverage {
-        return Some(core("ExcessiveLeverage"));
-    }
-    if settled(m) {
-        return Some(core("MarketSettled"));
-    }
-    if !model::in_session(m, now) {
-        return Some(core("MarketClosed"));
-    }
-    if let Some(r) = oracle(m, o, now, MAX_PRICE_AGE_SECS) {
-        return Some(r);
-    }
-    let Some(required) = model::open_margin(m, size, o.price, leverage, now) else { return Some(core("ExcessiveLeverage")) };
-    if free < required {
-        return Some(core("InsufficientCollateral"));
-    }
-    let oi = match side {
-        Side::Long => m.long_open_interest,
-        Side::Short => m.short_open_interest,
-    };
-    if oi.checked_add(size).map_or(true, |x| x > m.max_open_interest) {
-        return Some(core("OpenInterestCapExceeded"));
-    }
-    None
-}
-
-/// close_position of an open position: a settled market closes at its
-/// settlement price at any time; otherwise session, then oracle.
-pub fn close_position(m: &Market, o: &OracleView, now: i64) -> Option<Rej> {
-    if settled(m) {
-        return None;
-    }
-    if !model::in_session(m, now) {
-        return Some(core("MarketClosed"));
-    }
-    oracle(m, o, now, MAX_PRICE_AGE_SECS)
-}
-
-/// The price close_position settles at.
+/// The price a settled market closes at, else the oracle.
 pub fn close_mark(m: &Market, o: &OracleView) -> u64 {
     if settled(m) {
         m.settlement_price
     } else {
         o.price
     }
-}
-
-pub fn liquidate(m: &Market, o: &OracleView, now: i64, p: &Position) -> Option<Rej> {
-    if settled(m) {
-        return Some(core("MarketSettled"));
-    }
-    if !model::in_session(m, now) {
-        return Some(core("MarketClosed"));
-    }
-    if let Some(r) = oracle(m, o, now, MAX_PRICE_AGE_SECS) {
-        return Some(r);
-    }
-    if !model::liquidatable(m, p, o.price, now) {
-        return Some(core("NotLiquidatable"));
-    }
-    None
-}
-
-pub fn update_funding(m: &Market, o: &OracleView, now: i64) -> Option<Rej> {
-    if now - m.last_funding_time < m.funding_interval {
-        return Some(core("InvalidMarketConfig"));
-    }
-    if settled(m) {
-        return Some(core("MarketSettled"));
-    }
-    if !model::in_session(m, now) {
-        return Some(core("MarketClosed"));
-    }
-    oracle(m, o, now, MAX_PRICE_AGE_SECS)
 }
 
 /// withdraw_collateral of `amount` from `free`, paid from a vault holding `vault`.
@@ -134,13 +66,6 @@ pub fn withdraw(free: u64, amount: u64, vault: u64) -> Option<Rej> {
     if vault < amount {
         // The vault is short: the realised form of the solvency finding
         return Some(("spl_token", "Custom(1)"));
-    }
-    None
-}
-
-pub fn add_margin(free: u64, amount: u64) -> Option<Rej> {
-    if free < amount {
-        return Some(core("InsufficientCollateral"));
     }
     None
 }
@@ -252,7 +177,9 @@ pub fn leg(m: &Market, l: &Leg, size: u64, price: u64, oracle: u64, now: i64) ->
 }
 
 /// venue_fill, reached by CPI from a venue whose own checks passed. Account
-/// constraints first (in field order), then the handler.
+/// constraints first (in field order), then the handler. Its first handler
+/// check, `PoolHasNoLps`, cannot fail in the sim: the seed's dead shares
+/// never leave (D11).
 #[allow(clippy::too_many_arguments)]
 pub fn venue_fill(
     m: &Market, fills_paused: bool, venue: &Venue, o: &OracleView, now: i64, signers: u8, self_trade: bool,
@@ -381,21 +308,54 @@ pub fn match_orders(bid: &orderbook::Order, ask: &orderbook::Order, now: i64, ma
     Ok(fill)
 }
 
+/// The probes' sets (adversary.rs): every rejection of the LP pool
+/// (docs/lp-pool.md §12) an instruction can give, the profit-close
+/// quiet time, params validation and the market gates in front of them.
+pub const PROBE_ERRORS: [&str; 39] = [
+    "PoolExposureLimit", "PoolWeekendExposureLimit", "AccountExposureLimit", "PoolAdlPending", "PoolCashInsufficient",
+    "PoolWithdrawalsBlocked", "PoolCapWouldBreach", "PoolCashCapExceeded", "PoolInsolvent", "SlippageExceeded",
+    "InvalidLpAmount", "InsufficientShares", "WithdrawalPending", "NoWithdrawalPending", "WithdrawalDelayNotElapsed",
+    "NothingToSweep", "NothingToSettle", "SettleWouldBankrupt", "AdlUnauthorized", "AdlNotRequired", "AdlWrongSide",
+    "AdlCandidateNotProfitable", "AdlScoreBelowFloor", "AdlOvershoot", "BadDebtNotStale", "FundingNotDue",
+    "PoolDrawdownFreeze", "LpFlowWindowClosed", "FundingStale", "WithdrawalExpired",
+    "ProfitCloseQuiet", "InvalidPoolParams", "MarketPaused", "MarketClosed", "MarketSettled", "InvalidPositionReduction",
+    "StaleOraclePrice", "OracleConfidenceTooWide", "OraclePriceBelowFloor",
+];
+
 /// Errors each instruction label may legitimately be predicted to fail with.
 /// A prediction outside its label's set is a simulation bug and is reported
 /// as unexpected; MarketClosed is only in the keeper's sets, for its passes at
-/// session edges (agents act only in session).
+/// session edges (agents act only in session). A `_probe` label is sent to
+/// see a rejection on purpose.
 pub fn allowed_for(label: &str) -> &'static [&'static str] {
-    const ORACLE: [&str; 3] = ["StaleOraclePrice", "OracleConfidenceTooWide", "OraclePriceBelowFloor"];
     match label {
-        "open_position" | "open_position_probe" => &[
+        // The pool's caps on house opens are tried (and refused) as they come
+        "open_position" => &[
             "MarketPaused", "ExcessiveLeverage", "MarketSettled", "StaleOraclePrice", "OracleConfidenceTooWide", "OraclePriceBelowFloor",
+            "PoolAdlPending", "PoolDrawdownFreeze", "PoolExposureLimit", "PoolWeekendExposureLimit", "AccountExposureLimit", "SlippageExceeded",
         ],
-        "close_position" => &ORACLE,
+        "open_position_probe" => &[
+            "MarketPaused", "ExcessiveLeverage", "MarketSettled", "StaleOraclePrice", "OracleConfidenceTooWide", "OraclePriceBelowFloor",
+            "PoolAdlPending", "PoolDrawdownFreeze", "PoolExposureLimit", "PoolWeekendExposureLimit", "AccountExposureLimit", "SlippageExceeded",
+            "InsufficientCollateral", "OpenInterestCapExceeded",
+        ],
+        // A close can wait out the profit-close quiet time, need cash (the
+        // keeper settles losers), or raise |net| past the close-path caps
+        "close_position" => &[
+            "StaleOraclePrice", "OracleConfidenceTooWide", "OraclePriceBelowFloor",
+            "ProfitCloseQuiet", "PoolCashInsufficient", "PoolExposureLimit", "PoolWeekendExposureLimit", "SlippageExceeded",
+        ],
+        "close_position_probe" => &[
+            "StaleOraclePrice", "OracleConfidenceTooWide", "OraclePriceBelowFloor", "MarketClosed",
+            "ProfitCloseQuiet", "PoolCashInsufficient", "PoolExposureLimit", "PoolWeekendExposureLimit", "SlippageExceeded",
+        ],
         "liquidate" | "liquidate_probe" => &[
             "MarketSettled", "MarketClosed", "NotLiquidatable", "StaleOraclePrice", "OracleConfidenceTooWide", "OraclePriceBelowFloor",
         ],
         "update_funding" => &["MarketSettled", "MarketClosed", "StaleOraclePrice", "OracleConfidenceTooWide", "OraclePriceBelowFloor"],
+        "update_funding_probe" => &["MarketSettled", "MarketClosed", "FundingNotDue", "StaleOraclePrice", "OracleConfidenceTooWide"],
+        // Settled closes pay winners from cash: losers go first, a winner may wait
+        "close_settled_position" => &["PoolCashInsufficient", "ProfitCloseQuiet"],
         // The vault running dry is the realised solvency finding
         "withdraw" => &["Custom(1)"],
         "withdraw_probe" | "add_margin_probe" => &["InsufficientCollateral"],
@@ -416,6 +376,18 @@ pub fn allowed_for(label: &str) -> &'static [&'static str] {
             "ApprovalAllowanceExceeded", "InsufficientCollateral", "ApprovalPriceDeviation",
         ],
         "match_orders_probe" => &["FillTooLarge", "SelfTrade", "MarketPaused", "StaleOraclePrice", "OracleConfidenceTooWide"],
+        // Probes of the pool's own instructions (adversary.rs): any §12 rejection
+        "adl_probe" | "settle_pnl_probe" | "write_off_probe" | "sweep_probe" | "lp_deposit_probe" | "lp_request_probe"
+        | "lp_cancel_probe" | "lp_withdraw_probe" | "donate_probe" | "propose_pool_params_probe" => &PROBE_ERRORS,
+        "close_settled_position_probe" => &["ProfitCloseQuiet", "PoolCashInsufficient"],
+        // LP agents try their flows when they want to (part of the scenario):
+        // the gates refuse them in W, Q, with pending debt, before the delay
+        "lp_deposit" => &["LpFlowWindowClosed", "FundingStale", "PoolAdlPending", "PoolCashCapExceeded", "PoolInsolvent", "SlippageExceeded"],
+        "lp_withdraw" => &[
+            "LpFlowWindowClosed", "FundingStale", "PoolAdlPending", "WithdrawalDelayNotElapsed", "WithdrawalExpired",
+            "PoolWithdrawalsBlocked", "PoolCashInsufficient", "PoolCapWouldBreach",
+        ],
+        "lp_request" => &["FundingStale", "WithdrawalPending", "InsufficientShares"],
         _ => &[],
     }
 }

@@ -3,12 +3,16 @@ import { usePerpsProgram } from './usePerpsProgram';
 import { getCommodityMarket } from '../utils/pda';
 import { useMarketStore } from '../stores/marketStore';
 import { PRICE_DECIMALS } from '../config/program';
+import { nextFundingTime as computeNextFundingTime } from '../utils/session';
 
 interface OnChainMarketData {
   address: string;
   fundingRate: number;
   lastFundingTime: number;
   fundingInterval: number;
+  /** Open seconds accrued but not yet charged (docs/lp-pool.md §8). */
+  fundingCarrySecs: number;
+  /** First in-session time funding can be cranked; 0 once settled. */
   nextFundingTime: number;
   longOpenInterest: number;
   shortOpenInterest: number;
@@ -31,6 +35,8 @@ interface OnChainMarketData {
   maxConfidenceBps: number;
   minOraclePrice: number;
   settlementPrice: number;
+  /** Unix time of settlement; 0 if not settled. */
+  settledAt: number;
 }
 
 interface OnChainMarket {
@@ -63,6 +69,8 @@ interface OnChainMarket {
   maxConfidenceBps?: number;
   minOraclePrice?: { toNumber: () => number };
   settlementPrice?: { toNumber: () => number };
+  fundingCarrySecs?: number;
+  settledAt?: { toNumber: () => number };
 }
 
 export function useOnChainMarket() {
@@ -93,7 +101,15 @@ export function useOnChainMarket() {
 
       const lastFundingTime = market.lastFundingTime.toNumber();
       const fundingInterval = market.fundingInterval.toNumber();
-      const nextFundingTime = lastFundingTime + fundingInterval;
+      const fundingCarrySecs = market.fundingCarrySecs ?? 0;
+      const sessionSchedule = market.sessionSchedule ?? 0;
+      const settlementPrice = market.settlementPrice?.toNumber() ?? 0;
+      // Funding accrues over open seconds only (closed hours and the daily
+      // break do not count), plus the remainder carried from the last crank.
+      // A settled market never cranks again.
+      const nextFundingTime = settlementPrice > 0
+        ? 0
+        : computeNextFundingTime(sessionSchedule, lastFundingTime, fundingCarrySecs, fundingInterval);
 
       // Funding rate is stored with 6 decimals, convert to percentage
       // A funding rate of 100000 = 0.1% = 0.001
@@ -104,6 +120,7 @@ export function useOnChainMarket() {
         fundingRate,
         lastFundingTime,
         fundingInterval,
+        fundingCarrySecs,
         nextFundingTime,
         longOpenInterest: market.longOpenInterest.toNumber() / Math.pow(10, PRICE_DECIMALS),
         shortOpenInterest: market.shortOpenInterest.toNumber() / Math.pow(10, PRICE_DECIMALS),
@@ -118,14 +135,15 @@ export function useOnChainMarket() {
         makerFee: market.makerFee,
         liquidationFee: market.liquidationFee,
         insuranceFund: market.insuranceFund.toNumber() / Math.pow(10, PRICE_DECIMALS),
-        sessionSchedule: market.sessionSchedule ?? 0,
+        sessionSchedule,
         preCloseWindowSecs: market.preCloseWindowSecs ?? 0,
         weekendInitialMarginRatio: market.weekendInitialMarginRatio ?? 0,
         weekendMaintenanceMarginRatio: market.weekendMaintenanceMarginRatio ?? 0,
         maxConfidenceBps: market.maxConfidenceBps ?? 0,
         minOraclePrice: (market.minOraclePrice?.toNumber() ?? 0) / Math.pow(10, PRICE_DECIMALS),
         // Kept in raw 6-decimal units; only compared against zero and displayed
-        settlementPrice: market.settlementPrice?.toNumber() ?? 0,
+        settlementPrice,
+        settledAt: market.settledAt?.toNumber() ?? 0,
       });
     } catch (err) {
       if (request !== latestRequest.current) return;

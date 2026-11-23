@@ -1,7 +1,7 @@
 import * as anchor from '@coral-xyz/anchor';
 import { Program } from '@coral-xyz/anchor';
 import { PublicKey, Keypair, Connection } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { TOKEN_PROGRAM_ID, getAccount, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -136,6 +136,195 @@ function getVaultTokenAccountPDA(market: PublicKey): [PublicKey, number] {
   );
 }
 
+function getLpPoolPDA(market: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync([Buffer.from('lp_pool'), market.toBuffer()], PERPS_CORE_PROGRAM_ID);
+}
+
+function getLpPositionPDA(lpPool: PublicKey, owner: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('lp_position'), lpPool.toBuffer(), owner.toBuffer(), Buffer.from([LP_CLASS_COMMON])],
+    PERPS_CORE_PROGRAM_ID
+  );
+}
+
+// LP pool, the house counterparty (docs/lp-pool.md). No trading until it has
+// LPs (D11): initialize_market, initialize_pool, init_lp_position and the
+// protocol's seed lp_deposit go in one transaction.
+const LP_CLASS_COMMON = 0;
+const LP_DEAD_SHARES = 1_000_000; // locked for ever by the first deposit (§9.1)
+// Protocol seed in USDC (6 decimals); LP_SEED_USDC overrides. The admin's
+// USDC token account must hold it.
+const LP_SEED = new anchor.BN(process.env.LP_SEED_USDC ?? '1000000').mul(new anchor.BN(1_000_000));
+
+// PoolParams::production() (programs/perps-core/src/state/pool.rs, §15.1).
+// Changing them later is timelocked (propose_pool_params / apply_pool_params).
+function productionPoolParams() {
+  return {
+    skewScale: new anchor.BN('2500000000000'),
+    insuranceTarget: new anchor.BN('250000000000'),
+    insuranceClaimCapPerWindow: new anchor.BN(0),
+    liqMinRemainingNotional: new anchor.BN(100_000_000),
+    kNetBps: 10_000,
+    hardNetBps: 15_000,
+    perAccountCapBps: 2_500,
+    weekendLpLossBps: 1_000,
+    weekendGapBps: 0,
+    weekendCapWindowSecs: 86_400,
+    withdrawalDelaySecs: 345_600,
+    withdrawalClaimWindowSecs: 259_200,
+    lpReopenQuietSecs: 1_800,
+    adlNetTargetBps: 5_000,
+    adlExposureScoreFloorBps: 0,
+    ddFreezeBps: 1_000,
+    ddAdlBps: 1_500,
+    ddWithdrawBlockBps: 0,
+    redeemLossHaircutBps: 5_000,
+    openFeeBps: 5,
+    maxImpactBps: 100,
+    liqPenaltyBps: 200,
+    liqKeeperShareBps: 2_000,
+    backstopThresholdBps: 6_667,
+    minLiqSliceBps: 2_000,
+    treasuryFeeBps: 1_000,
+    lpLossCapWindowBps: 500,
+    profitCloseQuietSecs: 300, // D23
+  };
+}
+
+// Seed failures that a later run can retry (session, quiet time, oracle, funding)
+const RETRYABLE_SEED_ERRORS = [
+  'MarketClosed', 'LpFlowWindowClosed', 'FundingStale', 'StaleOraclePrice', 'InvalidOraclePrice',
+  'OracleConfidenceTooWide', 'OraclePriceBelowFloor',
+];
+
+function anchorErrorCode(error: unknown): string | undefined {
+  const e = error as { error?: { errorCode?: { code?: string } }; logs?: string[]; message?: string };
+  if (e?.error?.errorCode?.code) return e.error.errorCode.code;
+  const text = `${e?.message ?? ''}\n${(e?.logs ?? []).join('\n')}`;
+  return RETRYABLE_SEED_ERRORS.find((code) => text.includes(code));
+}
+
+function adlKeeper(authority: Keypair): PublicKey {
+  return process.env.ADL_KEEPER ? new PublicKey(process.env.ADL_KEEPER) : authority.publicKey;
+}
+
+/**
+ * The pool instructions that follow initialize_market (or that a later run
+ * sends for a market whose pool is missing or unseeded): initialize_pool
+ * unless it exists, then init_lp_position unless it exists and the seed
+ * lp_deposit if the admin holds LP_SEED.
+ */
+async function poolBootstrapIxs(
+  program: Program,
+  connection: Connection,
+  authority: Keypair,
+  marketPda: PublicKey,
+  pythPriceFeed: PublicKey,
+  opts: { createPool: boolean; withSeed: boolean }
+): Promise<{ ixs: anchor.web3.TransactionInstruction[]; seeded: boolean }> {
+  const [lpPool] = getLpPoolPDA(marketPda);
+  const [lpPosition] = getLpPositionPDA(lpPool, authority.publicKey);
+  const ixs: anchor.web3.TransactionInstruction[] = [];
+  if (opts.createPool) {
+    ixs.push(
+      await program.methods
+        .initializePool(productionPoolParams(), adlKeeper(authority))
+        .accounts({
+          admin: authority.publicKey,
+          config: getConfigPDA()[0],
+          market: marketPda,
+          lpPool,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .instruction()
+    );
+  }
+  if (!opts.withSeed) return { ixs, seeded: false };
+
+  const adminUsdc = getAssociatedTokenAddressSync(USDC_MINT, authority.publicKey);
+  let balance = BigInt(0);
+  try {
+    balance = (await getAccount(connection, adminUsdc)).amount;
+  } catch {
+    // no token account
+  }
+  if (balance < BigInt(LP_SEED.toString())) {
+    console.warn(`Admin USDC ${adminUsdc} holds ${balance}, less than the LP seed ${LP_SEED}: the pool is not seeded, so no trading is possible yet.`);
+    console.warn('Fund it (or set LP_SEED_USDC) and re-run this script to seed.');
+    return { ixs, seeded: false };
+  }
+  if (!(await connection.getAccountInfo(lpPosition))) {
+    ixs.push(
+      await program.methods
+        .initLpPosition(LP_CLASS_COMMON)
+        .accounts({
+          owner: authority.publicKey,
+          lpPool,
+          lpPosition,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .instruction()
+    );
+  }
+  ixs.push(
+    await program.methods
+      .lpDeposit(LP_SEED, LP_SEED.subn(LP_DEAD_SHARES))
+      .accounts({
+        owner: authority.publicKey,
+        market: marketPda,
+        lpPool,
+        lpPosition,
+        vaultTokenAccount: getVaultTokenAccountPDA(marketPda)[0],
+        ownerTokenAccount: adminUsdc,
+        pythPriceFeed,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction()
+  );
+  return { ixs, seeded: true };
+}
+
+/** For an existing market: create its pool if missing and seed it if it has no LPs. */
+async function ensurePool(
+  program: Program,
+  connection: Connection,
+  authority: Keypair,
+  commodity: string
+): Promise<void> {
+  const [marketPda] = getMarketPDA(USDC_MINT, commodity);
+  const [lpPool] = getLpPoolPDA(marketPda);
+  const info = await connection.getAccountInfo(lpPool);
+  const exists = !!info && info.owner.equals(PERPS_CORE_PROGRAM_ID);
+  if (exists) {
+    const pool = (await program.account.lpPool.fetch(lpPool)) as { lpShares: anchor.BN };
+    if (!pool.lpShares.isZero()) {
+      console.log(`LP pool ${lpPool} is seeded (${pool.lpShares.toString()} shares)`);
+      return;
+    }
+  }
+  console.log(exists ? `LP pool ${lpPool} has no LPs yet: seeding` : `Market has no LP pool: creating ${lpPool}`);
+  const { ixs, seeded } = await poolBootstrapIxs(program, connection, authority, marketPda, PYTH_PRICE_FEEDS[commodity], {
+    createPool: !exists,
+    withSeed: true,
+  });
+  if (ixs.length === 0) return;
+  const tx = new anchor.web3.Transaction().add(...ixs);
+  try {
+    const sig = await (program.provider as anchor.AnchorProvider).sendAndConfirm(tx, [authority]);
+    console.log(`LP pool ${seeded ? 'seeded' : 'created'}: ${sig}`);
+  } catch (error) {
+    const code = anchorErrorCode(error);
+    if (exists && code && RETRYABLE_SEED_ERRORS.includes(code)) {
+      console.warn(`The seed lp_deposit cannot go now (${code}): re-run in session, outside the reopen quiet time, with a fresh oracle.`);
+      return;
+    }
+    // initialize_pool needs a fresh market (no open interest, empty insurance
+    // fund, not settled): an older market cannot be migrated (redeploy)
+    console.error('LP pool setup failed (MarketNotFresh means the market traded before the pool existed):', error);
+    throw error;
+  }
+}
+
 async function loadKeypair(): Promise<Keypair> {
   const keypairPath = process.env.ANCHOR_WALLET ||
     path.join(process.env.HOME || '', '.config/solana/id.json');
@@ -181,24 +370,47 @@ async function initializeMarket(
     fundingInterval: new anchor.BN(config.fundingInterval),
   };
 
-  const tx = await program.methods
-    .initializeMarket(params)
-    .accounts({
-      authority: authority.publicKey,
-      config: getConfigPDA()[0],
-      market: marketPda,
-      vault: vaultPda,
-      vaultTokenAccount: vaultTokenAccountPda,
-      collateralMint: USDC_MINT,
-      pythPriceFeed,
-      systemProgram: anchor.web3.SystemProgram.programId,
-      tokenProgram: TOKEN_PROGRAM_ID,
-      rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-    })
-    .signers([authority])
-    .rpc();
+  const initMarket = () =>
+    program.methods
+      .initializeMarket(params)
+      .accounts({
+        authority: authority.publicKey,
+        config: getConfigPDA()[0],
+        market: marketPda,
+        vault: vaultPda,
+        vaultTokenAccount: vaultTokenAccountPda,
+        collateralMint: USDC_MINT,
+        pythPriceFeed,
+        systemProgram: anchor.web3.SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .signers([authority]);
 
-  console.log(`Market initialized! Transaction: ${tx}`);
+  // One transaction (D11): market, LP pool, the admin's LP position and the
+  // protocol's seed deposit. The seed needs a fresh oracle; if it cannot go
+  // now, the market and pool are created without it and a re-run seeds it.
+  const connection = program.provider.connection;
+  const withSeed = await poolBootstrapIxs(program, connection, authority, marketPda, pythPriceFeed, {
+    createPool: true,
+    withSeed: true,
+  });
+  let tx: string;
+  try {
+    tx = await initMarket().postInstructions(withSeed.ixs).rpc();
+  } catch (error) {
+    const code = anchorErrorCode(error);
+    if (!withSeed.seeded || !code || !RETRYABLE_SEED_ERRORS.includes(code)) throw error;
+    console.warn(`The seed lp_deposit failed (${code}): creating the market and pool without it. Re-run this script to seed.`);
+    const poolOnly = await poolBootstrapIxs(program, connection, authority, marketPda, pythPriceFeed, {
+      createPool: true,
+      withSeed: false,
+    });
+    tx = await initMarket().postInstructions(poolOnly.ixs).rpc();
+    withSeed.seeded = false;
+  }
+
+  console.log(`Market and LP pool initialized${withSeed.seeded ? ` and seeded with ${LP_SEED.toString()} USDC units` : ' (not seeded)'}! Transaction: ${tx}`);
   return tx;
 }
 
@@ -223,6 +435,8 @@ async function applyRiskConfig(
     weekendMaintenanceMarginRatio: risk.weekendMaintenanceMarginRatio,
     maxConfidenceBps: MAX_CONFIDENCE_BPS,
     minOraclePrice: new anchor.BN(risk.minOraclePrice),
+    // Per-side contracts cap (D6); 0 keeps the current value (§4.12)
+    maxOpenInterest: new anchor.BN(0),
   };
   console.log(`Applying risk config for ${commodity}:`, { ...params, minOraclePrice: risk.minOraclePrice });
 
@@ -390,8 +604,10 @@ async function main() {
           .map((k) => `  ${k}: ${String(market[k])}`).join('\n');
         console.log(`Current risk settings:\n${current}`);
         console.log(`Not changing them. Re-run with --update-config to apply this script's values:`, RISK_CONFIGS[commodity]);
+        await ensurePool(program, connection, authority, commodity);
         return;
       }
+      await ensurePool(program, connection, authority, commodity);
     } else {
       await assertPythFeed(connection, PYTH_PRICE_FEEDS[commodity], requiredPythProgram());
       const signature = await initializeMarket(program, authority, commodity);

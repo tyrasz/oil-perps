@@ -41,15 +41,34 @@ pub struct Violation {
     pub detail: String,
 }
 
-/// Solvency fails by design while house positions and orphaned venue legs
-/// have the shared vault as counterparty; it is measured and reported, and
-/// fatal only with --strict-solvency.
+/// Solvency (docs/lp-pool.md §16.7): the vault covers free collateral and
+/// every open position's claim at the solvency haircut, or bad debt is
+/// pending for ADL. Fatal by default now that the LP pool is the house
+/// counterparty; `--lenient-solvency` reports it as a finding instead.
 pub const SOLVENCY: &str = "2_solvency";
 
-pub const INVARIANTS: [&str; 15] = [
+/// The outcome a probe (adversary.rs, the LP agents' gate attempts) must
+/// have on-chain by the spec: a named rejection, or a landing with a stated
+/// effect. Checked against the chain itself, apart from the model's prediction.
+pub const PROBES: &str = "13_probe_outcomes";
+/// An LP flow that landed passed every gate (docs/lp-pool.md §9.5), each
+/// recomputed from the schedule and the accounts, not from the model.
+pub const LP_GATES: &str = "14_lp_gates";
+/// §17.4: across each weekend whose reopen gap is at most G, the per-share
+/// NAV drawdown is at most G·net/B at the close plus the deficits beyond
+/// insurance booked meanwhile, over B.
+pub const WEEKEND: &str = "15_weekend_criterion";
+/// Coverage (third review): every required scenario path is reached (runs
+/// of at least two days), and no label has its transactions skipped by a
+/// predicted rejection more than `SKIP_LIMIT_PER_DAY` times a day.
+pub const COVERAGE: &str = "16_coverage";
+
+pub const INVARIANTS: [&str; 21] = [
     "1_open_interest",
     SOLVENCY,
+    "2a_bucket_identity",
     "2b_vault_ledger",
+    "2c_pool_aggregates",
     "3_liquidation_predicate",
     "3_no_unliquidated_positions",
     "4_pair_settlement",
@@ -62,6 +81,10 @@ pub const INVARIANTS: [&str; 15] = [
     "10_predicted_rejections",
     "11_session_model",
     "12_collusion_no_bad_debt",
+    PROBES,
+    LP_GATES,
+    WEEKEND,
+    COVERAGE,
 ];
 
 #[derive(Default)]

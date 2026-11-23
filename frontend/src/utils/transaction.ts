@@ -1,4 +1,5 @@
 import type { Connection, TransactionSignature } from '@solana/web3.js';
+import { errorName, explainProgramError, programErrorCode, type ErrorContext } from './errors';
 
 /**
  * Wait for transaction confirmation with status updates
@@ -22,38 +23,18 @@ export async function confirmTransaction(
 }
 
 /**
- * Parse Anchor/program errors to user-friendly messages
+ * Parse Anchor/program errors to user-friendly messages. `context` says what
+ * the user was doing, so pool errors can say what to do next.
  */
-export function parseAnchorError(error: unknown): string {
-  // Handle Anchor program errors
+export function parseAnchorError(error: unknown, context: ErrorContext = {}): string {
+  const code = programErrorCode(error);
+  if (code !== undefined) {
+    const name = errorName(code);
+    return name ? explainProgramError(name, context) : `Program error: ${code}`;
+  }
+
   if (error && typeof error === 'object') {
     const err = error as Record<string, unknown>;
-
-    // Check for Anchor error code
-    if (err.code && typeof err.code === 'number') {
-      const errorMessages: Record<number, string> = {
-        6000: 'Market is currently paused',
-        6001: 'Leverage exceeds maximum allowed',
-        6002: 'Insufficient collateral. Please deposit more USDC first.',
-        6003: 'Position size is too small',
-        6004: 'Position size exceeds maximum',
-        6005: 'Open interest cap would be exceeded',
-        6006: 'Position is below maintenance margin',
-        6007: 'Position is not liquidatable',
-        6008: 'Invalid oracle price',
-        6009: 'Oracle price is stale. Please try again.',
-        6010: 'Invalid position side',
-        6011: 'Position not found',
-        6012: 'Position is already closed',
-        6013: 'Unauthorized access',
-        6014: 'Math overflow error',
-        6015: 'Invalid market configuration',
-        6016: 'Cannot reduce position below zero',
-        6017: 'Insufficient vault balance',
-      };
-
-      return errorMessages[err.code] || `Program error: ${err.code}`;
-    }
 
     // Check for error message
     if (err.message && typeof err.message === 'string') {

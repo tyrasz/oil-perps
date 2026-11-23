@@ -55,7 +55,39 @@ export {
   findVenueApprovalPda,
   findVPositionPda,
   findVMakerPda,
+  findLpPoolPda,
+  findLpPositionPda,
 } from "./pda";
+
+// perps-core LP pool (docs/lp-pool.md §1.2, §1.3, §16.3)
+export {
+  POOL_PARAMS_LEN,
+  LP_POOL_LEN,
+  LP_POSITION_LEN,
+  LP_DEAD_SHARES,
+  LP_CLASS_COMMON,
+  LP_POOL_DISCRIMINATOR,
+  LP_POSITION_DISCRIMINATOR,
+  INITIALIZE_POOL_DISCRIMINATOR,
+  PROPOSE_POOL_PARAMS_DISCRIMINATOR,
+  MARKET_FUNDING_CARRY_SECS,
+  MARKET_SETTLED_AT,
+  LP_POOL_OFFSETS,
+  LP_POSITION_OFFSETS,
+  POOL_PARAMS_LAYOUT,
+  PoolParams,
+  LpPoolInfo,
+  LpPositionInfo,
+  productionPoolParams,
+  neutralPoolParams,
+  encodePoolParams,
+  decodePoolParams,
+  decodeLpPool,
+  decodeLpPosition,
+  decodeMarketPoolFields,
+  buildInitializePoolIx,
+  buildProposePoolParamsIx,
+} from "./perpsPool";
 
 // Utility functions
 export {
