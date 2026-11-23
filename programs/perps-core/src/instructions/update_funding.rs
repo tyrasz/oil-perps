@@ -23,20 +23,19 @@ pub struct UpdateFunding<'info> {
     pub pyth_price_feed: AccountInfo<'info>,
 }
 
-pub fn handler(ctx: Context<UpdateFunding>) -> Result<()> {
-    let market = &mut ctx.accounts.market;
-    let current_time = Clock::get()?.unix_timestamp;
-
-    // 1–2. docs/lp-pool.md §8
-    require!(!market.is_settled(), PerpsError::MarketSettled);
-    require!(market.is_in_session(current_time), PerpsError::MarketClosed);
-    let oracle_price = read_price(&ctx.accounts.pyth_price_feed, market, current_time)?;
-
-    // 3–5. Open seconds since the last crank plus the carry; missed periods
-    // are charged at once (up to MAX_FUNDING_CATCHUP_PERIODS)
-    let open = session::open_seconds_between(market.session_schedule, market.last_funding_time, current_time);
+/// §8 steps 3–8 at `oracle_price`: charge every open funding period missed
+/// since the last crank (up to `MAX_FUNDING_CATCHUP_PERIODS`) at the rate the
+/// current OI imbalance gives. `None`, and nothing changes, when no period is
+/// due. `update_funding` cranks with it, and so does every instruction that
+/// sets or settles a position's funding basis (open, venue fill, close,
+/// liquidation, ADL; D40), so a stale `cumulative_funding` can never be
+/// captured by an open or escaped by a close.
+#[inline(never)]
+pub fn apply_funding(market: &mut Market, oracle_price: u64, now: i64) -> Option<FundingUpdated> {
+    // 3–5. Open seconds since the last crank plus the carry
+    let open = session::open_seconds_between(market.session_schedule, market.last_funding_time, now);
     let total = open.saturating_add(market.funding_carry_secs as i64);
-    let c = pool_math::funding_catchup(total, market.funding_interval).ok_or(PerpsError::FundingNotDue)?;
+    let c = pool_math::funding_catchup(total, market.funding_interval)?;
 
     // 6. Calculate funding rate based on OI imbalance
     // Positive = longs pay shorts, Negative = shorts pay longs
@@ -58,25 +57,56 @@ pub fn handler(ctx: Context<UpdateFunding>) -> Result<()> {
     // 7–8. Update market
     market.funding_rate = funding_rate;
     market.cumulative_funding = pool_math::funding_accumulate(market.cumulative_funding, c.n, step);
-    market.last_funding_time = current_time;
+    market.last_funding_time = now;
     market.funding_carry_secs = c.carry;
-
-    // 9.
-    msg!(
-        "Funding updated: rate={}, long_oi={}, short_oi={}, price={}",
-        funding_rate,
-        market.long_open_interest,
-        market.short_open_interest,
-        oracle_price
-    );
-    emit!(FundingUpdated {
+    Some(FundingUpdated {
         periods: c.n,
         periods_dropped: c.dropped,
         rate: funding_rate,
         step,
         cumulative_funding: market.cumulative_funding,
         carry_secs: c.carry,
-    });
+    })
+}
 
+/// §8 step 9: the indexer's "Funding updated:" line (D9) and the event.
+#[inline(never)]
+pub fn log_funding(market: &Market, oracle_price: u64, ev: FundingUpdated) {
+    msg!(
+        "Funding updated: rate={}, long_oi={}, short_oi={}, price={}",
+        ev.rate,
+        market.long_open_interest,
+        market.short_open_interest,
+        oracle_price
+    );
+    emit!(ev);
+}
+
+/// Crank funding inline if a period is due (D40). Unsettled markets only;
+/// the caller has read `oracle_price` in session.
+#[inline(never)]
+pub fn crank_funding(market: &mut Market, oracle_price: u64, now: i64) {
+    if market.is_settled() {
+        return;
+    }
+    if let Some(ev) = apply_funding(market, oracle_price, now) {
+        log_funding(market, oracle_price, ev);
+    }
+}
+
+pub fn handler(ctx: Context<UpdateFunding>) -> Result<()> {
+    let market = &mut ctx.accounts.market;
+    let current_time = Clock::get()?.unix_timestamp;
+
+    // 1–2. docs/lp-pool.md §8
+    require!(!market.is_settled(), PerpsError::MarketSettled);
+    require!(market.is_in_session(current_time), PerpsError::MarketClosed);
+    let oracle_price = read_price(&ctx.accounts.pyth_price_feed, market, current_time)?;
+
+    // 3–8. Missed periods are charged at once
+    let ev = apply_funding(market, oracle_price, current_time).ok_or(PerpsError::FundingNotDue)?;
+
+    // 9.
+    log_funding(market, oracle_price, ev);
     Ok(())
 }

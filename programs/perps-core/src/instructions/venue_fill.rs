@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 use crate::errors::PerpsError;
+use crate::instructions::update_funding::crank_funding;
 use crate::oracle::read_price_max_age;
 use crate::state::{
     pool_add, venue_margin, within_adverse_bound, within_band, ExecutionSource, LpPool, Market, Position, ProtocolConfig,
@@ -172,6 +173,8 @@ pub fn handler(ctx: Context<VenueFill>, params: VenueFillParams) -> Result<()> {
 
     let oracle = read_price_max_age(&a.pyth_price_feed, &a.market, now, a.venue.max_oracle_age_secs as u64)?;
     require!(within_band(params.price, oracle, a.venue.max_price_deviation_bps), PerpsError::FillPriceOutOfBand);
+    // Funding due is charged before the legs take their basis (D40)
+    crank_funding(&mut a.market, oracle, now);
 
     let notional = u64::try_from(params.size as u128 * params.price as u128 / 1_000_000)
         .map_err(|_| PerpsError::MathOverflow)?;

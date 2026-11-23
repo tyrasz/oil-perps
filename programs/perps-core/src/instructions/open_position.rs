@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 use crate::errors::PerpsError;
+use crate::instructions::update_funding::crank_funding;
 use crate::events::PositionOpened;
 use crate::oracle::read_price;
 use crate::pool_math;
@@ -180,6 +181,8 @@ pub fn handler(ctx: Context<OpenPosition>, params: OpenPositionParams) -> Result
 
     // 2. Validated oracle price (staleness, confidence, floor), 6 decimals
     let oracle_price = read_price(&a.pyth_price_feed, &a.market, current_time)?;
+    // Funding due is charged before the position takes its basis (D40)
+    crank_funding(&mut a.market, oracle_price, current_time);
 
     // 3. Gross OI cap; no trading before the pool has LPs (D11)
     let oi_ok = match side {

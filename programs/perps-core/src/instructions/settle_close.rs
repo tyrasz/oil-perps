@@ -64,9 +64,28 @@ pub fn check_close_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, siz
 
 /// `ceil(opened_notional(size)·taker_fee, 10_000)` (D21).
 pub fn close_base_fee(position: &Position, taker_fee: u32) -> u64 {
-    let n = position.opened_notional(position.size) as u128;
+    slice_close_fee(position, position.size, taker_fee)
+}
+
+/// The close fee of a slice `x`: `ceil(opened_notional(x)·taker_fee, 10_000)`.
+/// Deficit-mode ADL charges it on each slice (D22).
+pub fn slice_close_fee(position: &Position, x: u64, taker_fee: u32) -> u64 {
+    let n = position.opened_notional(x) as u128;
     let fee = pool_math::ceil_u(n * taker_fee as u128, 10_000);
     u64::try_from(fee).unwrap_or(u64::MAX)
+}
+
+/// Profit-close quiet time (D23): within `profit_close_quiet_secs` of a
+/// session open (never for a schedule that does not close), or, once
+/// settled, of `settled_at` (D35), so the bankrupt losers a settlement price
+/// creates can be closed and booked before their winners are paid.
+pub fn in_profit_close_quiet(m: &Market, pool: &LpPool, now: i64) -> bool {
+    let q = pool.params.profit_close_quiet_secs as i64;
+    if m.is_settled() {
+        m.settled_at > 0 && now.saturating_sub(m.settled_at) < q
+    } else {
+        session::seconds_since_open(m.session_schedule, now).map_or(false, |t| t < q)
+    }
 }
 
 fn to_i64(x: i128) -> i64 {
@@ -102,6 +121,11 @@ pub fn settle_close(
     let pnl = position.unrealized_pnl(exec);
     let fnd = position.accrued_funding(m.cumulative_funding);
     let p = pnl as i128 + fnd as i128;
+    // A winner waits out the quiet time after a session open (or after
+    // settlement), so the keeper can liquidate or close its bankrupt matched
+    // counterparty first and the deficit reaches the bad-debt haircut (D23,
+    // D35)
+    require!(!(p > 0 && in_profit_close_quiet(m, pool, now)), PerpsError::ProfitCloseQuiet);
     if !settled {
         check_close_caps(m, pool, &v, side, size, mark, now)?;
     }
@@ -274,10 +298,10 @@ mod tests {
         let mut short2 = open(&mut m2, &mut pool2, &mut user2, Side::Short, 10, 75, 150);
         let _long2 = open(&mut m2, &mut pool2, &mut user2, Side::Long, 10, 75, 150);
         pool2.pending_bad_debt_long = 30 * C6;
-        pool2.pending_since = 1;
+        pool2.pending_since_long = 1;
         let o = close(&mut m2, &mut pool2, &mut user2, &mut short2, 70, None);
         assert_eq!((o.p_eff, o.bad_debt_hc), (20 * C6 as i64, 30 * C6));
-        assert_eq!((pool2.pending_bad_debt_long, pool2.pending_since, pool2.bad_debt_recovered_cum), (0, 0, 30 * C6));
+        assert_eq!((pool2.pending_bad_debt_long, pool2.pending_since_long, pool2.bad_debt_recovered_cum), (0, 0, 30 * C6));
     }
 
     #[test]
@@ -314,6 +338,46 @@ mod tests {
         assert_eq!(close_base_fee(&p, 5), 37_501);
         p.opened_price = 75 * C6;
         assert_eq!(close_base_fee(&p, 5), 37_500);
+    }
+
+    /// D23: inside `profit_close_quiet_secs` after a session open a winner
+    /// cannot close; a loser can, and a settled market is exempt.
+    #[test]
+    fn profitable_closes_wait_out_the_quiet_time() {
+        let sunday_open = 1_794_783_600; // Sun 2026-11-15 18:00 ET
+        let (mut m, mut pool, mut user) = (market(), mk_pool(1_000_000 * C6), UserAccount::default());
+        m.session_schedule = session::SCHEDULE_CME_GLOBEX;
+        pool.params.profit_close_quiet_secs = 300;
+        let mut long = open(&mut m, &mut pool, &mut user, Side::Long, 10, 75, 150);
+        let mut short = open(&mut m, &mut pool, &mut user, Side::Short, 10, 75, 150);
+        let at = |m: &mut Market, pool: &mut LpPool, user: &mut UserAccount, p: &mut Position, t: i64| {
+            settle_close(m, pool, p, user, Pubkey::default(), 70 * C6, 70 * C6, t, None)
+        };
+        let e = at(&mut m, &mut pool, &mut user, &mut short, sunday_open + 299).unwrap_err();
+        assert_eq!(e, PerpsError::ProfitCloseQuiet.into());
+        assert!(short.status == PositionStatus::Open);
+        // The loser closes at once, and so does a close at exactly P = 0
+        at(&mut m, &mut pool, &mut user, &mut long, sunday_open).unwrap();
+        let mut flat = open(&mut m, &mut pool, &mut user, Side::Short, 10, 70, 150);
+        at(&mut m, &mut pool, &mut user, &mut flat, sunday_open + 1).unwrap();
+        at(&mut m, &mut pool, &mut user, &mut short, sunday_open + 300).unwrap();
+        // 0 turns it off; settled markets and 24/7 schedules never wait
+        let mut w: Vec<Position> = (0..3).map(|_| open(&mut m, &mut pool, &mut user, Side::Short, 10, 75, 150)).collect();
+        pool.params.profit_close_quiet_secs = 0;
+        at(&mut m, &mut pool, &mut user, &mut w[0], sunday_open).unwrap();
+        pool.params.profit_close_quiet_secs = 300;
+        m.session_schedule = session::SCHEDULE_ALWAYS_OPEN;
+        at(&mut m, &mut pool, &mut user, &mut w[1], sunday_open).unwrap();
+        m.session_schedule = session::SCHEDULE_CME_GLOBEX;
+        m.settlement_price = 70 * C6;
+        at(&mut m, &mut pool, &mut user, &mut w[2], sunday_open).unwrap();
+        // ... unless settle_market recorded `settled_at`: then winners wait
+        // out the quiet time after settlement (D35)
+        m.settled_at = sunday_open;
+        let mut w3 = open(&mut m, &mut pool, &mut user, Side::Short, 10, 75, 150);
+        let e = at(&mut m, &mut pool, &mut user, &mut w3, sunday_open + 299).unwrap_err();
+        assert_eq!(e, PerpsError::ProfitCloseQuiet.into());
+        at(&mut m, &mut pool, &mut user, &mut w3, sunday_open + 300).unwrap();
     }
 
     #[test]
@@ -353,5 +417,44 @@ mod tests {
         // An explicit G of 10% doubles the room
         pool.params.weekend_gap_bps = 1_000;
         check_close_caps(&m, &pool, &v, Side::Short, size, 75 * C6, friday_close - 3_600).unwrap();
+    }
+
+    /// Mutation finding: equity exactly 0 after the fee is the solvent branch.
+    /// The fee is split as a fee (not left in LP cash), nothing is a deficit,
+    /// and no loss window opens. Long 10 @ $75 with $10 at $74.0375: P =
+    /// −$9.625, fee $0.375. The close also counts a trade and touches the
+    /// drawdown peak.
+    #[test]
+    fn close_with_exactly_zero_equity_after_the_fee() {
+        let (mut m, mut pool, mut user) = (market(), mk_pool(1_000_000 * C6), UserAccount::default());
+        let mut p = open(&mut m, &mut pool, &mut user, Side::Long, 10, 75, 10);
+        let (cash0, ins0, trades0) = (pool.cash, m.insurance_fund, user.total_trades);
+        pool.nps_peak = 1;
+        let before = bucket_total(&pool, &m);
+        let o = settle_close(&mut m, &mut pool, &mut p, &mut user, Pubkey::new_unique(), 74_037_500, 74_037_500, 1, None).unwrap();
+        assert_eq!(bucket_total(&pool, &m), before);
+        assert_eq!((o.payout, o.deficit, o.fee, o.p_eff), (0, 0, 375_000, -9_625_000));
+        assert_eq!((pool.cash, m.insurance_fund), (cash0 + 9_625_000, ins0 + 375_000));
+        assert_eq!((pool.loss_window_start, pool.bad_debt_cum), (0, 0));
+        assert_eq!(user.total_trades, trades0 + 1);
+        assert!(pool.nps_peak > 1);
+    }
+
+    /// Mutation findings on the close caps (D14): a close that leaves `|net|`
+    /// unchanged is not checked, and the net notional is a ceiling, so a
+    /// close whose floored notional just fits B is refused.
+    #[test]
+    fn close_caps_skip_equal_net_and_ceil_the_notional() {
+        let (m, mut pool) = (market(), mk_pool(0));
+        pool.params.k_net_bps = 10_000;
+        // net +5, closing a 10 long: |after| = |net|, no check even with B = 0
+        let v = PoolView { net: 5, b: 0, ..Default::default() };
+        check_close_caps(&m, &pool, &v, Side::Long, 10, 75 * C6, 0).unwrap();
+        // net 0, closing 3 units of a short at $75.000001: 225.000003 → 226
+        let v = PoolView { net: 0, b: 225, ..Default::default() };
+        let e = check_close_caps(&m, &pool, &v, Side::Short, 3, 75_000_001, 0).unwrap_err();
+        assert_eq!(e, PerpsError::PoolExposureLimit.into());
+        let v = PoolView { net: 0, b: 226, ..Default::default() };
+        check_close_caps(&m, &pool, &v, Side::Short, 3, 75_000_001, 0).unwrap();
     }
 }

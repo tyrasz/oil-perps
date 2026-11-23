@@ -51,6 +51,7 @@ pub struct Market {
     pub settlement_price: u64,                // 6 decimals; non-zero once settle_market has run
     pub funding_rate: i64,                    // Latest per-period funding rate (6 decimals, 100 = 0.01%)
     pub funding_carry_secs: u32,              // Open seconds accrued but not yet charged (docs/lp-pool.md §8)
+    pub settled_at: i64,                      // Unix time settle_market ran; 0 = not settled (or settled before it existed)
 }
 
 impl Market {
@@ -86,7 +87,8 @@ impl Market {
         8 +   // settlement_price
         8 +   // funding_rate
         4 +   // funding_carry_secs
-        11;   // padding for future use
+        8 +   // settled_at
+        3;    // padding for future use
 
     /// Convert commodity bytes to string
     pub fn commodity_str(&self) -> String {
@@ -316,7 +318,7 @@ mod tests {
     fn account_size_is_unchanged_so_existing_markets_still_load() {
         assert_eq!(Market::LEN, 298);
         let serialized = Market::default().try_to_vec().unwrap().len();
-        assert_eq!(8 + serialized + 11, Market::LEN);
+        assert_eq!(8 + serialized + 3, Market::LEN);
     }
 
     /// docs/lp-pool.md §1.1: `funding_carry_secs` is appended after
@@ -324,12 +326,14 @@ mod tests {
     #[test]
     fn funding_carry_secs_is_appended() {
         use anchor_lang::AccountSerialize;
-        let m = Market { funding_rate: -2, funding_carry_secs: 0x0a0b_0c0d, ..Default::default() };
+        let m = Market { funding_rate: -2, funding_carry_secs: 0x0a0b_0c0d, settled_at: -3, ..Default::default() };
         let mut b = Vec::new();
         m.try_serialize(&mut b).unwrap();
         assert_eq!(&b[275..283], &(-2i64).to_le_bytes());
         assert_eq!(&b[283..287], &0x0a0b_0c0du32.to_le_bytes());
-        assert_eq!(b.len(), 287);
+        // settled_at (docs/lp-pool.md §0 D35) follows at 287..295
+        assert_eq!(&b[287..295], &(-3i64).to_le_bytes());
+        assert_eq!(b.len(), 295);
     }
 
     #[test]

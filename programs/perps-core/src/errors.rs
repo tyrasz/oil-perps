@@ -280,4 +280,7 @@ pub enum PerpsError {
 
     #[msg("Market is not settled")]
     MarketNotSettled,
+
+    #[msg("Profitable closes wait profit_close_quiet_secs after a session open")]
+    ProfitCloseQuiet,
 }

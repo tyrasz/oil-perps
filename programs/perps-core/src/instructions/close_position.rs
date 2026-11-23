@@ -6,6 +6,7 @@ use crate::instructions::open_position::check_acceptable;
 use crate::instructions::settle_close::settle_close;
 use crate::state::{assert_backed, skew_price, LpPool, Market, Position, Vault, UserAccount, Side, PositionStatus, ReferralCode, UserReferral};
 use crate::errors::PerpsError;
+use crate::instructions::update_funding::crank_funding;
 
 #[derive(Accounts)]
 pub struct ClosePosition<'info> {
@@ -121,8 +122,10 @@ pub fn handler(ctx: Context<ClosePosition>, acceptable_price: u64) -> Result<()>
     };
     let notional = ctx.accounts.position.notional_value();
 
-    // 2–7. Value, caps, profit or loss, fee, equity, pool (docs/lp-pool.md §4.5)
+    // 2–7. Value, caps, profit or loss, fee, equity, pool (docs/lp-pool.md §4.5).
+    // Funding due is charged first, so a close cannot escape it (D40)
     let a = &mut *ctx.accounts;
+    crank_funding(&mut a.market, mark, current_time);
     let o = settle_close(
         &mut a.market, &mut a.lp_pool, &mut a.position, &mut a.user_account, position_key, mark, exec, current_time, referral,
     )?;
@@ -242,6 +245,10 @@ mod tests {
         // $10 base fee, 10% discount, 20% of the discounted fee to the referrer
         assert_eq!(referral_fees(10_000_000, Some((1_000, 2_000))), (9_000_000, 1_800_000));
         assert_eq!(referral_fees(10_000_000, None), (10_000_000, 0));
+        // Non-divisible: the discount is floored, so the trader pays the
+        // odd unit (rounding against the actor), and so is the reward
+        assert_eq!(referral_fees(333, Some((1_000, 2_000))), (300, 60));
+        assert_eq!(referral_fees(339, Some((1_000, 3_333))), (306, 101));
     }
 
     #[test]

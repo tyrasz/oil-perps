@@ -163,9 +163,37 @@ pub fn nav_per_share(nav: i128, lp_shares: u64) -> u64 {
         .map_or(u64::MAX, |v| u64::try_from(v).unwrap_or(u64::MAX))
 }
 
-/// O(1) pool valuation (§2.2). `None` on arithmetic overflow (`MathOverflow`).
-/// `h_bps` is `redeem_loss_haircut_bps`.
+/// The skew premium the pool pays back when the net skew unwinds (D39), at
+/// `mark`: house opens and closes trade at the SIP-279 skew price, and the
+/// premium paid to move the skew from 0 to `net` is returned in full by
+/// closing back to 0 at the same oracle. Path independent, so an O(1) bound:
+/// `min(ceil(mark·net²/(2·skew_scale·1e6)), ceil(net_notional·max_impact/1e4))`.
+/// `0` with no price impact (`skew_scale == 0`, settled).
 #[inline(never)]
+pub fn unwind_premium(net: i128, mark: u64, skew_scale: u64, max_impact_bps: u16) -> Option<u128> {
+    let n = net.unsigned_abs();
+    if skew_scale == 0 || n == 0 {
+        return Some(0);
+    }
+    let nn = ceil_u(n.checked_mul(mark as u128)?, SCALE as u128);
+    let cap = ceil_u(nn.checked_mul(max_impact_bps as u128)?, BPS);
+    let n2 = n.checked_mul(n)?;
+    let den = 2 * skew_scale as u128 * SCALE as u128;
+    let quad = match mul_div_floor(n2, mark as u128, den) {
+        Some(q) if mul_wide(q, den) == mul_wide(n2, mark as u128) => q,
+        Some(q) => q.saturating_add(1),
+        None => u128::MAX,
+    };
+    Some(quad.min(cap))
+}
+
+/// O(1) pool valuation (§2.2). `None` on arithmetic overflow (`MathOverflow`).
+/// `h_bps` is `redeem_loss_haircut_bps`; `skew_scale` and `max_impact_bps`
+/// price the refundable skew premium (`unwind_premium`, D39), which
+/// `NAV_redeem` and the mark NAV count as owed to traders. `NAV_mint` does
+/// not, which errs against the depositor.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub fn pool_view_raw(
     p: &PoolState,
     long_oi: u64,
@@ -174,6 +202,8 @@ pub fn pool_view_raw(
     mark: u64,
     now: i64,
     h_bps: u16,
+    skew_scale: u64,
+    max_impact_bps: u16,
 ) -> Option<PoolView> {
     let l = long_oi as i128;
     let s = short_oi as i128;
@@ -190,11 +220,16 @@ pub fn pool_view_raw(
     let fund_num = fund_short.checked_sub(fund_long)?;
     let u = pnl_num.checked_add(fund_num)?.div_euclid(SCALE);
 
+    let net = l - s;
     let slack = 2 * p.open_positions as i128 + 1;
     let unv = unvested(p.vest_amount, p.vest_start, p.vest_end, now) as i128;
     let cash = p.cash as i128;
-    let gain = u.max(0);
-    let loss = (-u).max(0);
+    // What traders are owed on unwinding: U plus the skew premium they get
+    // back (D39)
+    let x = i128::try_from(unwind_premium(net, mark, skew_scale, max_impact_bps)?).ok()?;
+    let u_lp = u.checked_add(x)?;
+    let gain = u_lp.max(0);
+    let loss = (-u_lp).max(0);
 
     let nav_mint = cash.checked_sub(u)?.checked_add(slack)?;
     let counted_loss = loss.checked_mul(h_bps as i128)? / BPS as i128;
@@ -203,12 +238,11 @@ pub fn pool_view_raw(
         .checked_sub(gain)?
         .checked_add(counted_loss)?
         .checked_sub(slack)?;
-    let nav_mark = cash.checked_sub(unv)?.checked_sub(u)?;
+    let nav_mark = cash.checked_sub(unv)?.checked_sub(u_lp)?;
 
     let nps = nav_per_share(nav_mark, p.lp_shares);
     let dd_bps = drawdown_bps(nps, p.nps_peak);
 
-    let net = l - s;
     let net_notional = ceil_u(net.unsigned_abs().checked_mul(mark as u128)?, SCALE as u128);
     let b = nav_redeem.max(0) as u128;
     let cap_nav = if p.lp_shares == 0 {
@@ -387,7 +421,7 @@ pub fn dd_withdraw_blocked(dd_bps: u64, dd_withdraw_block_bps: u16) -> bool {
 
 /// `lp_withdraw` post-check: `hard_net == 0 || net == 0 || nn·1e4 ≤ hard·B'`.
 pub fn hard_net_ok(net_notional: u128, hard_net_bps: u32, b_after: u128) -> bool {
-    hard_net_bps == 0 || net_notional == 0 || le_mul(net_notional, BPS, hard_net_bps as u128, b_after)
+    hard_net_bps == 0 || le_mul(net_notional, BPS, hard_net_bps as u128, b_after)
 }
 
 /// `floor(bps·B / 10_000)`: the net-mode and drawdown-mode ADL targets.
@@ -504,6 +538,39 @@ pub fn params_timelock_secs(cur_delay: u32, new_delay: u32, cur_window: u32, new
     t.max(MIN_POOL_TIMELOCK_SECS)
 }
 
+/// Open seconds in one CME week (Sun 6 h + Mon–Thu 4 × 23 h + Fri 17 h),
+/// the most any supported schedule is open between two weekly closes.
+pub const WEEK_OPEN_SECS: u64 = 414_000;
+/// One day of open time that every week, and every claim window, must leave
+/// ungated for `lp_withdraw` (§1.2, D38).
+pub const LP_UNGATED_SECS: u64 = 86_400;
+
+/// Upper bound on the open seconds per week the LP gates close
+/// `lp_withdraw` (D38): the pre-close window `W` (wall seconds, so at least
+/// its open seconds) plus the reopen quiet `Q` after each of the five weekly
+/// session opens (Sunday and Monday–Thursday 18:00 ET).
+pub fn lp_gated_secs_per_week(window: u32, quiet: u32) -> u64 {
+    window as u64 + 5 * quiet as u64
+}
+
+/// Shortest claim window (open seconds) that always holds a day of ungated
+/// `lp_withdraw` time: `W + 5·Q + 1 day` (D38).
+pub fn min_claim_window_secs(window: u32, quiet: u32) -> u64 {
+    lp_gated_secs_per_week(window, quiet) + LP_UNGATED_SECS
+}
+
+/// The claim window a request is held to: the one stored at request time,
+/// but never shorter than what the gates in force now need, so a later
+/// `apply_pool_params` that widens `W` or `Q` cannot expire it inside gated
+/// time (D38). `0` (never lapses) stays 0.
+pub fn effective_claim_window_secs(stored: u32, window: u32, quiet: u32) -> u64 {
+    if stored == 0 {
+        0
+    } else {
+        (stored as u64).max(min_claim_window_secs(window, quiet))
+    }
+}
+
 /// `floor(size·price / 1e6)`, saturating at u64::MAX (only reachable far
 /// beyond `MAX_OPEN_INTEREST` at realistic prices).
 pub fn notional_floor(size: u64, price: u64) -> u64 {
@@ -614,7 +681,7 @@ mod tests {
 
     #[test]
     fn empty_pool_view() {
-        let v = pool_view_raw(&state(1_000_000_000_000), 0, 0, 0, 75_000_000, 0, 5_000).unwrap();
+        let v = pool_view_raw(&state(1_000_000_000_000), 0, 0, 0, 75_000_000, 0, 5_000, 0, 0).unwrap();
         assert_eq!(v.u, 0);
         assert_eq!(v.nav_mint, 1_000_000_000_001);
         assert_eq!(v.nav_redeem, 999_999_999_999);
@@ -633,7 +700,7 @@ mod tests {
         p.long_funding_sum = 100_000_000i128 * 10;
         p.open_positions = 1;
         p.pending_withdraw_shares = p.lp_shares / 4;
-        let v = pool_view_raw(&p, 100_000_000, 0, 7_510, 76_000_000, 0, 5_000).unwrap();
+        let v = pool_view_raw(&p, 100_000_000, 0, 7_510, 76_000_000, 0, 5_000, 0, 0).unwrap();
         // pnl +$100, funding −$0.75 → U = 99.25
         assert_eq!(v.u, 99_250_000);
         assert_eq!(v.nav_mint, 1_000_000_000 - 99_250_000 + 3);
@@ -646,7 +713,7 @@ mod tests {
         q.short_entry_sum = p.long_entry_sum;
         q.short_funding_sum = p.long_funding_sum;
         q.open_positions = 1;
-        let w = pool_view_raw(&q, 0, 100_000_000, 7_510, 76_000_000, 0, 5_000).unwrap();
+        let w = pool_view_raw(&q, 0, 100_000_000, 7_510, 76_000_000, 0, 5_000, 0, 0).unwrap();
         assert_eq!(w.u, -99_250_000);
         assert_eq!(w.nav_redeem, 1_000_000_000 + 49_625_000 - 3);
         assert_eq!(w.net, -100_000_000);
@@ -655,10 +722,23 @@ mod tests {
 
     #[test]
     fn net_notional_rounds_against_the_opener() {
-        let v = pool_view_raw(&state(0), 1, 0, 0, 1, 0, 0);
+        let v = pool_view_raw(&state(0), 1, 0, 0, 1, 0, 0, 0, 0);
         // pool_view needs positions in the aggregates to be meaningful; only
         // the net term matters here: |1|·1 / 1e6 rounds up to 1.
         assert_eq!(v.unwrap().net_notional, 1);
+    }
+
+    /// Mutation finding: U floors (`div_euclid`), so a sub-unit trader loss
+    /// counts as a whole unit (truncation would count 0).
+    #[test]
+    fn u_floors_a_fractional_trader_loss() {
+        let p = PoolState { cash: 1_000, long_entry_sum: 2, open_positions: 1, lp_shares: 1_000, ..Default::default() };
+        // One unit long, entry sum 2, at mark 1: PnL −1e-6 units
+        let v = pool_view_raw(&p, 1, 0, 0, 1, 0, 0, 0, 0).unwrap();
+        assert_eq!((v.u, v.nav_mint), (-1, 1_000 + 1 + 3));
+        // hard_net_ok with no net always holds
+        assert!(hard_net_ok(0, 1, 0));
+        assert!(!hard_net_ok(1, 1, 0));
     }
 
     #[test]
@@ -673,7 +753,7 @@ mod tests {
             p.short_entry_sum = s as u128 * mark as u128;
             p.lp_shares = 1_000_000 + r.below(u64::MAX / 2);
             p.pending_withdraw_shares = r.below(p.lp_shares + 1);
-            let v = pool_view_raw(&p, l, s, 0, mark, 0, 0).unwrap();
+            let v = pool_view_raw(&p, l, s, 0, mark, 0, 0, 0, 0).unwrap();
             assert_eq!(v.u, 0);
             let exact = (l as i128 - s as i128).unsigned_abs() * mark as u128;
             assert!(v.net_notional * 1_000_000 >= exact);
@@ -688,23 +768,23 @@ mod tests {
     fn view_overflow_is_reported() {
         let mut p = state(0);
         p.long_entry_sum = u128::MAX;
-        assert_eq!(pool_view_raw(&p, 1, 0, 0, 1, 0, 0), None);
+        assert_eq!(pool_view_raw(&p, 1, 0, 0, 1, 0, 0, 0, 0), None);
         // The bounds in §2.2 never overflow
         let mut p = state(u64::MAX);
         p.long_entry_sum = MAX_OPEN_INTEREST as u128 * u64::MAX as u128;
         p.short_funding_sum = i64::MIN as i128 * MAX_OPEN_INTEREST as i128;
         p.open_positions = u64::MAX / 4;
-        assert!(pool_view_raw(&p, MAX_OPEN_INTEREST, MAX_OPEN_INTEREST, i64::MAX, u64::MAX, 0, 10_000).is_some());
+        assert!(pool_view_raw(&p, MAX_OPEN_INTEREST, MAX_OPEN_INTEREST, i64::MAX, u64::MAX, 0, 10_000, 0, 0).is_some());
     }
 
     #[test]
     fn vesting_widens_mint_minus_redeem_by_exactly_the_unvested_part() {
         let mut p = state(5_000_000_000);
-        let base = pool_view_raw(&p, 0, 0, 0, 1, 50, 0).unwrap();
+        let base = pool_view_raw(&p, 0, 0, 0, 1, 50, 0, 0, 0).unwrap();
         p.vest_amount = 1_000_000;
         p.vest_start = 0;
         p.vest_end = 100;
-        let v = pool_view_raw(&p, 0, 0, 0, 1, 50, 0).unwrap();
+        let v = pool_view_raw(&p, 0, 0, 0, 1, 50, 0, 0, 0).unwrap();
         assert_eq!(v.nav_mint, base.nav_mint);
         assert_eq!(v.nav_redeem, base.nav_redeem - 500_000);
         assert_eq!((v.nav_mint - v.nav_redeem) - (base.nav_mint - base.nav_redeem), 500_000);
@@ -985,7 +1065,10 @@ mod tests {
             p.short_entry_sum = s as u128 * (1 + r.below(100_000_000)) as u128;
             let mark = 1 + r.below(100_000_000);
             let h = r.below(10_001) as u16;
-            let v = pool_view_raw(&p, l, s, 0, mark, 0, h).unwrap();
+            // Half the cases price the refundable skew premium (D39)
+            let (k, mi) = if r.below(2) == 0 { (0, 0) } else { (1 + r.below(10_000_000_000_000), r.below(1_001) as u16) };
+            let v = pool_view_raw(&p, l, s, 0, mark, 0, h, k, mi).unwrap();
+            assert!(v.nav_redeem < v.nav_mint);
             if v.nav_mint <= 0 {
                 continue;
             }
@@ -996,7 +1079,7 @@ mod tests {
             let mut d = p;
             d.cash += amount;
             d.lp_shares += minted;
-            let after = pool_view_raw(&d, l, s, 0, mark, 0, h).unwrap().nps;
+            let after = pool_view_raw(&d, l, s, 0, mark, 0, h, k, mi).unwrap().nps;
             assert!(after >= before, "deposit {} -> {}", before, after);
             // Withdraw
             let shares = 1 + r.below(p.lp_shares - 1);
@@ -1007,9 +1090,48 @@ mod tests {
             let mut w = p;
             w.cash -= value;
             w.lp_shares -= shares;
-            let after = pool_view_raw(&w, l, s, 0, mark, 0, h).unwrap().nps;
+            let after = pool_view_raw(&w, l, s, 0, mark, 0, h, k, mi).unwrap().nps;
             assert!(after >= before, "withdraw {} -> {}", before, after);
         }
+    }
+
+    /// D39: a house open pays the skew premium into U, and closing back at
+    /// the same oracle pays it out again, so NAV_redeem must not count it.
+    /// Open then close at a flat oracle: NAV_redeem in between is never above
+    /// the cash the pool ends with, and the mark NAV does not move.
+    #[test]
+    fn refundable_skew_premium_is_not_lp_value() {
+        let (k, mi, h) = (2_500_000_000_000u64, 100u16, 5_000u16);
+        let o = 75_000_000u64;
+        for (cash, q) in [(10_000_000_000_000u64, 133_333_000_000u64), (1_000_000_000_000, 13_333_000_000), (1_000_000_000_000, 1_000_000_000), (1_000_000_000_000, 1)] {
+            let p0 = PoolState { cash, lp_shares: cash, ..Default::default() };
+            let before = pool_view_raw(&p0, 0, 0, 0, o, 0, h, k, mi).unwrap();
+            let open = skew_price_raw(o, 0, q as i128, k, mi).unwrap() as u64;
+            let p1 = PoolState { long_entry_sum: q as u128 * open as u128, open_positions: 1, ..p0 };
+            let v = pool_view_raw(&p1, q, 0, 0, o, 0, h, k, mi).unwrap();
+            // The close sells back down the same skew
+            let close = skew_price_raw(o, q as i128, -(q as i128), k, mi).unwrap() as u64;
+            let pnl = (q as i128 * (close as i128 - open as i128)).div_euclid(SCALE);
+            let final_cash = cash as i128 - pnl;
+            assert!(v.nav_redeem <= final_cash, "q={} redeem {} > cash {}", q, v.nav_redeem, final_cash);
+            // Exact up to the slack and the 1-unit roundings
+            assert!(final_cash - v.nav_redeem <= 4, "q={} {} {}", q, final_cash, v.nav_redeem);
+            assert!((v.nps as i128 - before.nps as i128).abs() <= 1, "q={}", q);
+            // Without the premium term the open would raise NAV_redeem
+            if q > 1_000_000 {
+                let raw = pool_view_raw(&p1, q, 0, 0, o, 0, h, 0, 0).unwrap();
+                assert!(raw.nav_redeem > final_cash);
+            }
+        }
+        // $10M pool, 133,333 contracts: clamped at 1%, $100k of premium
+        let q = 133_333_000_000u128;
+        assert_eq!(unwind_premium(q as i128, o, k, mi), Some(ceil_u(ceil_u(q * o as u128, SCALE as u128) * 100, BPS)));
+        assert_eq!(unwind_premium(-(q as i128), o, k, mi), unwind_premium(q as i128, o, k, mi));
+        // Unclamped: o·n²/(2K·1e6), ceiled; none without impact
+        assert_eq!(unwind_premium(1_000_000_000, o, k, mi), Some(15_000_000));
+        assert_eq!(unwind_premium(1_000_000_001, o, k, mi), Some(15_000_001));
+        assert_eq!(unwind_premium(1_000_000_000, o, 0, mi), Some(0));
+        assert_eq!(unwind_premium(0, o, k, mi), Some(0));
     }
 
     #[test]

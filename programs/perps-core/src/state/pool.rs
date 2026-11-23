@@ -16,7 +16,7 @@ pub use crate::pool_math::{
     MIN_POOL_TIMELOCK_SECS, PARAMS_TIMELOCK_MARGIN_SECS,
 };
 
-/// Pool risk and fee parameters (§1.2). Borsh, 100 bytes; offsets in comments.
+/// Pool risk and fee parameters (§1.2). Borsh, 104 bytes; offsets in comments.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, PartialEq)]
 pub struct PoolParams {
     pub skew_scale: u64,                     //  0  contracts (6 dp); 0 = no price impact
@@ -46,10 +46,11 @@ pub struct PoolParams {
     pub min_liq_slice_bps: u16,              // 94  minimum stage-1 slice, of size
     pub treasury_fee_bps: u16,               // 96  of net fees
     pub lp_loss_cap_window_bps: u16,         // 98  × loss_window_nav; the LP's share of one loss window
+    pub profit_close_quiet_secs: u32,        // 100 no profitable close_position this long after each session open (§4.5)
 }
 
 impl PoolParams {
-    pub const LEN: usize = 8 * 4 + 4 * 11 + 2 * 12; // 100
+    pub const LEN: usize = 8 * 4 + 4 * 11 + 2 * 12 + 4; // 104
 
     /// Production defaults for OIL (§15.1).
     pub fn production() -> Self {
@@ -81,6 +82,7 @@ impl PoolParams {
             min_liq_slice_bps: 2_000,
             treasury_fee_bps: 1_000,
             lp_loss_cap_window_bps: 500,
+            profit_close_quiet_secs: 300,
         }
     }
 
@@ -105,6 +107,7 @@ impl PoolParams {
             withdrawal_delay_secs: 0,
             withdrawal_claim_window_secs: 0,
             lp_reopen_quiet_secs: 0,
+            profit_close_quiet_secs: 0,
             ..Self::production()
         }
     }
@@ -122,10 +125,16 @@ impl PoolParams {
             && bps(p.redeem_loss_haircut_bps)
             && p.weekend_cap_window_secs <= 5 * 86_400
             && p.withdrawal_delay_secs <= 30 * 86_400
-            && p.lp_reopen_quiet_secs <= 86_400;
+            && p.lp_reopen_quiet_secs <= 86_400
+            && p.profit_close_quiet_secs <= 3_600
+            // Every week keeps a day of open time with lp_withdraw ungated
+            // (D38): W and Q together cannot shut LP exits for good
+            && pool_math::lp_gated_secs_per_week(p.weekend_cap_window_secs, p.lp_reopen_quiet_secs)
+                + pool_math::LP_UNGATED_SECS
+                <= pool_math::WEEK_OPEN_SECS;
         let claim = p.withdrawal_claim_window_secs == 0
             || p.withdrawal_claim_window_secs as u64
-                >= p.weekend_cap_window_secs as u64 + p.lp_reopen_quiet_secs as u64 + 86_400;
+                >= pool_math::min_claim_window_secs(p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
         let drawdown = bps(p.dd_freeze_bps)
             && bps(p.dd_adl_bps)
             && bps(p.dd_withdraw_block_bps)
@@ -188,7 +197,7 @@ pub struct LpPool {                          // offset
     // Bad debt / ADL
     pub pending_bad_debt_long: u64,          // 200  deficit of bankrupt LONGS (recovered from profitable shorts)
     pub pending_bad_debt_short: u64,         // 208
-    pub pending_since: i64,                  // 216  debt-weighted booking time (§2.6); 0 when both pending are 0
+    pub pending_since_long: i64,             // 216  debt-weighted booking time of pending_bad_debt_long (§2.6); 0 when it is 0
     pub bad_debt_cum: u64,                   // 224  Σ deficits D, saturating
     pub bad_debt_recovered_cum: u64,         // 232  haircuts + sweeps + donations applied to pending
     pub bad_debt_written_off_cum: u64,       // 240
@@ -206,14 +215,19 @@ pub struct LpPool {                          // offset
     pub vest_end: i64,                       // 312  0 = nothing vesting
     pub donated_cum: u64,                    // 320  stat
     pub pending_params_at: i64,              // 328  0 = no proposal
-    pub params: PoolParams,                  // 336  100 bytes
-    pub pending_params: PoolParams,          // 436  100 bytes
-    pub bump: u8,                            // 536
-}                                            // 537..601 padding (64): reserved for a junior/first-loss tranche (§9.6)
+    pub params: PoolParams,                  // 336  104 bytes
+    pub pending_params: PoolParams,          // 440  104 bytes
+    pub bump: u8,                            // 544
+    pub pending_since_short: i64,            // 545  the same for pending_bad_debt_short (D36)
+}                                            // 553..601 padding (48): reserved for a junior/first-loss tranche (§9.6)
 
 impl LpPool {
     pub const SEED: &'static [u8] = b"lp_pool";
-    pub const LEN: usize = 8 + 32 * 2 + 8 * 4 + 16 * 4 + 8 * 21 + PoolParams::LEN * 2 + 1 + 64; // 601
+    /// Reserved tail. `profit_close_quiet_secs` took 2 × 4 bytes of it (one
+    /// per `PoolParams` copy) and `pending_since_short` 8, so `LEN` and the
+    /// rent did not change.
+    pub const PADDING: usize = 48;
+    pub const LEN: usize = 8 + 32 * 2 + 8 * 4 + 16 * 4 + 8 * 22 + PoolParams::LEN * 2 + 1 + LpPool::PADDING; // 601
 
     pub fn adl_required(&self) -> bool {
         self.pending_bad_debt_long > 0 || self.pending_bad_debt_short > 0
@@ -248,6 +262,14 @@ impl LpPool {
         match side {
             Side::Short => self.pending_bad_debt_long,
             Side::Long => self.pending_bad_debt_short,
+        }
+    }
+
+    /// `(pending, pending_since)` of the bankrupt `side` (D36).
+    pub fn pending_of(&self, bankrupt: Side) -> (u64, i64) {
+        match bankrupt {
+            Side::Long => (self.pending_bad_debt_long, self.pending_since_long),
+            Side::Short => (self.pending_bad_debt_short, self.pending_since_short),
         }
     }
 }
@@ -345,6 +367,9 @@ pub fn pool_view(pool: &LpPool, market: &Market, mark: u64, now: i64, h: u16) ->
         mark,
         now,
         h,
+        // A settled market closes at the settlement price, with no impact
+        if market.is_settled() { 0 } else { pool.params.skew_scale },
+        pool.params.max_impact_bps,
     )
     .ok_or_else(|| error!(PerpsError::MathOverflow))
 }
@@ -446,14 +471,15 @@ pub fn absorb_deficit(
     pool.lp_absorbed_window = pool.lp_absorbed_window.saturating_add(lp_absorbed);
 
     // Pending: the ADL recovery target
+    // Each side keeps its own debt-weighted clock (D36), so fresh debt on
+    // one side never inherits the other side's age
     let pending = d - ins_paid - lp_absorbed;
     if pending > 0 {
-        let old = pool.pending_bad_debt_long.saturating_add(pool.pending_bad_debt_short);
-        pool.pending_since = pool_math::weighted_since(pool.pending_since, old, now, pending);
-        let slot = match bankrupt_side {
-            Side::Long => &mut pool.pending_bad_debt_long,
-            Side::Short => &mut pool.pending_bad_debt_short,
+        let (slot, since) = match bankrupt_side {
+            Side::Long => (&mut pool.pending_bad_debt_long, &mut pool.pending_since_long),
+            Side::Short => (&mut pool.pending_bad_debt_short, &mut pool.pending_since_short),
         };
+        *since = pool_math::weighted_since(*since, *slot, now, pending);
         *slot = slot.checked_add(pending).ok_or(PerpsError::MathOverflow)?;
     }
     pool.bad_debt_cum = pool.bad_debt_cum.saturating_add(d);
@@ -467,7 +493,8 @@ pub fn absorb_deficit(
         pending_added: pending,
         pending_long: pool.pending_bad_debt_long,
         pending_short: pool.pending_bad_debt_short,
-        pending_since: pool.pending_since,
+        pending_since_long: pool.pending_since_long,
+        pending_since_short: pool.pending_since_short,
         window_lp_absorbed: pool.lp_absorbed_window,
         window_ins_paid: pool.ins_paid_window,
     });
@@ -492,15 +519,15 @@ pub fn quote_profit(pool: &LpPool, v: &PoolView, side: Side, p: u64, allow_short
 #[inline(never)]
 pub fn apply_payout(pool: &mut LpPool, side: Side, po: &Payout) -> Result<()> {
     if po.bad_debt_hc > 0 {
-        let slot = match side {
-            Side::Short => &mut pool.pending_bad_debt_long,
-            Side::Long => &mut pool.pending_bad_debt_short,
+        let (slot, since) = match side {
+            Side::Short => (&mut pool.pending_bad_debt_long, &mut pool.pending_since_long),
+            Side::Long => (&mut pool.pending_bad_debt_short, &mut pool.pending_since_short),
         };
         *slot = slot.checked_sub(po.bad_debt_hc).ok_or(PerpsError::BucketUnderflow)?;
-        pool.bad_debt_recovered_cum = pool.bad_debt_recovered_cum.saturating_add(po.bad_debt_hc);
-        if !pool.adl_required() {
-            pool.pending_since = 0;
+        if *slot == 0 {
+            *since = 0;
         }
+        pool.bad_debt_recovered_cum = pool.bad_debt_recovered_cum.saturating_add(po.bad_debt_hc);
     }
     pool.cash = pool.cash.checked_sub(po.paid).ok_or(PerpsError::BucketUnderflow)?;
     Ok(())
@@ -526,11 +553,14 @@ pub fn recover_pending(pool: &mut LpPool, x: u64) -> u64 {
     let r_s = (x - r_l).min(pool.pending_bad_debt_short);
     pool.pending_bad_debt_long -= r_l;
     pool.pending_bad_debt_short -= r_s;
+    if pool.pending_bad_debt_long == 0 {
+        pool.pending_since_long = 0;
+    }
+    if pool.pending_bad_debt_short == 0 {
+        pool.pending_since_short = 0;
+    }
     let r = r_l + r_s;
     pool.bad_debt_recovered_cum = pool.bad_debt_recovered_cum.saturating_add(r);
-    if r > 0 && !pool.adl_required() {
-        pool.pending_since = 0;
-    }
     r
 }
 
@@ -626,10 +656,11 @@ mod tests {
 
     #[test]
     fn account_sizes_are_pinned() {
-        assert_eq!(PoolParams::LEN, 100);
-        assert_eq!(PoolParams::default().try_to_vec().unwrap().len(), 100);
+        assert_eq!(PoolParams::LEN, 104);
+        assert_eq!(PoolParams::default().try_to_vec().unwrap().len(), 104);
         assert_eq!(LpPool::LEN, 601);
-        assert_eq!(8 + LpPool::default().try_to_vec().unwrap().len() + 64, LpPool::LEN);
+        assert_eq!(8 + LpPool::default().try_to_vec().unwrap().len() + LpPool::PADDING, LpPool::LEN);
+        assert_eq!(LpPool::PADDING, 48);
         assert_eq!(LpPosition::LEN, 166);
         assert_eq!(8 + LpPosition::default().try_to_vec().unwrap().len() + 32, LpPosition::LEN);
     }
@@ -670,6 +701,7 @@ mod tests {
             min_liq_slice_bps: 0x0219,
             treasury_fee_bps: 0x021a,
             lp_loss_cap_window_bps: 0x021b,
+            profit_close_quiet_secs: 0x0100_001c,
         }
     }
 
@@ -691,7 +723,8 @@ mod tests {
             max_pool_cash: 0x0500_0000_0000_000c,
             pending_bad_debt_long: 0x0500_0000_0000_000d,
             pending_bad_debt_short: 0x0500_0000_0000_000e,
-            pending_since: -0x0500_0000_0000_000f,
+            pending_since_long: -0x0500_0000_0000_000f,
+            pending_since_short: -0x0500_0000_0000_001f,
             bad_debt_cum: 0x0500_0000_0000_0010,
             bad_debt_recovered_cum: 0x0500_0000_0000_0011,
             bad_debt_written_off_cum: 0x0500_0000_0000_0012,
@@ -734,7 +767,7 @@ mod tests {
     fn lp_pool_layout_is_pinned() {
         let p = sample_pool();
         let b = bytes(&p);
-        assert_eq!(b.len(), LpPool::LEN - 64);
+        assert_eq!(b.len(), LpPool::LEN - LpPool::PADDING);
         assert_eq!(&b[8..40], p.market.as_ref());
         assert_eq!(&b[40..72], p.adl_keeper.as_ref());
         let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
@@ -755,7 +788,7 @@ mod tests {
         assert_eq!(u64_at(192), p.max_pool_cash);
         assert_eq!(u64_at(200), p.pending_bad_debt_long);
         assert_eq!(u64_at(208), p.pending_bad_debt_short);
-        assert_eq!(i64_at(216), p.pending_since);
+        assert_eq!(i64_at(216), p.pending_since_long);
         assert_eq!(u64_at(224), p.bad_debt_cum);
         assert_eq!(u64_at(232), p.bad_debt_recovered_cum);
         assert_eq!(u64_at(240), p.bad_debt_written_off_cum);
@@ -770,9 +803,10 @@ mod tests {
         assert_eq!(i64_at(312), p.vest_end);
         assert_eq!(u64_at(320), p.donated_cum);
         assert_eq!(i64_at(328), p.pending_params_at);
-        assert_eq!(&b[336..436], p.params.try_to_vec().unwrap().as_slice());
-        assert_eq!(&b[436..536], p.pending_params.try_to_vec().unwrap().as_slice());
-        assert_eq!(b[536], p.bump);
+        assert_eq!(&b[336..440], p.params.try_to_vec().unwrap().as_slice());
+        assert_eq!(&b[440..544], p.pending_params.try_to_vec().unwrap().as_slice());
+        assert_eq!(b[544], p.bump);
+        assert_eq!(i64_at(545), p.pending_since_short);
 
         // PoolParams offsets (relative to the struct)
         let q = p.params.try_to_vec().unwrap();
@@ -800,6 +834,7 @@ mod tests {
                 pp.min_liq_slice_bps, pp.treasury_fee_bps, pp.lp_loss_cap_window_bps,
             ]
         );
+        assert_eq!(qu32(100), pp.profit_close_quiet_secs);
 
         let lp = sample_lp_position();
         let b = bytes(&lp);
@@ -851,6 +886,7 @@ mod tests {
         assert_eq!((n.dd_freeze_bps, n.dd_adl_bps, n.dd_withdraw_block_bps), (0, 0, 0));
         assert_eq!((n.backstop_threshold_bps, n.liq_penalty_bps, n.lp_loss_cap_window_bps), (10_000, 0, 10_000));
         assert_eq!((n.withdrawal_delay_secs, n.withdrawal_claim_window_secs, n.lp_reopen_quiet_secs), (0, 0, 0));
+        assert_eq!((n.profit_close_quiet_secs, PoolParams::production().profit_close_quiet_secs), (0, 300));
         // Everything else is the production value
         let p = PoolParams::production();
         assert_eq!(n.max_impact_bps, p.max_impact_bps);
@@ -865,6 +901,56 @@ mod tests {
     }
 
     /// Each bound at its limit passes and one step past it fails.
+    /// D38, scanned minute by minute over three CME weeks (DST included):
+    /// for parameters that validate, every claim window of the minimum length
+    /// `W + 5·Q + 1 day` open seconds, wherever it starts, holds at least a
+    /// day of open time in which `lp_withdraw` is not gated by `W` or `Q`,
+    /// and so does every week. `effective_claim_window_secs` keeps that for a
+    /// request stored under narrower gates.
+    #[test]
+    fn valid_lp_gates_always_leave_a_day_to_withdraw() {
+        use crate::session::{in_pre_close_window, is_open, seconds_since_open, SCHEDULE_CME_GLOBEX as CME};
+        let start = 1_794_783_600 - 7 * 86_400; // Sun 2026-11-08 18:00 ET
+        let n = 3 * 7 * 1_440;
+        for (w, q) in [(86_400u32, 1_800u32), (318_600, 1_800), (86_400, 48_240), (327_600, 0), (0, 65_520), (241_200, 17_280)] {
+            let p = PoolParams { weekend_cap_window_secs: w, lp_reopen_quiet_secs: q, withdrawal_claim_window_secs: 0, ..PoolParams::production() };
+            assert!(p.validate(&oil()), "W={} Q={}", w, q);
+            // Per minute: open, and open with lp_withdraw ungated
+            let mut open = vec![0i64; n + 1];
+            let mut free = vec![0i64; n + 1];
+            for i in 0..n {
+                let t = start + 60 * i as i64;
+                let o = is_open(CME, t);
+                let gated = in_pre_close_window(CME, t, w) || seconds_since_open(CME, t).map_or(false, |s| s < q as i64);
+                open[i + 1] = open[i] + o as i64 * 60;
+                free[i + 1] = free[i] + (o && !gated) as i64 * 60;
+            }
+            let c = crate::pool_math::min_claim_window_secs(w, q) as i64;
+            let mut j = 0;
+            for i in 0..n {
+                while j < n && open[j] - open[i] < c {
+                    j += 1;
+                }
+                if open[j] - open[i] < c {
+                    break; // runs past the scan
+                }
+                assert!(free[j] - free[i] >= 86_400, "W={} Q={} start {} has {}", w, q, i, free[j] - free[i]);
+            }
+            // Every week (Sunday open to Sunday open)
+            for wk in 0..3 {
+                let (a, b) = (wk * 7 * 1_440, ((wk + 1) * 7 * 1_440).min(n));
+                if b - a == 7 * 1_440 {
+                    assert!(free[b] - free[a] >= 86_400, "W={} Q={} week {}", w, q, wk);
+                }
+            }
+        }
+        // A request stored under the production gates is held to the wider
+        // gates a later apply brings in, never to less than it stored
+        assert_eq!(crate::pool_math::effective_claim_window_secs(259_200, 86_400, 1_800), 259_200);
+        assert_eq!(crate::pool_math::effective_claim_window_secs(181_800, 318_600, 1_800), 414_000);
+        assert_eq!(crate::pool_math::effective_claim_window_secs(0, 318_600, 1_800), 0);
+    }
+
     #[test]
     fn validate_checks_every_bound() {
         let m = oil();
@@ -891,16 +977,29 @@ mod tests {
         assert!(!ok(&|p| p.weekend_gap_bps = 10_001));
         assert!(ok(&|p| p.redeem_loss_haircut_bps = 10_000));
         assert!(!ok(&|p| p.redeem_loss_haircut_bps = 10_001));
-        // windows (claim window off so only the bound under test bites)
-        assert!(ok(&|p| { p.weekend_cap_window_secs = 5 * 86_400; p.withdrawal_claim_window_secs = 0; }));
-        assert!(!ok(&|p| { p.weekend_cap_window_secs = 5 * 86_400 + 1; p.withdrawal_claim_window_secs = 0; }));
+        // windows (claim window off so only the bound under test bites).
+        // W + 5·Q + 1 day ≤ 414_000 open seconds a week (D38): with Q = 1_800,
+        // W ≤ 318_600; with W = 1 day, Q ≤ 48_240
+        let wq = |w: u32, q: u32| ok(&|p| { p.weekend_cap_window_secs = w; p.lp_reopen_quiet_secs = q; p.withdrawal_claim_window_secs = 0; });
+        assert!(wq(318_600, 1_800));
+        assert!(!wq(318_601, 1_800));
+        assert!(wq(86_400, 48_240));
+        assert!(!wq(86_400, 48_241));
+        assert!(wq(327_600, 0));
+        assert!(wq(0, 65_520));
+        // The combinations that shut lp_withdraw for a whole CME week all fail
+        for (w, q) in [(432_000, 0), (432_000, 1_800), (428_400, 0), (345_600, 86_400), (86_400, 82_800), (0, 86_400)] {
+            assert!(!wq(w, q), "W={} Q={}", w, q);
+        }
+        assert!(!wq(5 * 86_400 + 1, 0));
+        assert!(!wq(0, 86_401));
         assert!(ok(&|p| p.withdrawal_delay_secs = 30 * 86_400));
         assert!(!ok(&|p| p.withdrawal_delay_secs = 30 * 86_400 + 1));
-        assert!(ok(&|p| { p.lp_reopen_quiet_secs = 86_400; p.withdrawal_claim_window_secs = 0; }));
-        assert!(!ok(&|p| { p.lp_reopen_quiet_secs = 86_401; p.withdrawal_claim_window_secs = 0; }));
-        // claim window ≥ window + quiet + 1 day = 174_600 with the defaults
-        assert!(ok(&|p| p.withdrawal_claim_window_secs = 174_600));
-        assert!(!ok(&|p| p.withdrawal_claim_window_secs = 174_599));
+        assert!(ok(&|p| p.profit_close_quiet_secs = 3_600));
+        assert!(!ok(&|p| p.profit_close_quiet_secs = 3_601));
+        // claim window ≥ W + 5·Q + 1 day = 181_800 with the defaults
+        assert!(ok(&|p| p.withdrawal_claim_window_secs = 181_800));
+        assert!(!ok(&|p| p.withdrawal_claim_window_secs = 181_799));
         assert!(ok(&|p| p.withdrawal_claim_window_secs = 0));
         assert!(!ok(&|p| p.withdrawal_claim_window_secs = 1));
         // drawdown lines
@@ -1202,7 +1301,7 @@ mod tests {
         // LP cap exhausted: the rest is pending on the bankrupt side
         assert_eq!(absorb_deficit(&mut m, &mut pool, key, 30_000, Side::Short, 1_000_000, 300).unwrap(), (0, 20_200, 9_800));
         assert_eq!((pool.pending_bad_debt_long, pool.pending_bad_debt_short), (0, 9_800));
-        assert_eq!(pool.pending_since, 300);
+        assert_eq!((pool.pending_since_long, pool.pending_since_short), (0, 300));
         assert!(pool.adl_required());
         assert_eq!(pool.bad_debt_cum, 60_300);
         assert_eq!((pool.lp_absorbed_window, pool.ins_paid_window), (50_000, 500));
@@ -1264,14 +1363,43 @@ mod tests {
         let mut m = oil();
         let mut pool = waterfall_pool(0, 0); // everything goes to pending
         absorb_deficit(&mut m, &mut pool, key, 10, Side::Long, 0, 1_000).unwrap();
-        assert_eq!(pool.pending_since, 1_000);
+        assert_eq!(pool.pending_since_long, 1_000);
         // Large after small: almost now
-        absorb_deficit(&mut m, &mut pool, key, 1_000_000, Side::Short, 0, 1_000 + 86_400).unwrap();
-        assert_eq!(pool.pending_since, 1_000 + 86_400 - 1); // floor((1000·10 + 87400·1e6)/1000010)
+        absorb_deficit(&mut m, &mut pool, key, 1_000_000, Side::Long, 0, 1_000 + 86_400).unwrap();
+        assert_eq!(pool.pending_since_long, 1_000 + 86_400 - 1); // floor((1000·10 + 87400·1e6)/1000010)
         // Dust barely moves it
-        let before = pool.pending_since;
+        let before = pool.pending_since_long;
         absorb_deficit(&mut m, &mut pool, key, 1, Side::Long, 0, before + 86_400).unwrap();
-        assert_eq!(pool.pending_since, before);
+        assert_eq!(pool.pending_since_long, before);
+    }
+
+    /// D36: each side has its own clock. Fresh debt on one side starts at
+    /// `now` whatever the other side's age, and repaying one side to 0
+    /// resets only that side's clock.
+    #[test]
+    fn pending_clocks_are_per_side() {
+        let key = Pubkey::new_unique();
+        let mut m = oil();
+        let mut pool = waterfall_pool(0, 0);
+        let t0 = 1_000;
+        absorb_deficit(&mut m, &mut pool, key, 1_000_000, Side::Long, 0, t0).unwrap();
+        // 23.5 h later a short deficit: its own clock starts now (a shared
+        // clock would have weighted it to ~t0 + 3.9 h)
+        let t1 = t0 + 84_600;
+        absorb_deficit(&mut m, &mut pool, key, 200_000, Side::Short, 0, t1).unwrap();
+        assert_eq!((pool.pending_since_long, pool.pending_since_short), (t0, t1));
+        assert_eq!(pool.pending_of(Side::Short), (200_000, t1));
+        // Haircuts repay the longs in full: only the long clock resets
+        pool.cash = 10_000_000;
+        pay_profit(&mut pool, &view(0), Side::Short, 1_000_000, false).unwrap();
+        assert_eq!((pool.pending_bad_debt_long, pool.pending_since_long, pool.pending_since_short), (0, 0, t1));
+        // recover_pending likewise
+        pool.pending_bad_debt_long = 5;
+        pool.pending_since_long = 9;
+        recover_pending(&mut pool, 5);
+        assert_eq!((pool.pending_since_long, pool.pending_since_short), (0, t1));
+        recover_pending(&mut pool, 200_000);
+        assert_eq!((pool.pending_bad_debt_short, pool.pending_since_short), (0, 0));
     }
 
     // ---------------- §17.1 #6 quote / apply ----------------
@@ -1292,7 +1420,7 @@ mod tests {
     fn bad_debt_haircut_takes_the_opposite_side() {
         let mut pool = seeded(1_000, PoolParams::neutral());
         pool.pending_bad_debt_long = 30;
-        pool.pending_since = 77;
+        pool.pending_since_long = 77;
         // A long winner does not repay bankrupt longs
         assert_eq!(quote_profit(&pool, &view(0), Side::Long, 100, false).unwrap().bad_debt_hc, 0);
         // A short winner does
@@ -1303,14 +1431,14 @@ mod tests {
         let total = bucket_total(&pool, &oil());
         apply_payout(&mut pool, Side::Short, &q).unwrap();
         assert_eq!((pool.pending_bad_debt_long, pool.cash, pool.bad_debt_recovered_cum), (0, 930, 30));
-        assert_eq!(pool.pending_since, 0); // both pending are 0 now
+        assert_eq!(pool.pending_since_long, 0); // the long pending is 0 now
         assert_eq!(bucket_total(&pool, &oil()), total - q.paid as u128);
         // Partial recovery keeps the clock
         let mut pool = seeded(1_000, PoolParams::neutral());
         pool.pending_bad_debt_short = 300;
-        pool.pending_since = 77;
+        pool.pending_since_short = 77;
         pay_profit(&mut pool, &view(0), Side::Long, 100, false).unwrap();
-        assert_eq!((pool.pending_bad_debt_short, pool.pending_since, pool.cash), (200, 77, 1_000));
+        assert_eq!((pool.pending_bad_debt_short, pool.pending_since_short, pool.cash), (200, 77, 1_000));
     }
 
     #[test]
@@ -1328,11 +1456,13 @@ mod tests {
         let mut pool = seeded(0, PoolParams::neutral());
         pool.pending_bad_debt_long = 10;
         pool.pending_bad_debt_short = 20;
-        pool.pending_since = 5;
+        pool.pending_since_long = 5;
+        pool.pending_since_short = 6;
         assert_eq!(recover_pending(&mut pool, 15), 15);
-        assert_eq!((pool.pending_bad_debt_long, pool.pending_bad_debt_short, pool.pending_since), (0, 15, 5));
+        // The long side is repaid, so only its clock resets (D36)
+        assert_eq!((pool.pending_bad_debt_long, pool.pending_bad_debt_short, pool.pending_since_long, pool.pending_since_short), (0, 15, 0, 6));
         assert_eq!(recover_pending(&mut pool, 100), 15);
-        assert_eq!((pool.pending_bad_debt_short, pool.pending_since, pool.bad_debt_recovered_cum), (0, 0, 30));
+        assert_eq!((pool.pending_bad_debt_short, pool.pending_since_short, pool.bad_debt_recovered_cum), (0, 0, 30));
         assert_eq!(recover_pending(&mut pool, 100), 0);
     }
 

@@ -3,7 +3,7 @@
 
 use crate::support::*;
 use perps_core::errors::PerpsError;
-use perps_core::state::{LpPool, PoolParams, Position, PositionStatus};
+use perps_core::state::{LpPool, Market, PoolParams, Position, PositionStatus};
 
 const HOUR: i64 = 3_600;
 const DAY: i64 = 86_400;
@@ -33,6 +33,23 @@ fn seed_lp(base: &Base) -> Lp {
 async fn patch_pool(base: &mut Base, f: impl FnOnce(&mut LpPool)) {
     let p = base.lp_pool;
     patch::<LpPool>(base, p, f).await;
+}
+
+async fn patch_market(base: &mut Base, f: impl FnOnce(&mut Market)) {
+    let m = base.market;
+    patch::<Market>(base, m, f).await;
+}
+
+/// No funding period falls due for the rest of the test, so tests that are
+/// not about funding keep exact numbers although every open, close,
+/// liquidation and ADL cranks funding inline (D40).
+async fn freeze_funding(base: &mut Base) {
+    patch_market(base, |m| m.funding_interval = 1 << 40).await;
+}
+
+/// The close fee of `x` contracts (6 dp) opened at $75 with 5 bps: D21, D22.
+fn fee_at_75(x: u64) -> u64 {
+    ((x as u128 * 75 * 5 + 9_999) / 10_000) as u64
 }
 
 async fn open_with(base: &mut Base, t: &Trader, side: u8, size: u64, leverage_x: u32, acceptable: u64) -> Result<Pubkey, BanksClientError> {
@@ -196,12 +213,12 @@ async fn pending_debt_and_drawdown_freeze_net_raising_opens() {
     let alice = trader(&mut base, 10_000 * USDC).await;
     let bob = trader(&mut base, 10_000 * USDC).await;
     let pa = open(&mut base, &alice, 0, 10, 5).await.unwrap();
-    patch_pool(&mut base, |p| { p.pending_bad_debt_long = USDC; p.pending_since = WEDNESDAY; }).await;
+    patch_pool(&mut base, |p| { p.pending_bad_debt_long = USDC; p.pending_since_long = WEDNESDAY; }).await;
     assert_eq!(custom_error(open(&mut base, &alice, 0, 1, 5).await.map(|_| ())), perr(PerpsError::PoolAdlPending));
     // An open that lowers |net| is not frozen, nor is any close
     open(&mut base, &bob, 1, 5, 5).await.unwrap();
     close(&mut base, &alice, pa).await.unwrap();
-    patch_pool(&mut base, |p| { p.pending_bad_debt_long = 0; p.pending_since = 0; }).await;
+    patch_pool(&mut base, |p| { p.pending_bad_debt_long = 0; p.pending_since_long = 0; }).await;
     // A 50% drawdown against a fresh peak
     let nps = pool_view_at(&mut base, 75_000_000).await.nps;
     let t = now(&mut base).await;
@@ -247,13 +264,13 @@ async fn an_opposite_winner_closing_pays_pending_first() {
     let p = open(&mut base, &bob, 1, 10, 5).await.unwrap();
     set_price(&mut base, 70.0).await;
     // $30 of bankrupt-long debt is pending
-    patch_pool(&mut base, |p| { p.pending_bad_debt_long = 30 * USDC; p.pending_since = WEDNESDAY; }).await;
+    patch_pool(&mut base, |p| { p.pending_bad_debt_long = 30 * USDC; p.pending_since_long = WEDNESDAY; }).await;
     let cash = pool(&mut base).await.cash;
     close(&mut base, &bob, p).await.unwrap();
     // $150 + ($50 − $30) − $0.375
     assert_eq!(token_balance(&mut base, bob.tokens).await, 169_625_000);
     let pl = pool(&mut base).await;
-    assert_eq!((pl.pending_bad_debt_long, pl.pending_since, pl.bad_debt_recovered_cum), (0, 0, 30 * USDC));
+    assert_eq!((pl.pending_bad_debt_long, pl.pending_since_long, pl.bad_debt_recovered_cum), (0, 0, 30 * USDC));
     assert_eq!(pl.cash, cash - 20 * USDC);
 }
 
@@ -320,6 +337,7 @@ async fn stage_one_slices_and_the_owner_keeps_the_rest() {
 async fn a_gap_deficit_goes_pending_and_deficit_adl_clears_it() {
     // LPs stop pursuing 1 bp of window NAV ($100) per loss window
     let mut base = base_with(PoolParams { lp_loss_cap_window_bps: 1, ..neutral() }).await;
+    freeze_funding(&mut base).await;
     let alice = trader(&mut base, 1_000 * USDC).await;
     let bob = trader(&mut base, 2_000 * USDC).await;
     let carol = trader(&mut base, 1_000 * USDC).await;
@@ -357,20 +375,138 @@ async fn a_gap_deficit_goes_pending_and_deficit_adl_clears_it() {
     set_time(&mut base, t + 21_059).await;
     assert_eq!(custom_error(adl(&mut base, None, &bob.key(), pb, 0, 0).await), perr(PerpsError::AdlScoreBelowFloor));
     set_time(&mut base, t + 21_060).await;
-    adl(&mut base, None, &bob.key(), pb, 0, 0).await.unwrap();
-    // Bob is paid $1,500 less the pending debt, to free collateral
+    let ins = market(&mut base).await.insurance_fund;
+    let ix = adl_ix(&base, &base.ctx.payer.pubkey(), &bob.key(), pb, 0, 0);
+    let ev: Vec<perps_core::events::Adl> = send_events(&mut base.ctx, &[ix], &[]).await.unwrap();
+    // Asked for the whole position, the ADL closes only the slice whose $15
+    // a contract covers the pending debt (+4 units of slack, D37)
+    let x = ((pending as u128 + 4) * 100 * CONTRACT as u128).div_ceil(1_500 * USDC as u128) as u64;
+    assert_eq!((ev[0].size_closed, ev[0].bad_debt_hc), (x, pending));
+    // Bob gets the slice's collateral and its profit less the pending debt
+    // and the close fee (D22), to free collateral; the fee goes to insurance
+    // like any close fee
+    let fee = fee_at_75(x);
+    let profit = x * 15;
+    assert_eq!((ev[0].profit, ev[0].fee), (profit - pending, fee));
     let s = position(&mut base, pb).await;
-    assert!(s.status == PositionStatus::Closed);
-    assert_eq!(s.realized_pnl, (1_500 * USDC - pending) as i64);
-    assert_eq!(user(&mut base, &bob.key()).await.collateral_balance, 500 * USDC + 1_500 * USDC + 1_500 * USDC - pending);
+    assert!(s.status == PositionStatus::Open);
+    assert_eq!(s.size, 100 * CONTRACT - x);
+    assert_eq!(s.realized_pnl, (profit - pending) as i64 - fee as i64);
+    let c_x = (1_500 * USDC as u128 * x as u128 / (100 * CONTRACT) as u128) as u64;
+    assert_eq!(user(&mut base, &bob.key()).await.collateral_balance, 500 * USDC + c_x + profit - pending - fee);
+    assert_eq!(market(&mut base).await.insurance_fund, ins + fee);
     let pl = pool(&mut base).await;
     assert!(!pl.adl_required());
-    assert_eq!((pl.bad_debt_recovered_cum, pl.open_positions), (pending, 0));
+    assert_eq!((pl.bad_debt_recovered_cum, pl.open_positions), (pending, 1));
     assert_buckets(&mut base).await;
-    // LP flows reopen
-    update_funding(&mut base).await.unwrap();
+    // LP flows reopen (funding is frozen, so it is always current)
     let l2 = lp(&mut base, 10 * USDC).await;
     lp_deposit(&mut base, &l2, 10 * USDC, 0).await.unwrap();
+}
+
+/// Owner decision D22: every deficit-mode ADL slice pays the normal close
+/// fee on its opened notional, through `distribute_fee`, after the haircuts.
+#[tokio::test]
+async fn deficit_adl_slices_pay_the_close_fee() {
+    let mut base = base_with(PoolParams { lp_loss_cap_window_bps: 1, ..neutral() }).await;
+    freeze_funding(&mut base).await;
+    let alice = trader(&mut base, 1_000 * USDC).await;
+    let bob = trader(&mut base, 2_000 * USDC).await;
+    let keeper = trader(&mut base, 0).await;
+    let pa = open(&mut base, &alice, 0, 100, 10).await.unwrap();
+    let pb = open(&mut base, &bob, 1, 100, 5).await.unwrap(); // $1,500
+    set_price(&mut base, 60.0).await;
+    liquidate(&mut base, &keeper, &alice.key(), pa).await.unwrap();
+    let pending = pool(&mut base).await.pending_bad_debt_long;
+    assert!(pending > 600 * USDC);
+    let t = now(&mut base).await;
+    set_time(&mut base, t + 21_060).await;
+
+    // A 40-contract slice: $600 of profit all repays pending, so the $1.50
+    // fee (5 bps of $3,000 opened) comes out of its $600 of collateral
+    let free0 = user(&mut base, &bob.key()).await.collateral_balance;
+    let ins0 = market(&mut base).await.insurance_fund;
+    let ix = adl_ix(&base, &base.ctx.payer.pubkey(), &bob.key(), pb, 0, 40 * CONTRACT);
+    let ev: Vec<perps_core::events::Adl> = send_events(&mut base.ctx, &[ix], &[]).await.unwrap();
+    assert_eq!(ev.len(), 1);
+    assert_eq!((ev[0].size_closed, ev[0].profit, ev[0].bad_debt_hc, ev[0].fee), (40 * CONTRACT, 0, 600 * USDC, 1_500_000));
+    assert_eq!(user(&mut base, &bob.key()).await.collateral_balance, free0 + 600 * USDC - 1_500_000);
+    assert_eq!(market(&mut base).await.insurance_fund, ins0 + 1_500_000);
+    // Asking for the rest closes only the slice the rest of pending needs
+    // (D37); it pays the fee on that slice alone
+    let rest = pending - 600 * USDC;
+    let x = ((rest as u128 + 4) * 60 * CONTRACT as u128).div_ceil(900 * USDC as u128) as u64;
+    let ix = adl_ix(&base, &base.ctx.payer.pubkey(), &bob.key(), pb, 0, 0);
+    let ev: Vec<perps_core::events::Adl> = send_events(&mut base.ctx, &[ix], &[]).await.unwrap();
+    let fee2 = fee_at_75(x);
+    assert_eq!((ev[0].size_closed, ev[0].profit, ev[0].bad_debt_hc, ev[0].fee), (x, x * 15 - rest, rest, fee2));
+    let c_x = (900 * USDC as u128 * x as u128 / (60 * CONTRACT) as u128) as u64;
+    assert_eq!(user(&mut base, &bob.key()).await.collateral_balance, free0 + 600 * USDC - 1_500_000 + c_x + x * 15 - rest - fee2);
+    let s = position(&mut base, pb).await;
+    assert!(s.status == PositionStatus::Open);
+    assert_eq!(s.size, 60 * CONTRACT - x);
+    assert_eq!(s.realized_pnl, (600 * USDC + x * 15 - pending) as i64 - (1_500_000 + fee2) as i64);
+    assert_eq!(market(&mut base).await.insurance_fund, ins0 + 1_500_000 + fee2);
+    assert!(!pool(&mut base).await.adl_required());
+    assert_buckets(&mut base).await;
+}
+
+/// Owner decision D23: a winner cannot close for `profit_close_quiet_secs`
+/// after a session open, so the keeper liquidates its bankrupt matched
+/// counterparty first and the winner then repays the deficit (D13). Losing
+/// closes and liquidations are not held; settled markets are exempt.
+#[tokio::test]
+async fn winners_wait_out_the_profit_close_quiet_time() {
+    let params = PoolParams { profit_close_quiet_secs: 300, lp_loss_cap_window_bps: 1, ..neutral() };
+    let mut base = base_with(params).await;
+    configure(&mut base, cme_config()).await.unwrap();
+    freeze_funding(&mut base).await;
+    let alice = trader(&mut base, 1_000 * USDC).await;
+    let bob = trader(&mut base, 2_000 * USDC).await;
+    let carol = trader(&mut base, 1_000 * USDC).await;
+    let dave = trader(&mut base, 1_000 * USDC).await;
+    let keeper = trader(&mut base, 0).await;
+    let pa = open(&mut base, &alice, 0, 100, 10).await.unwrap(); // $750, bankrupt below $67.50
+    let pb = open(&mut base, &bob, 1, 100, 5).await.unwrap(); // its matched winner
+    let pc = open(&mut base, &carol, 0, 1, 2).await.unwrap(); // a small loser
+    let pd = open(&mut base, &dave, 1, 1, 2).await.unwrap(); // a small winner
+
+    // The weekend gaps oil to $60
+    set_time(&mut base, SUNDAY_OPEN + 10).await;
+    set_price(&mut base, 60.0).await;
+    // Bob would be paid in full and the whole deficit left to the LPs
+    assert_eq!(custom_error(close(&mut base, &bob, pb).await), perr(PerpsError::ProfitCloseQuiet));
+    // Carol's losing close and the keeper's liquidation are not held
+    close(&mut base, &carol, pc).await.unwrap();
+    liquidate(&mut base, &keeper, &alice.key(), pa).await.unwrap();
+    let pending = pool(&mut base).await.pending_bad_debt_long;
+    assert!(pending > 600 * USDC);
+    set_time(&mut base, SUNDAY_OPEN + 299).await;
+    assert_eq!(custom_error(close(&mut base, &bob, pb).await), perr(PerpsError::ProfitCloseQuiet));
+    // Once it is over, Bob's profit repays the pending deficit first
+    set_time(&mut base, SUNDAY_OPEN + 300).await;
+    let tokens = token_balance(&mut base, bob.tokens).await;
+    close(&mut base, &bob, pb).await.unwrap();
+    // $1,500 + ($1,500 − pending) − 5 bps of $7,500
+    assert_eq!(token_balance(&mut base, bob.tokens).await - tokens, 3_000 * USDC - pending - 3_750_000);
+    let pl = pool(&mut base).await;
+    assert_eq!((pl.pending_bad_debt_long, pl.bad_debt_recovered_cum), (0, pending));
+
+    // The daily 18:00 reopen starts a quiet time too
+    set_time(&mut base, SUNDAY_OPEN + DAY + 10).await;
+    assert_eq!(custom_error(close(&mut base, &dave, pd).await), perr(PerpsError::ProfitCloseQuiet));
+    // Settlement starts a quiet time of its own (D35): the losers it makes
+    // bankrupt are closed and booked before any winner is paid
+    let t = SUNDAY_OPEN + DAY + 400;
+    set_time(&mut base, t).await;
+    settle(&mut base, 60 * USDC).await.unwrap();
+    assert_eq!(market(&mut base).await.settled_at, t);
+    set_time(&mut base, t + 299).await;
+    assert_eq!(custom_error(close(&mut base, &dave, pd).await), perr(PerpsError::ProfitCloseQuiet));
+    set_time(&mut base, t + 300).await;
+    close(&mut base, &dave, pd).await.unwrap();
+    assert!(position(&mut base, pd).await.status == PositionStatus::Closed);
+    assert_buckets(&mut base).await;
 }
 
 #[tokio::test]
@@ -388,7 +524,7 @@ async fn adl_rejects_the_wrong_candidates() {
     // Bob is losing
     assert_eq!(custom_error(adl(&mut base, None, &bob.key(), pb, 0, 0).await), perr(PerpsError::AdlCandidateNotProfitable));
     // Pending on the long side is repaid by shorts, not by long alice
-    patch_pool(&mut base, |p| { p.pending_bad_debt_long = USDC; p.pending_since = 1; }).await;
+    patch_pool(&mut base, |p| { p.pending_bad_debt_long = USDC; p.pending_since_long = 1; }).await;
     assert_eq!(custom_error(adl(&mut base, None, &alice.key(), pa, 0, 0).await), perr(PerpsError::AdlWrongSide));
     assert_eq!(custom_error(adl(&mut base, None, &alice.key(), pa, 0, 11 * CONTRACT).await), perr(PerpsError::InvalidPositionReduction));
     // Settled: deficit mode only
@@ -416,10 +552,20 @@ async fn exposure_adl_stops_at_the_net_target() {
     // Net may fall to the target and no further
     let max_x = ((v.net_notional - target) * 1_000_000 / usd(75.1) as u128) as u64;
     assert_eq!(custom_error(adl(&mut base, Some(&admin), &alice.key(), pa, 1, max_x + 2 * CONTRACT).await), perr(PerpsError::AdlOvershoot));
-    adl(&mut base, Some(&admin), &alice.key(), pa, 1, max_x - CONTRACT).await.unwrap();
+    let free0 = user(&mut base, &alice.key()).await.collateral_balance;
+    let c0 = position(&mut base, pa).await.collateral;
+    let ins0 = market(&mut base).await.insurance_fund;
+    let ix = adl_ix(&base, &admin.pubkey(), &alice.key(), pa, 1, max_x - CONTRACT);
+    let ev: Vec<perps_core::events::Adl> = send_events(&mut base.ctx, &[ix], &[&admin]).await.unwrap();
     let s = position(&mut base, pa).await;
     assert_eq!(s.size, 13_000 * CONTRACT - (max_x - CONTRACT));
     assert!(s.status == PositionStatus::Open);
+    // Exposure mode charges no close fee (D22): the owner gets C_x + profit
+    assert_eq!((ev.len(), ev[0].fee), (1, 0));
+    assert!(ev[0].profit > 0);
+    let credited = user(&mut base, &alice.key()).await.collateral_balance - free0;
+    assert_eq!(credited, (c0 - s.collateral) + ev[0].profit);
+    assert_eq!(market(&mut base).await.insurance_fund, ins0);
     // The ADL keeper key can run it too, a stranger cannot
     let k = funded_keypair(&mut base).await;
     set_adl_keeper(&mut base, &admin, k.pubkey()).await.unwrap();
@@ -433,7 +579,7 @@ async fn bad_debt_is_written_off_after_a_day_of_session() {
     configure(&mut base, cme_config()).await.unwrap();
     assert_eq!(custom_error(write_off(&mut base).await), perr(PerpsError::AdlNotRequired));
     set_time(&mut base, FRIDAY_NOON).await;
-    patch_pool(&mut base, |p| { p.pending_bad_debt_long = 100 * USDC; p.pending_since = FRIDAY_NOON; }).await;
+    patch_pool(&mut base, |p| { p.pending_bad_debt_long = 100 * USDC; p.pending_since_long = FRIDAY_NOON; }).await;
     // Saturday: only 5 open hours have passed
     set_time(&mut base, SATURDAY).await;
     assert_eq!(custom_error(write_off(&mut base).await), perr(PerpsError::BadDebtNotStale));
@@ -443,7 +589,7 @@ async fn bad_debt_is_written_off_after_a_day_of_session() {
     set_time(&mut base, SUNDAY_OPEN + 19 * HOUR).await;
     write_off(&mut base).await.unwrap();
     let pl = pool(&mut base).await;
-    assert_eq!((pl.pending_bad_debt_long, pl.pending_since, pl.bad_debt_written_off_cum), (0, 0, 100 * USDC));
+    assert_eq!((pl.pending_bad_debt_long, pl.pending_since_long, pl.bad_debt_written_off_cum), (0, 0, 100 * USDC));
 }
 
 // ---------------------------------------------------------------------------
@@ -757,7 +903,7 @@ async fn trading_fits_the_compute_budget() {
     r.unwrap();
 
     // Deficit ADL of bob's winning short
-    patch_pool(&mut base, |p| { p.pending_bad_debt_long = USDC; p.pending_since = 1; }).await;
+    patch_pool(&mut base, |p| { p.pending_bad_debt_long = USDC; p.pending_since_long = 1; }).await;
     let payer = base.ctx.payer.pubkey();
     let a = adl_ix(&base, &payer, &bob.key(), pb, 0, 0);
     let (r, adl_units) = simulate(&mut base.ctx, &[a], &[]).await;
@@ -910,7 +1056,7 @@ async fn bankrupt_positions_share_one_window_cap_and_a_winner_repays_pending() {
     assert_eq!((ev[0].bad_debt_hc, ev[0].solvency_hc), (pending, 0));
     assert_eq!(token_balance(&mut base, bob.tokens).await, 2_250 * USDC + 4_500 * USDC - pending - 11_250_000);
     let pl = pool(&mut base).await;
-    assert_eq!((pl.pending_bad_debt_long, pl.pending_since, pl.bad_debt_recovered_cum), (0, 0, pending));
+    assert_eq!((pl.pending_bad_debt_long, pl.pending_since_long, pl.bad_debt_recovered_cum), (0, 0, pending));
     assert!(!pl.adl_required());
     assert_eq!(pl.open_positions, 0);
 }
@@ -973,6 +1119,7 @@ async fn weekend_force_reduce_stops_at_its_target() {
     let params = PoolParams { weekend_cap_window_secs: DAY as u32, weekend_lp_loss_bps: 1_000, ..neutral() };
     let mut base = base_with(params).await;
     configure(&mut base, cme_config()).await.unwrap();
+    freeze_funding(&mut base).await;
     let admin = base.admin.insecure_clone();
     let alice = trader(&mut base, 100_000 * USDC).await;
     let pa = open(&mut base, &alice, 0, 8_000, 10).await.unwrap(); // $600k on Wednesday
@@ -1012,11 +1159,12 @@ async fn a_withdrawal_request_alone_never_triggers_exposure_adl() {
     adl(&mut base, Some(&admin), &alice.key(), pa, 1, 100 * CONTRACT).await.unwrap();
 }
 
-/// Red-team F27 (§17.2 #14): `pending_since` is debt-weighted, so a large
+/// Red-team F27 (§17.2 #14): `pending_since_long` is debt-weighted, so a large
 /// second deficit restarts the write-off clock almost fully.
 #[tokio::test]
 async fn a_large_second_deficit_restarts_the_write_off_clock() {
     let mut base = base_with(PoolParams { lp_loss_cap_window_bps: 1, ..neutral() }).await;
+    freeze_funding(&mut base).await;
     let alice = trader(&mut base, 1_000 * USDC).await;
     let bob = trader(&mut base, 10_000 * USDC).await;
     let keeper = trader(&mut base, 0).await;
@@ -1026,7 +1174,7 @@ async fn a_large_second_deficit_restarts_the_write_off_clock() {
     let t0 = now(&mut base).await;
     liquidate(&mut base, &keeper, &alice.key(), pa).await.unwrap();
     let first = pool(&mut base).await;
-    assert_eq!(first.pending_since, t0);
+    assert_eq!(first.pending_since_long, t0);
     let p1 = first.pending_bad_debt_long;
     assert!(p1 > 600 * USDC);
     // 20 h later (24/7 market: open seconds are wall seconds) bob's $7,500 deficit lands in the same window
@@ -1036,7 +1184,7 @@ async fn a_large_second_deficit_restarts_the_write_off_clock() {
     let pl = pool(&mut base).await;
     assert_eq!(pl.pending_bad_debt_long, p1 + 7_500 * USDC);
     let since = ((t0 as i128 * p1 as i128 + t1 as i128 * 7_500 * USDC as i128) / (p1 as i128 + 7_500 * USDC as i128)) as i64;
-    assert_eq!(pl.pending_since, since);
+    assert_eq!(pl.pending_since_long, since);
     assert!(since > t1 - 2 * HOUR);
     // A day after the first deficit is not enough
     set_time(&mut base, t0 + DAY).await;
@@ -1141,4 +1289,171 @@ async fn liquidation_worst_cases_fit_the_compute_budget() {
         assert!(full_units < 150_000, "liquidate (stage 1 full) used {} CU", full_units);
         assert!(deficit_units < 150_000, "liquidate (stage 2 deficit) used {} CU", deficit_units);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2
+// ---------------------------------------------------------------------------
+
+/// Review finding (D23 bypass by self-ADL): old opposite pending must not
+/// let a winner self-ADL in the quiet time after a gapped reopen, ahead of
+/// the liquidation of its bankrupt counterparty. $1 of long pending booked
+/// Friday 10:00 ET is 7 open hours old at the Sunday open (floor 0).
+#[tokio::test]
+async fn a_winner_cannot_self_adl_in_the_quiet_time() {
+    let params = PoolParams { profit_close_quiet_secs: 300, lp_loss_cap_window_bps: 1, ..neutral() };
+    let mut base = base_with(params).await;
+    configure(&mut base, cme_config()).await.unwrap();
+    freeze_funding(&mut base).await;
+    let alice = trader(&mut base, 1_000 * USDC).await;
+    let bob = trader(&mut base, 2_000 * USDC).await;
+    let keeper = trader(&mut base, 0).await;
+    let pa = open(&mut base, &alice, 0, 100, 10).await.unwrap();
+    let pb = open(&mut base, &bob, 1, 100, 5).await.unwrap();
+    patch_pool(&mut base, |p| { p.pending_bad_debt_long = USDC; p.pending_since_long = FRIDAY_MORNING; }).await;
+
+    set_time(&mut base, SUNDAY_OPEN + 5).await;
+    set_price(&mut base, 60.0).await;
+    // Bob, the owner, signs a deficit ADL of his own position
+    assert_eq!(custom_error(adl(&mut base, Some(&bob.kp), &bob.key(), pb, 0, 0).await), perr(PerpsError::ProfitCloseQuiet));
+    set_time(&mut base, SUNDAY_OPEN + 299).await;
+    assert_eq!(custom_error(adl(&mut base, Some(&bob.kp), &bob.key(), pb, 0, 0).await), perr(PerpsError::ProfitCloseQuiet));
+    // The keeper books alice's gap deficit meanwhile
+    liquidate(&mut base, &keeper, &alice.key(), pa).await.unwrap();
+    let pending = pool(&mut base).await.pending_bad_debt_long;
+    assert!(pending > 600 * USDC);
+    // The fresh deficit restarts the long side's clock, so the mode-0 floor
+    // is back at the top; bob's close after the quiet time repays it all
+    set_time(&mut base, SUNDAY_OPEN + 300).await;
+    assert_eq!(custom_error(adl(&mut base, Some(&bob.kp), &bob.key(), pb, 0, 0).await), perr(PerpsError::AdlScoreBelowFloor));
+    let ix = close_ix(&base, &bob, pb);
+    let ev: Vec<perps_core::events::PositionClosed> = send_events(&mut base.ctx, &[ix], &[&bob.kp]).await.unwrap();
+    assert_eq!(ev[0].bad_debt_hc, pending);
+    assert!(!pool(&mut base).await.adl_required());
+    assert_buckets(&mut base).await;
+}
+
+/// Mutation findings (§7.2 steps 8 and 10): with traders net long under an
+/// active net trigger, exposure ADL may not close a profitable short (which
+/// raises net), and may not close a long so large that net flips past zero
+/// even though `|net|` stays above the target.
+#[tokio::test]
+async fn exposure_adl_cannot_flip_net_or_close_the_wrong_side() {
+    let mut base = base_with(neutral()).await;
+    let admin = base.admin.insecure_clone();
+    let alice = trader(&mut base, 200_000 * USDC).await;
+    let carol = trader(&mut base, 100_000 * USDC).await;
+    let pa = open(&mut base, &alice, 0, 13_000, 10).await.unwrap();
+    let pc = open(&mut base, &carol, 1, 6_000, 5).await.unwrap();
+    // Net +7,000 ($525k) against a 0.1 × B line and target (≈ $100k)
+    patch_pool(&mut base, |p| { p.params.k_net_bps = 1_000; p.params.hard_net_bps = 1_000; p.params.adl_net_target_bps = 1_000; }).await;
+    // Carol's short is the winner at $74.90, but it is the wrong side
+    set_price(&mut base, 74.9).await;
+    assert_eq!(custom_error(adl(&mut base, Some(&admin), &carol.key(), pc, 1, 0).await), perr(PerpsError::AdlWrongSide));
+    // Alice's long wins at $75.10. 9,000 contracts take net to −2,000
+    // ($150k, above the target) — a flip, so refused
+    set_price(&mut base, 75.1).await;
+    let v = pool_view_at(&mut base, usd(75.1)).await;
+    assert!(v.net_notional > v.b / 10 && v.b / 10 < 150_000 * USDC as u128);
+    assert_eq!(custom_error(adl(&mut base, Some(&admin), &alice.key(), pa, 1, 9_000 * CONTRACT).await), perr(PerpsError::AdlOvershoot));
+    // 6,000 leave $75k, under the target; 5,000 leave $150k on the same side
+    assert_eq!(custom_error(adl(&mut base, Some(&admin), &alice.key(), pa, 1, 6_000 * CONTRACT).await), perr(PerpsError::AdlOvershoot));
+    adl(&mut base, Some(&admin), &alice.key(), pa, 1, 5_000 * CONTRACT).await.unwrap();
+    assert_eq!(pool_view_at(&mut base, usd(75.1)).await.net, 2_000 * CONTRACT as i128);
+}
+
+/// Mutation finding (D28 through `adl`): the instruction touches the peak
+/// before its triggers, so a 20% drawdown against a peak exactly
+/// `DD_WINDOW_SECS` old does not make exposure ADL eligible; one second
+/// younger, it does.
+#[tokio::test]
+async fn exposure_adl_resets_an_expired_peak_first() {
+    let params = PoolParams { dd_adl_bps: 1_500, adl_net_target_bps: 0, ..neutral() };
+    let mut base = base_with(params).await;
+    let admin = base.admin.insecure_clone();
+    let alice = trader(&mut base, 80_000 * USDC).await;
+    let pa = open(&mut base, &alice, 0, 1_000, 10).await.unwrap();
+    set_price(&mut base, 76.0).await;
+    let t = now(&mut base).await;
+    let nps = pool_view_at(&mut base, 76 * USDC).await.nps;
+    let window = perps_core::pool_math::DD_WINDOW_SECS;
+    patch_pool(&mut base, |p| { p.nps_peak = nps / 4 * 5; p.nps_peak_at = t - window; }).await;
+    assert_eq!(custom_error(adl(&mut base, Some(&admin), &alice.key(), pa, 1, 10 * CONTRACT).await), perr(PerpsError::AdlNotRequired));
+    patch_pool(&mut base, |p| { p.nps_peak = nps / 4 * 5; p.nps_peak_at = t - window + 1; }).await;
+    let ix = adl_ix(&base, &admin.pubkey(), &alice.key(), pa, 1, 10 * CONTRACT);
+    let ev: Vec<perps_core::events::Adl> = send_events(&mut base.ctx, &[ix], &[&admin]).await.unwrap();
+    assert_eq!(ev[0].triggers, perps_core::pool_math::TRIGGER_DRAWDOWN);
+}
+
+/// Review finding (retroactive wall clock, D35): pending booked Fri 15:00 ET
+/// has 2 open hours of age at the weekly close. A Sunday-noon settlement
+/// does not make it writable at once (wall time since booking is 45 h); it
+/// needs 22 more hours after settlement.
+#[tokio::test]
+async fn settlement_does_not_age_pending_debt_retroactively() {
+    let mut base = base_with(PoolParams { lp_loss_cap_window_bps: 1, ..neutral() }).await;
+    configure(&mut base, cme_config()).await.unwrap();
+    freeze_funding(&mut base).await;
+    let alice = trader(&mut base, 1_000 * USDC).await;
+    let bob = trader(&mut base, 2_000 * USDC).await;
+    let keeper = trader(&mut base, 0).await;
+    let pa = open(&mut base, &alice, 0, 100, 10).await.unwrap();
+    let _pb = open(&mut base, &bob, 1, 100, 5).await.unwrap();
+    let booked = FRIDAY_CLOSE - 2 * HOUR;
+    set_time(&mut base, booked).await;
+    set_price(&mut base, 60.0).await;
+    liquidate(&mut base, &keeper, &alice.key(), pa).await.unwrap();
+    assert_eq!(pool(&mut base).await.pending_since_long, booked);
+    let at = SUNDAY_OPEN - 6 * HOUR;
+    set_time(&mut base, at).await;
+    settle(&mut base, 60 * USDC).await.unwrap();
+    assert_eq!(market(&mut base).await.settled_at, at);
+    assert_eq!(custom_error(write_off(&mut base).await), perr(PerpsError::BadDebtNotStale));
+    set_time(&mut base, at + 22 * HOUR - 1).await;
+    assert_eq!(custom_error(write_off(&mut base).await), perr(PerpsError::BadDebtNotStale));
+    set_time(&mut base, at + 22 * HOUR).await;
+    write_off(&mut base).await.unwrap();
+    assert!(!pool(&mut base).await.adl_required());
+}
+
+/// Review finding (funding catch-up captured or escaped, D40): opens and
+/// closes charge the funding that is due before they set or settle a
+/// position's basis. After 5 uncranked hours with longs dominant, a new
+/// short is not credited for them and the long that held through them pays
+/// them on its close.
+#[tokio::test]
+async fn opens_and_closes_crank_due_funding_first() {
+    let mut base = base_with(neutral()).await;
+    let alice = trader(&mut base, 10_000 * USDC).await;
+    let bob = trader(&mut base, 10_000 * USDC).await;
+    let pa = open(&mut base, &alice, 0, 100, 5).await.unwrap();
+    let m0 = market(&mut base).await;
+    let t0 = now(&mut base).await;
+    assert_eq!(m0.last_funding_time, t0);
+    set_time(&mut base, t0 + 5 * HOUR).await;
+    set_price(&mut base, 75.0).await;
+    // Bob's open charges the 5 periods first, at the long-only rate
+    let pb = open(&mut base, &bob, 1, 50, 5).await.unwrap();
+    let m1 = market(&mut base).await;
+    let step = m1.cumulative_funding - m0.cumulative_funding;
+    assert!(step > 0 && step % 5 == 0);
+    assert_eq!(m1.last_funding_time, t0 + 5 * HOUR);
+    let b = position(&mut base, pb).await;
+    assert_eq!(b.last_funding_payment, m1.cumulative_funding);
+    assert_eq!(b.accrued_funding(m1.cumulative_funding), 0);
+    // Nothing is left for a crank to charge
+    assert_eq!(custom_error(update_funding(&mut base).await), perr(PerpsError::FundingNotDue));
+    // 3 more uncranked hours (longs still dominant): alice's close charges
+    // them first, so it settles all 8 periods she held through
+    set_time(&mut base, t0 + 8 * HOUR).await;
+    set_price(&mut base, 75.0).await;
+    let tokens = token_balance(&mut base, alice.tokens).await;
+    let ix = close_ix(&base, &alice, pa);
+    let ev: Vec<perps_core::events::PositionClosed> = send_events(&mut base.ctx, &[ix], &[&alice.kp]).await.unwrap();
+    let m2 = market(&mut base).await;
+    assert!(m2.cumulative_funding > m1.cumulative_funding);
+    assert_eq!(m2.last_funding_time, t0 + 8 * HOUR);
+    assert_eq!(ev[0].funding, -(100 * (m2.cumulative_funding - m0.cumulative_funding)));
+    assert!(token_balance(&mut base, alice.tokens).await > tokens);
+    assert_buckets(&mut base).await;
 }

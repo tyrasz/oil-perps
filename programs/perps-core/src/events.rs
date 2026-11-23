@@ -68,7 +68,8 @@ pub struct BadDebt {
     pub pending_added: u64,
     pub pending_long: u64,
     pub pending_short: u64,
-    pub pending_since: i64,
+    pub pending_since_long: i64,
+    pub pending_since_short: i64,
     pub window_lp_absorbed: u64,
     pub window_ins_paid: u64,
 }
@@ -99,6 +100,8 @@ pub struct Adl {
     pub net_after: i128,
     pub cash_after: u64,
     pub b: u128,
+    /// Mode 0: the close fee collected from the slice (D22); mode 1: 0.
+    pub fee: u64,
 }
 
 #[event]

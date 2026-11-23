@@ -35,6 +35,7 @@ pub fn handler(ctx: Context<SettleMarket>, settlement_price: u64) -> Result<()> 
     require!(settlement_price > 0, PerpsError::InvalidOraclePrice);
 
     market.settlement_price = settlement_price;
+    market.settled_at = Clock::get()?.unix_timestamp;
     market.is_paused = true;
 
     msg!("Market settled at {}", settlement_price);

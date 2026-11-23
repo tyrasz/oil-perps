@@ -7,6 +7,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use crate::errors::PerpsError;
+use crate::instructions::update_funding::crank_funding;
 use crate::events::PositionLiquidated;
 use crate::oracle::read_price;
 use crate::pool_math;
@@ -369,6 +370,8 @@ pub fn handler(ctx: Context<Liquidate>) -> Result<()> {
     require!(!a.market.is_settled(), PerpsError::MarketSettled);
     require!(a.market.is_in_session(current_time), PerpsError::MarketClosed);
     let oracle_price = read_price(&a.pyth_price_feed, &a.market, current_time)?;
+    // Funding due is charged first (D40)
+    crank_funding(&mut a.market, oracle_price, current_time);
 
     let insurance_before = a.market.insurance_fund;
     let o = liquidate_position(&mut a.market, &mut a.lp_pool, &mut a.position, &mut a.user_account, position_key, oracle_price, current_time)?;
@@ -646,7 +649,7 @@ mod tests {
         assert_eq!(pool.lp_absorbed_window, pool_math::lp_window_cap(pool.loss_window_nav, 1, 0));
         assert_eq!(pool.pending_bad_debt_long, 375 * C6 + 27_875_000 - pool.lp_absorbed_window);
         assert!(pool.adl_required());
-        assert_eq!(pool.pending_since, 1);
+        assert_eq!(pool.pending_since_long, 1);
     }
 
     #[test]
@@ -690,4 +693,68 @@ mod tests {
         assert!((rest - (e - o.penalty as i128)).abs() <= 1, "{} vs {}", rest, e - o.penalty as i128);
     }
 
+    /// Mutation finding: the insurance window cap and its counter also bind
+    /// the keeper top-up of a solvent stage 2 (`0 ≤ E < target`). Long 100
+    /// @ $75 with $401 at $71: E = $1 against a $3.75 target.
+    #[test]
+    fn solvent_stage2_top_up_is_capped_and_counted_per_window() {
+        let params = PoolParams { insurance_claim_cap_per_window: 2 * C6, ..PoolParams::neutral() };
+        let (mut m, mut pool, mut user) = (market(), pool_with(1_000_000 * C6, params), UserAccount::default());
+        m.insurance_fund = 50 * C6;
+        let mut p = open(&mut m, &mut pool, &mut user, Side::Long, 100 * C6, 75 * C6, 401 * C6);
+        let o = liq(&mut m, &mut pool, &mut user, &mut p, 71 * C6).unwrap();
+        // $1 from the collateral, then min($2.75, $50, the $2 cap)
+        assert_eq!((o.stage, o.deficit, o.keeper_reward), (2, 0, 3 * C6));
+        assert_eq!((m.insurance_fund, pool.ins_paid_window), (48 * C6, 2 * C6));
+        // A second one in the same window finds no insurance room left
+        let mut q = open(&mut m, &mut pool, &mut user, Side::Long, 100 * C6, 75 * C6, 401 * C6);
+        let o = liq(&mut m, &mut pool, &mut user, &mut q, 71 * C6).unwrap();
+        assert_eq!((o.stage, o.keeper_reward), (2, C6));
+        assert_eq!((m.insurance_fund, pool.ins_paid_window), (48 * C6, 2 * C6));
+    }
+
+    /// Mutation finding (F21): a profitable partial stage-1 slice never
+    /// reverts on pool cash; the part cash cannot pay is cut (`cash_hc`).
+    /// Long 100 @ $75 with $200 at $76: E = $300 (3.9% < 5% MM, above the
+    /// 3.33% backstop line); its matched short keeps U at 0; cash is $10.
+    #[test]
+    fn profitable_partial_stage1_never_reverts_on_cash() {
+        let (mut m, mut pool, mut user) = (market(), pool_with(10 * C6, stage1_params()), UserAccount::default());
+        let mut p = open(&mut m, &mut pool, &mut user, Side::Long, 100 * C6, 75 * C6, 200 * C6);
+        let _short = open(&mut m, &mut pool, &mut user, Side::Short, 100 * C6, 75 * C6, 7_500 * C6);
+        let o = liq(&mut m, &mut pool, &mut user, &mut p, 76 * C6).unwrap();
+        assert_eq!(o.stage, 1);
+        assert!(o.size_remaining > 0 && p.status == PositionStatus::Open);
+        // The slice earned $1 a contract; cash paid its $10 and the rest was cut
+        assert_eq!(o.cash_hc, o.size_closed - 10 * C6);
+        assert_eq!(pool.cash, 0);
+    }
+
+    /// Mutation findings: `liquidate_position` touches the drawdown peak
+    /// (§2.2), and equity exactly on the backstop line, `floor(MMR ·
+    /// backstop_bps / 1e4)` = 333 bps of $7,000, is stage 1 (`≥`).
+    #[test]
+    fn backstop_line_is_inclusive_and_liquidation_touches_the_peak() {
+        let (mut m, mut pool, mut user) = (market(), pool_with(1_000_000 * C6, stage1_params()), UserAccount::default());
+        // E = $733.10 − $500 = $233.10 = 333 bps of $7,000 at $70
+        let mut p = open(&mut m, &mut pool, &mut user, Side::Long, 100 * C6, 75 * C6, 733_100_000);
+        pool.nps_peak = 1;
+        let o = liq(&mut m, &mut pool, &mut user, &mut p, 70 * C6).unwrap();
+        assert_eq!(o.stage, 1);
+        assert!(pool.nps_peak > 1);
+        assert_eq!(pool.nps_peak_at, 1);
+        // One unit less is stage 2
+        let mut q = open(&mut m, &mut pool, &mut user, Side::Long, 100 * C6, 75 * C6, 733_099_999);
+        assert_eq!(liq(&mut m, &mut pool, &mut user, &mut q, 70 * C6).unwrap().stage, 2);
+    }
+
+    /// Mutation finding (D21 rounding against the actor): the minimum slice
+    /// is a ceiling. 20% of 7,000,003 units is 1,400,000.6 → 1,400,001.
+    #[test]
+    fn stage1_minimum_slice_rounds_up() {
+        let size = 7 * C6 + 3;
+        let mark = 75 * C6;
+        let e = pool_math::notional_floor(size, mark) as i128; // well above IM: x_need ≤ 0
+        assert_eq!(stage1_slice(size, mark, e, 1_000, 200, 2_000, 0), 1_400_001);
+    }
 }

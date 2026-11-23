@@ -1099,7 +1099,7 @@ async fn deficit_adl_of_one_leg_of_a_self_cross_is_capped() {
     let lp_pool = env.base.lp_pool;
     patch::<perps_core::state::LpPool>(&mut env.base, lp_pool, |p| {
         p.pending_bad_debt_long = USDC;
-        p.pending_since = t;
+        p.pending_since_long = t;
     })
     .await;
     set_time(&mut env.base, t + perps_core::state::ADL_FLOOR_DECAY_SECS).await;

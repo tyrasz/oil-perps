@@ -204,7 +204,7 @@ async fn pending_bad_debt_and_insolvency_block_deposits_until_a_donation() {
     // Bad debt booked on the long side (as liquidate will)
     patch_pool(&mut base, |p| {
         p.pending_bad_debt_long = 30 * USDC;
-        p.pending_since = t;
+        p.pending_since_long = t;
     })
     .await;
     assert_eq!(custom_error(lp_deposit(&mut base, &l2, 100 * USDC, 0).await), perr(PerpsError::PoolAdlPending));
@@ -217,7 +217,7 @@ async fn pending_bad_debt_and_insolvency_block_deposits_until_a_donation() {
     donate(&mut base, &donor, donor_tokens, 100 * USDC).await.unwrap();
     let p = pool(&mut base).await;
     assert!(!p.adl_required());
-    assert_eq!((p.pending_since, p.bad_debt_recovered_cum, p.donated_cum), (0, 30 * USDC, 100 * USDC));
+    assert_eq!((p.pending_since_long, p.bad_debt_recovered_cum, p.donated_cum), (0, 30 * USDC, 100 * USDC));
     // The rest vests (over max(withdrawal_delay_secs, 1) = 1 s)
     assert_eq!((p.vest_amount, p.vest_start, p.vest_end), (70 * USDC, t, t + 1));
     assert_eq!(p.cash, LP_SEED + 100 * USDC);
@@ -325,6 +325,30 @@ async fn matured_requests_lapse_after_the_claim_window_in_open_seconds() {
     send_current(&mut base, w, &b.kp).await.unwrap();
     assert!(token_balance(&mut base, b.tokens).await > 0);
     assert_eq!(perps_core::session::open_seconds_between(1, unlock, unlock + 25 * HOUR), DAY);
+}
+
+/// Review finding (D38): a request keeps the claim window in force when it
+/// was made, but a later apply that widens `W` or `Q` (patched here) extends
+/// it to `W + 5·Q + 1 day`, so the request cannot lapse inside time the new
+/// gates close.
+#[tokio::test]
+async fn wider_gates_extend_a_stored_claim_window() {
+    let p = PoolParams { withdrawal_delay_secs: DAY as u32, withdrawal_claim_window_secs: DAY as u32, ..PoolParams::neutral() };
+    let mut base = base_with(p).await;
+    configure(&mut base, cme_config()).await.unwrap();
+    let b = deposited_lp(&mut base, 1_000 * USDC).await;
+    let sb = lp_position(&mut base, &b).await.shares;
+    set_time(&mut base, THURSDAY_NOON).await;
+    let req = lp_request_ix(&base, &b, sb);
+    send_current(&mut base, req, &b.kp).await.unwrap();
+    assert_eq!(lp_position(&mut base, &b).await.claim_window_secs, DAY as u32);
+    // One open second past the stored day (as in the lapse test above)
+    let monday_1pm = FRIDAY_CLOSE + 68 * HOUR;
+    set_time(&mut base, monday_1pm + 1).await;
+    patch_pool(&mut base, |p| p.params.weekend_cap_window_secs = HOUR as u32).await;
+    let w = lp_withdraw_ix(&base, &b);
+    send_current(&mut base, w, &b.kp).await.unwrap();
+    assert!(token_balance(&mut base, b.tokens).await > 0);
 }
 
 #[tokio::test]
@@ -462,13 +486,13 @@ async fn sweep_recovers_pending_then_vests_the_excess() {
     let t = now(&mut base).await;
     patch_pool(&mut base, |p| {
         p.pending_bad_debt_long = 50 * USDC;
-        p.pending_since = t - 10;
+        p.pending_since_long = t - 10;
     })
     .await;
     sweep(&mut base).await.unwrap();
     assert_eq!(market(&mut base).await.insurance_fund, 100 * USDC);
     let pl = pool(&mut base).await;
-    assert_eq!((pl.cash, pl.pending_bad_debt_long, pl.pending_since, pl.bad_debt_recovered_cum), (LP_SEED + 200 * USDC, 0, 0, 50 * USDC));
+    assert_eq!((pl.cash, pl.pending_bad_debt_long, pl.pending_since_long, pl.bad_debt_recovered_cum), (LP_SEED + 200 * USDC, 0, 0, 50 * USDC));
     assert_eq!((pl.vest_amount, pl.vest_start, pl.vest_end), (150 * USDC, t, t + delay as i64));
     assert_eq!(custom_error(sweep(&mut base).await), perr(PerpsError::NothingToSweep));
 
