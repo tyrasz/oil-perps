@@ -17,6 +17,8 @@ jobs:
           toolchain: "1.97.0"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p perps-core -p prop-amm -p vamm -p mm-registry -p orderbook
+      # The simulation's own model and schedule against the spec and the IANA session vectors
+      - run: cargo test -p sim
 
   sbf:
     name: SBF build, end-to-end on SBF, TypeScript suite
@@ -35,6 +37,17 @@ jobs:
       - run: scripts/build-sbf.sh
       # Native tests can't catch SBF-only failures (e.g. the 4 KB stack limit)
       - run: SBF_OUT_DIR=$PWD/target/deploy cargo test -p perps-core -p prop-amm -p mm-registry -p orderbook --test integration
+      # Agent-based simulation (sim/) on the SBF binaries: MMs, retail and a keeper,
+      # seeds 1 and 2 for two simulated days in each scenario. Fails on any invariant
+      # violation or unexpected error; solvency is reported as a finding unless
+      # --strict-solvency (see sim/src/checks.rs). Debug build, as the tests above.
+      - name: Simulation on SBF
+        run: |
+          for scenario in normal stress adversarial; do
+            for seed in 1 2; do
+              SBF_OUT_DIR=$PWD/target/deploy cargo run -p sim -- --scenario $scenario --seed $seed --days 2 --report sim-$scenario-$seed.json
+            done
+          done
       - uses: actions/setup-node@v4
         with:
           node-version: 22

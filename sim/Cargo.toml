@@ -1,0 +1,27 @@
+[package]
+name = "sim"
+version = "0.1.0"
+description = "Agent-based simulation of the OIL perps market: market makers, retail traders and a keeper driving perps-core, mm-registry and orderbook in-process, with invariant checks"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "sim"
+path = "src/main.rs"
+
+[dependencies]
+perps-core = { path = "../programs/perps-core", features = ["cpi"] }
+mm-registry = { path = "../programs/mm-registry", features = ["cpi"] }
+orderbook = { path = "../programs/orderbook", features = ["cpi"] }
+anchor-lang = "0.28.0"
+# What the shared harness (programs/perps-core/tests/support/market_env.rs) needs
+solana-program-test = "~1.16"
+solana-sdk = "~1.16"
+spl-token = { version = "3.5", features = ["no-entrypoint"] }
+pyth-sdk-solana = "0.8"
+bytemuck = "1"
+bincode = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Reproducible runs and the JSON report
+rand = "0.8"
+serde_json = "1"

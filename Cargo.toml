@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "programs/*"
+    "programs/*",
+    # Agent-based simulation driving the programs in-process (test tooling)
+    "sim"
 ]
 # Backend is excluded due to dependency conflicts with Solana versions
 # Build backend separately with: cargo build -p oil-perps-api
