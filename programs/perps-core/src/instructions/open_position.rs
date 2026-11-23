@@ -1,13 +1,21 @@
 use anchor_lang::prelude::*;
-use crate::oracle::read_price;
-use crate::state::{Market, Position, UserAccount, Side, PositionStatus, ExecutionSource};
 use crate::errors::PerpsError;
+use crate::events::PositionOpened;
+use crate::oracle::read_price;
+use crate::pool_math;
+use crate::session;
+use crate::state::{
+    distribute_fee, drawdown_now, pool_add, pool_view, side_u8, skew_price, touch_peak, venue_margin, ExecutionSource,
+    LpPool, Market, Position, PoolView, Side, UserAccount,
+};
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct OpenPositionParams {
     pub side: u8,           // 0 = Long, 1 = Short
     pub size: u64,          // Position size in base units
     pub leverage: u32,      // Leverage (3 decimals: 10x = 10_000)
+    // docs/lp-pool.md §4.4 (appended): worst acceptable execution price; 0 = no bound
+    pub acceptable_price: u64,
 }
 
 #[derive(Accounts)]
@@ -22,7 +30,7 @@ pub struct OpenPosition<'info> {
         bump = user_account.bump,
         constraint = user_account.owner == owner.key()
     )]
-    pub user_account: Account<'info, UserAccount>,
+    pub user_account: Box<Account<'info, UserAccount>>,
 
     #[account(
         mut,
@@ -30,7 +38,7 @@ pub struct OpenPosition<'info> {
         bump = market.bump,
         constraint = !market.is_paused @ PerpsError::MarketPaused
     )]
-    pub market: Account<'info, Market>,
+    pub market: Box<Account<'info, Market>>,
 
     #[account(
         init,
@@ -39,127 +47,201 @@ pub struct OpenPosition<'info> {
         seeds = [b"position", owner.key().as_ref(), market.key().as_ref(), &market.total_positions.to_le_bytes()],
         bump
     )]
-    pub position: Account<'info, Position>,
+    pub position: Box<Account<'info, Position>>,
 
     /// CHECK: Pyth price feed, validated below
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
     pub pyth_price_feed: AccountInfo<'info>,
 
     pub system_program: Program<'info, System>,
+
+    // docs/lp-pool.md §4.4 (account 7): the house is the pool
+    #[account(mut, seeds = [LpPool::SEED, market.key().as_ref()], bump = lp_pool.bump)]
+    pub lp_pool: Box<Account<'info, LpPool>>,
+}
+
+/// What the house quotes for an open: the execution price, the margin to post
+/// and the open fee (§4.4 steps 4–5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HouseQuote {
+    pub exec: u64,
+    pub notional: u64,
+    pub margin: u64,
+    pub fee: u64,
+}
+
+/// `acceptable_price` check: a buy needs `exec ≤ bound`, a sell `exec ≥ bound`;
+/// 0 is no bound.
+pub fn check_acceptable(buy: bool, exec: u64, acceptable_price: u64) -> Result<()> {
+    if acceptable_price != 0 {
+        let ok = if buy { exec <= acceptable_price } else { exec >= acceptable_price };
+        require!(ok, PerpsError::SlippageExceeded);
+    }
+    Ok(())
+}
+
+/// §4.4 steps 4–5: skew execution price, slippage bound, margin and fee.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn house_quote(m: &Market, pool: &LpPool, side: Side, size: u64, leverage: u32, oracle: u64, acceptable_price: u64, now: i64) -> Result<HouseQuote> {
+    let skew = m.long_open_interest as i128 - m.short_open_interest as i128;
+    let delta = match side {
+        Side::Long => size as i128,
+        Side::Short => -(size as i128),
+    };
+    let exec = skew_price(oracle, skew, delta, &pool.params)?;
+    check_acceptable(side == Side::Long, exec, acceptable_price)?;
+    let notional = u64::try_from(size as u128 * exec as u128 / 1_000_000).map_err(|_| error!(PerpsError::MathOverflow))?;
+    require!(notional > 0, PerpsError::PositionTooSmall);
+    let margin = venue_margin(m, side, size, exec, oracle, leverage, now).ok_or(PerpsError::ExcessiveLeverage)?;
+    let fee = u64::try_from(pool_math::ceil_u(notional as u128 * pool.params.open_fee_bps as u128, 10_000))
+        .map_err(|_| error!(PerpsError::MathOverflow))?;
+    Ok(HouseQuote { exec, notional, margin, fee })
+}
+
+/// §4.4 steps 7–8: the pool's caps on a house open, at the oracle. Net-raising
+/// opens must clear the bad-debt and drawdown freezes, the net cap and (in
+/// `W`) the weekend cap, all against `capNAV`; every open must fit the
+/// per-account cap on `opened_notional`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn check_open_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, size: u64, oracle: u64, house_entry_notional: u64, opened_notional: u64, now: i64) -> Result<()> {
+    let p = &pool.params;
+    let after = match side {
+        Side::Long => v.net + size as i128,
+        Side::Short => v.net - size as i128,
+    };
+    if after.unsigned_abs() > v.net.unsigned_abs() {
+        require!(!pool.adl_required(), PerpsError::PoolAdlPending);
+        require!(!pool_math::dd_freeze(drawdown_now(pool, v), p.dd_freeze_bps), PerpsError::PoolDrawdownFreeze);
+        let nn = pool_math::ceil_u(
+            after.unsigned_abs().checked_mul(oracle as u128).ok_or(PerpsError::MathOverflow)?,
+            1_000_000,
+        );
+        require!(pool_math::net_cap_ok(nn, p.k_net_bps, v.cap_nav), PerpsError::PoolExposureLimit);
+        if session::in_pre_close_window(m.session_schedule, now, p.weekend_cap_window_secs) {
+            require!(
+                pool_math::weekend_cap_ok(nn, p.g_bps(m), p.weekend_lp_loss_bps, v.cap_nav),
+                PerpsError::PoolWeekendExposureLimit
+            );
+        }
+    }
+    require!(
+        pool_math::per_account_ok(house_entry_notional, opened_notional, p.per_account_cap_bps, p.k_net_bps, v.cap_nav),
+        PerpsError::AccountExposureLimit
+    );
+    Ok(())
+}
+
+/// §4.4 steps 7–9 on the pool and the user: caps, then the bucket moves
+/// (`−(margin+fee) +margin +fee`), the aggregates and the house notional.
+/// Returns the view the caps were checked on.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn house_open_pool(m: &mut Market, pool: &mut LpPool, user: &mut UserAccount, side: Side, size: u64, oracle: u64, q: &HouseQuote, now: i64) -> Result<PoolView> {
+    let v = pool_view(pool, m, oracle, now, pool.params.redeem_loss_haircut_bps)?;
+    touch_peak(pool, &v, now);
+    check_open_caps(m, pool, &v, side, size, oracle, user.house_entry_notional, q.notional, now)?;
+
+    let total = q.margin.checked_add(q.fee).ok_or(PerpsError::MathOverflow)?;
+    user.collateral_balance = user.collateral_balance.checked_sub(total).ok_or(PerpsError::InsufficientCollateral)?;
+    pool.free_collateral = pool.free_collateral.checked_sub(total).ok_or(PerpsError::BucketUnderflow)?;
+    pool.position_collateral = pool.position_collateral.checked_add(q.margin).ok_or(PerpsError::MathOverflow)?;
+    distribute_fee(m, pool, q.fee)?;
+
+    pool_add(pool, side, size, q.exec, m.cumulative_funding)?;
+    match side {
+        Side::Long => m.long_open_interest = m.long_open_interest.checked_add(size).ok_or(PerpsError::MathOverflow)?,
+        Side::Short => m.short_open_interest = m.short_open_interest.checked_add(size).ok_or(PerpsError::MathOverflow)?,
+    }
+    // opened_notional(size) with opened_price = exec
+    user.house_entry_notional = user.house_entry_notional.checked_add(q.notional).ok_or(PerpsError::MathOverflow)?;
+    Ok(v)
 }
 
 pub fn handler(ctx: Context<OpenPosition>, params: OpenPositionParams) -> Result<()> {
-    let market = &mut ctx.accounts.market;
-    let user_account = &mut ctx.accounts.user_account;
-    let position = &mut ctx.accounts.position;
+    let bump = *ctx.bumps.get("position").unwrap();
+    let a = ctx.accounts;
 
-    // Validate leverage
+    // 1. Validate leverage, session, size and side
     require!(
-        params.leverage > 0 && params.leverage <= market.max_leverage,
+        params.leverage > 0 && params.leverage <= a.market.max_leverage,
         PerpsError::ExcessiveLeverage
     );
-
     let current_time = Clock::get()?.unix_timestamp;
-    require!(!market.is_settled(), PerpsError::MarketSettled);
-    require!(market.is_in_session(current_time), PerpsError::MarketClosed);
-
-    // Validated oracle price (staleness, confidence, floor), 6 decimals
-    let oracle_price = read_price(&ctx.accounts.pyth_price_feed, market, current_time)?;
-
-    // Calculate required collateral
-    // notional = size * price / 1_000_000
-    // required_collateral = notional / leverage (must meet initial margin)
-    let notional = (params.size as u128)
-        .checked_mul(oracle_price as u128)
-        .and_then(|v| v.checked_div(1_000_000))
-        .ok_or(PerpsError::MathOverflow)? as u64;
-
-    let required_collateral = market
-        .required_collateral(notional, params.leverage, current_time)
-        .ok_or(PerpsError::ExcessiveLeverage)?;
-
-    require!(
-        user_account.collateral_balance >= required_collateral,
-        PerpsError::InsufficientCollateral
-    );
-
-    // Parse side
+    require!(!a.market.is_settled(), PerpsError::MarketSettled);
+    require!(a.market.is_in_session(current_time), PerpsError::MarketClosed);
+    require!(params.size > 0, PerpsError::PositionTooSmall);
     let side = match params.side {
         0 => Side::Long,
         1 => Side::Short,
         _ => return Err(PerpsError::InvalidPositionSide.into()),
     };
 
-    // Check OI caps
-    match side {
-        Side::Long => require!(
-            market.can_increase_long_oi(params.size),
-            PerpsError::OpenInterestCapExceeded
-        ),
-        Side::Short => require!(
-            market.can_increase_short_oi(params.size),
-            PerpsError::OpenInterestCapExceeded
-        ),
-    }
+    // 2. Validated oracle price (staleness, confidence, floor), 6 decimals
+    let oracle_price = read_price(&a.pyth_price_feed, &a.market, current_time)?;
 
-    // Deduct collateral from user
-    user_account.collateral_balance = user_account.collateral_balance
-        .checked_sub(required_collateral)
-        .ok_or(PerpsError::MathOverflow)?;
+    // 3. Gross OI cap; no trading before the pool has LPs (D11)
+    let oi_ok = match side {
+        Side::Long => a.market.can_increase_long_oi(params.size),
+        Side::Short => a.market.can_increase_short_oi(params.size),
+    };
+    require!(oi_ok, PerpsError::OpenInterestCapExceeded);
+    require!(a.lp_pool.lp_shares > 0, PerpsError::PoolHasNoLps);
 
-    // Initialize position
-    position.owner = ctx.accounts.owner.key();
-    position.market = market.key();
-    position.side = side;
-    position.size = params.size;
-    position.collateral = required_collateral;
-    position.entry_price = oracle_price;
-    position.leverage = params.leverage;
-    position.realized_pnl = 0;
-    position.last_funding_payment = market.cumulative_funding;
-    position.opened_at = current_time;
-    position.last_updated_at = current_time;
-    position.status = PositionStatus::Open;
-    position.execution_source = ExecutionSource::OrderBook;
-    position.bump = *ctx.bumps.get("position").unwrap();
+    // 4–6. Execution price, margin, fee
+    let q = house_quote(&a.market, &a.lp_pool, side, params.size, params.leverage, oracle_price, params.acceptable_price, current_time)?;
+    require!(
+        a.user_account.collateral_balance >= q.margin.saturating_add(q.fee),
+        PerpsError::InsufficientCollateral
+    );
 
-    // Update market OI
-    match side {
-        Side::Long => {
-            market.long_open_interest = market.long_open_interest
-                .checked_add(params.size)
-                .ok_or(PerpsError::MathOverflow)?;
-        }
-        Side::Short => {
-            market.short_open_interest = market.short_open_interest
-                .checked_add(params.size)
-                .ok_or(PerpsError::MathOverflow)?;
-        }
-    }
+    // 7–9. Pool caps and effects
+    let v = house_open_pool(&mut a.market, &mut a.lp_pool, &mut a.user_account, side, params.size, oracle_price, &q, current_time)?;
 
-    market.total_positions = market.total_positions
-        .checked_add(1)
-        .ok_or(PerpsError::MathOverflow)?;
+    // Initialize position (init_open also sets opened_price = exec, docs/lp-pool.md §1.1)
+    let market_key = a.market.key();
+    a.position.init_open(
+        a.owner.key(),
+        market_key,
+        side,
+        params.size,
+        q.margin,
+        q.exec,
+        params.leverage,
+        a.market.cumulative_funding,
+        current_time,
+        ExecutionSource::OrderBook,
+        bump,
+    );
 
-    market.total_trades = market.total_trades
-        .checked_add(1)
-        .ok_or(PerpsError::MathOverflow)?;
-
-    user_account.total_positions = user_account.total_positions
-        .checked_add(1)
-        .ok_or(PerpsError::MathOverflow)?;
-
-    user_account.total_trades = user_account.total_trades
-        .checked_add(1)
-        .ok_or(PerpsError::MathOverflow)?;
+    let market = &mut a.market;
+    market.total_positions = market.total_positions.checked_add(1).ok_or(PerpsError::MathOverflow)?;
+    market.total_trades = market.total_trades.checked_add(1).ok_or(PerpsError::MathOverflow)?;
+    let user_account = &mut a.user_account;
+    user_account.total_positions = user_account.total_positions.checked_add(1).ok_or(PerpsError::MathOverflow)?;
+    user_account.total_trades = user_account.total_trades.checked_add(1).ok_or(PerpsError::MathOverflow)?;
 
     msg!(
         "Position opened: {} {} @ {} with {}x leverage",
         if side == Side::Long { "LONG" } else { "SHORT" },
         params.size,
-        oracle_price,
+        q.exec,
         params.leverage / 1000
     );
+    let net_after = market.long_open_interest as i128 - market.short_open_interest as i128;
+    emit!(PositionOpened {
+        position: a.position.key(),
+        owner: a.owner.key(),
+        side: side_u8(side),
+        size: params.size,
+        oracle: oracle_price,
+        exec_price: q.exec,
+        collateral: q.margin,
+        open_fee: q.fee,
+        net_after,
+        nav_redeem: v.nav_redeem,
+    });
 
     Ok(())
 }

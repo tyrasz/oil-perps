@@ -319,6 +319,7 @@ fn cpi_venue_fill<'info>(a: &MatchOrders<'info>, taker_is_bid: bool, bump: u8, p
         maker_approval: a.maker_approval.to_account_info(),
         maker_position: a.maker_position.to_account_info(),
         system_program: a.system_program.to_account_info(),
+        lp_pool: a.perps_lp_pool.to_account_info(),
     };
     perps_core::cpi::venue_fill(
         CpiContext::new_with_signer(a.perps_core_program.to_account_info(), accounts, &[seeds]),
@@ -574,6 +575,10 @@ pub struct MatchOrders<'info> {
     /// CHECK: perps-core validates and inits
     #[account(mut)]
     pub maker_position: UncheckedAccount<'info>,
+
+    /// CHECK: perps-core validates (the market's LP pool, venue_fill account 17)
+    #[account(mut)]
+    pub perps_lp_pool: UncheckedAccount<'info>,
 
     pub perps_core_program: Program<'info, perps_core::program::PerpsCore>,
     pub system_program: Program<'info, System>,

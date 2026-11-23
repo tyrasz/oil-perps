@@ -166,7 +166,8 @@ impl Sim {
             checks: CheckBook::new(cfg.strict_solvency),
             metrics: Metrics::default(),
             vault_expected: 0,
-            total_minted: 0,
+            // The harness mints the LP pool seed before any agent exists
+            total_minted: LP_SEED,
             paused: false,
             settled: false,
             was_open: true,
@@ -329,6 +330,7 @@ impl Sim {
         let accounts = perps_core::accounts::DepositCollateral {
             owner: t.key(), user_account: t.user, market: b.market, vault: b.vault,
             vault_token_account: b.vault_token, user_token_account: t.tokens, token_program: spl_token::ID,
+            lp_pool: b.lp_pool,
         };
         ix(perps_core::ID, accounts, perps_core::instruction::DepositCollateral { amount })
     }
@@ -339,6 +341,7 @@ impl Sim {
         let accounts = perps_core::accounts::WithdrawCollateral {
             owner: t.key(), user_account: t.user, market: b.market, vault: b.vault,
             vault_token_account: b.vault_token, user_token_account: t.tokens, token_program: spl_token::ID,
+            lp_pool: b.lp_pool,
         };
         ix(perps_core::ID, accounts, perps_core::instruction::WithdrawCollateral { amount })
     }
@@ -348,7 +351,7 @@ impl Sim {
         let accounts = perps_core::accounts::Liquidate {
             liquidator: self.keeper.key(), position_owner: *owner, user_account: user_pda(owner, &b.market), market: b.market,
             position, vault: b.vault, vault_token_account: b.vault_token, liquidator_token_account: self.keeper.tokens,
-            pyth_price_feed: b.oracle, token_program: spl_token::ID,
+            pyth_price_feed: b.oracle, token_program: spl_token::ID, lp_pool: b.lp_pool,
         };
         ix(perps_core::ID, accounts, perps_core::instruction::Liquidate {})
     }
@@ -400,7 +403,7 @@ impl Sim {
             venue_authority: fa.venue_authority, perps_config: fa.config, perps_venue: fa.venue,
             venue_program_data: fa.venue_program_data, market: fa.market, pyth_price_feed: fa.pyth_price_feed,
             taker_user: fa.taker_user, taker_approval: fa.taker_approval, taker_position: fa.taker_position,
-            mm_user: fa.maker_user, mm_approval: fa.maker_approval, mm_position: fa.maker_position,
+            mm_user: fa.maker_user, mm_approval: fa.maker_approval, mm_position: fa.maker_position, perps_lp_pool: fa.lp_pool,
             perps_core_program: perps_core::ID, system_program: system_program::ID,
         };
         let params = mm_registry::instructions::FillQuoteParams {
@@ -453,6 +456,7 @@ impl Sim {
             maker_user: fa.maker_user,
             maker_approval: fa.maker_approval,
             maker_position: fa.maker_position,
+            perps_lp_pool: fa.lp_pool,
             perps_core_program: perps_core::ID,
             system_program: system_program::ID,
         };

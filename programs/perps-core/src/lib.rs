@@ -1,13 +1,16 @@
 use anchor_lang::prelude::*;
 
 pub mod errors;
+pub mod events;
 pub mod oracle;
+pub mod pool_math;
 pub mod price;
 pub mod session;
 pub mod instructions;
 pub mod state;
 
 use instructions::*;
+use state::PoolParams;
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
@@ -38,8 +41,8 @@ pub mod perps_core {
         instructions::open_position::handler(ctx, params)
     }
 
-    pub fn close_position(ctx: Context<ClosePosition>) -> Result<()> {
-        instructions::close_position::handler(ctx)
+    pub fn close_position(ctx: Context<ClosePosition>, acceptable_price: u64) -> Result<()> {
+        instructions::close_position::handler(ctx, acceptable_price)
     }
 
     pub fn add_margin(ctx: Context<AddMargin>, amount: u64) -> Result<()> {
@@ -136,5 +139,84 @@ pub mod perps_core {
     // CPI from a registered venue only
     pub fn venue_fill(ctx: Context<VenueFill>, params: VenueFillParams) -> Result<()> {
         instructions::venue_fill::handler(ctx, params)
+    }
+
+    // LP pool (docs/lp-pool.md §5, §9, §10). Admin: create the pool and set
+    // its parameters (timelocked once LPs exist), the cap and the ADL keeper.
+    pub fn initialize_pool(ctx: Context<InitializePool>, params: PoolParams, adl_keeper: Pubkey) -> Result<()> {
+        instructions::pool_admin::initialize_pool(ctx, params, adl_keeper)
+    }
+
+    pub fn propose_pool_params(ctx: Context<ProposePoolParams>, params: PoolParams) -> Result<()> {
+        instructions::pool_admin::propose_pool_params(ctx, params)
+    }
+
+    // Anyone, once the timelock has passed
+    pub fn apply_pool_params(ctx: Context<ApplyPoolParams>) -> Result<()> {
+        instructions::pool_admin::apply_pool_params(ctx)
+    }
+
+    pub fn cancel_pool_params(ctx: Context<PoolAdminOnly>) -> Result<()> {
+        instructions::pool_admin::cancel_pool_params(ctx)
+    }
+
+    pub fn set_max_pool_cash(ctx: Context<PoolAdminOnly>, cap: u64) -> Result<()> {
+        instructions::pool_admin::set_max_pool_cash(ctx, cap)
+    }
+
+    pub fn set_adl_keeper(ctx: Context<PoolAdminOnly>, key: Pubkey) -> Result<()> {
+        instructions::pool_admin::set_adl_keeper(ctx, key)
+    }
+
+    pub fn withdraw_treasury(ctx: Context<WithdrawTreasury>, amount: u64) -> Result<()> {
+        instructions::pool_admin::withdraw_treasury(ctx, amount)
+    }
+
+    // LPs
+    pub fn init_lp_position(ctx: Context<InitLpPosition>, class: u8) -> Result<()> {
+        instructions::lp_pool::init_lp_position(ctx, class)
+    }
+
+    pub fn lp_deposit(ctx: Context<LpDeposit>, amount: u64, min_shares_out: u64) -> Result<()> {
+        instructions::lp_pool::lp_deposit(ctx, amount, min_shares_out)
+    }
+
+    pub fn lp_request_withdrawal(ctx: Context<LpRequestWithdrawal>, shares: u64) -> Result<()> {
+        instructions::lp_pool::lp_request_withdrawal(ctx, shares)
+    }
+
+    pub fn lp_cancel_withdrawal(ctx: Context<LpCancelWithdrawal>) -> Result<()> {
+        instructions::lp_pool::lp_cancel_withdrawal(ctx)
+    }
+
+    pub fn lp_withdraw(ctx: Context<LpWithdraw>) -> Result<()> {
+        instructions::lp_pool::lp_withdraw(ctx)
+    }
+
+    // Permissionless
+    pub fn donate_to_pool(ctx: Context<DonateToPool>, amount: u64) -> Result<()> {
+        instructions::lp_pool::donate_to_pool(ctx, amount)
+    }
+
+    pub fn sweep_insurance_excess(ctx: Context<SweepInsuranceExcess>) -> Result<()> {
+        instructions::lp_pool::sweep_insurance_excess(ctx)
+    }
+
+    pub fn close_settled_position(ctx: Context<CloseSettledPosition>) -> Result<()> {
+        instructions::lp_pool::close_settled_position(ctx)
+    }
+
+    // Moves a losing position's unrealized loss into pool cash (D3)
+    pub fn settle_position_pnl(ctx: Context<SettlePositionPnl>) -> Result<()> {
+        instructions::adl::settle_position_pnl(ctx)
+    }
+
+    // Mode 0 (deficit): anyone. Mode 1 (exposure): the ADL keeper or admin.
+    pub fn adl(ctx: Context<AdlPosition>, mode: u8, size: u64) -> Result<()> {
+        instructions::adl::adl(ctx, mode, size)
+    }
+
+    pub fn write_off_bad_debt(ctx: Context<WriteOffBadDebt>) -> Result<()> {
+        instructions::adl::write_off_bad_debt(ctx)
     }
 }

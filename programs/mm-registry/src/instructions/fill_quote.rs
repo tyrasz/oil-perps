@@ -107,6 +107,10 @@ pub struct FillQuote<'info> {
     #[account(mut)]
     pub mm_position: UncheckedAccount<'info>,
 
+    /// CHECK: perps-core validates (the market's LP pool, venue_fill account 17)
+    #[account(mut)]
+    pub perps_lp_pool: UncheckedAccount<'info>,
+
     pub perps_core_program: Program<'info, perps_core::program::PerpsCore>,
     pub system_program: Program<'info, System>,
 }
@@ -227,6 +231,7 @@ fn cpi_venue_fill<'info>(a: &FillQuote<'info>, bump: u8, params: VenueFillParams
         maker_approval: a.mm_approval.to_account_info(),
         maker_position: a.mm_position.to_account_info(),
         system_program: a.system_program.to_account_info(),
+        lp_pool: a.perps_lp_pool.to_account_info(),
     };
     perps_core::cpi::venue_fill(
         CpiContext::new_with_signer(a.perps_core_program.to_account_info(), accounts, &[seeds]),

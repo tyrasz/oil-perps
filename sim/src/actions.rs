@@ -148,7 +148,7 @@ impl Sim {
         let before: Position = load(self.chain.base(), address).await;
         let predicted = predict::add_margin(free, amount);
         let t = &self.agents[owner].t;
-        let accounts = perps_core::accounts::AddMargin { owner: t.key(), user_account: t.user, market: self.chain.base.market, position: address };
+        let accounts = perps_core::accounts::AddMargin { owner: t.key(), user_account: t.user, market: self.chain.base.market, position: address, lp_pool: self.chain.base.lp_pool };
         let ix = ix(perps_core::ID, accounts, perps_core::instruction::AddMargin { amount });
         let kp = t.kp.insecure_clone();
         if self.run(label, &[ix], &[&kp], predicted).await.is_err() {

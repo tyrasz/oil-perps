@@ -47,7 +47,7 @@ const MARKET_CONFIGS: Record<string, {
     takerFee: 50, // 0.5% (basis points)
     makerFee: 20, // 0.2% (basis points)
     liquidationFee: 100, // 1% of maintenance margin (basis points)
-    maxOpenInterest: 10_000_000_000_000, // 10M USDC (6 decimals)
+    maxOpenInterest: 10_000_000_000_000, // 10M contracts per side (6 decimals; D6)
     fundingInterval: 3600, // 1 hour
   },
   GOLD: {

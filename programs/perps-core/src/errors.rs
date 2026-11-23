@@ -156,4 +156,128 @@ pub enum PerpsError {
 
     #[msg("Venue approvals can only be written by a top-level instruction")]
     ApprovalViaCpi,
+
+    // LP pool (docs/lp-pool.md §12). Appended in order; existing codes do not move.
+    #[msg("Invalid LP pool parameters")]
+    InvalidPoolParams,
+
+    #[msg("Market or pool is not fresh")]
+    MarketNotFresh,
+
+    #[msg("Trade would take the pool's net exposure past its cap")]
+    PoolExposureLimit,
+
+    #[msg("Trade would take the pool's net exposure past its weekend cap")]
+    PoolWeekendExposureLimit,
+
+    #[msg("Trade would take this account's house notional past its cap")]
+    AccountExposureLimit,
+
+    #[msg("Pool has pending bad debt awaiting ADL")]
+    PoolAdlPending,
+
+    #[msg("Pool cash cannot cover this payout yet")]
+    PoolCashInsufficient,
+
+    #[msg("LP withdrawals are blocked by the pool drawdown")]
+    PoolWithdrawalsBlocked,
+
+    #[msg("Withdrawal would leave net exposure beyond the pool's hard line")]
+    PoolCapWouldBreach,
+
+    #[msg("Deposit would exceed the pool's capital cap")]
+    PoolCashCapExceeded,
+
+    #[msg("Pool NAV is not positive")]
+    PoolInsolvent,
+
+    #[msg("Pool has no LP capital yet")]
+    PoolHasNoLps,
+
+    #[msg("Price or shares are worse than the acceptable limit")]
+    SlippageExceeded,
+
+    #[msg("Invalid LP amount")]
+    InvalidLpAmount,
+
+    #[msg("Invalid LP share class")]
+    InvalidLpClass,
+
+    #[msg("Not enough free LP shares")]
+    InsufficientShares,
+
+    #[msg("A withdrawal request is already pending")]
+    WithdrawalPending,
+
+    #[msg("No withdrawal request is pending")]
+    NoWithdrawalPending,
+
+    #[msg("Withdrawal delay has not elapsed")]
+    WithdrawalDelayNotElapsed,
+
+    #[msg("No insurance excess to sweep")]
+    NothingToSweep,
+
+    #[msg("Amount exceeds the treasury")]
+    InsufficientTreasury,
+
+    #[msg("Position has no unrealized loss to settle")]
+    NothingToSettle,
+
+    #[msg("Settling would exhaust the position's collateral; liquidate instead")]
+    SettleWouldBankrupt,
+
+    #[msg("Invalid ADL mode")]
+    InvalidAdlMode,
+
+    #[msg("Only the ADL keeper or admin may run exposure ADL")]
+    AdlUnauthorized,
+
+    #[msg("ADL is not required")]
+    AdlNotRequired,
+
+    #[msg("Position is on the wrong side for this ADL")]
+    AdlWrongSide,
+
+    #[msg("ADL candidate is not profitable")]
+    AdlCandidateNotProfitable,
+
+    #[msg("ADL candidate's score is below the floor")]
+    AdlScoreBelowFloor,
+
+    #[msg("ADL would reduce net exposure past its target")]
+    AdlOvershoot,
+
+    #[msg("Pending bad debt is not old enough to write off")]
+    BadDebtNotStale,
+
+    #[msg("Funding is not due yet")]
+    FundingNotDue,
+
+    #[msg("Pool parameter change is still timelocked")]
+    ParamsTimelocked,
+
+    #[msg("No pool parameter change is pending")]
+    NoPendingParams,
+
+    #[msg("Pool bucket would go negative")]
+    BucketUnderflow,
+
+    #[msg("Vault balance does not cover the pool buckets")]
+    VaultInvariantViolated,
+
+    #[msg("Pool drawdown freezes net-raising opens")]
+    PoolDrawdownFreeze,
+
+    #[msg("LP flows are closed in this window")]
+    LpFlowWindowClosed,
+
+    #[msg("Funding must be cranked first")]
+    FundingStale,
+
+    #[msg("Withdrawal request has lapsed; cancel and request again")]
+    WithdrawalExpired,
+
+    #[msg("Market is not settled")]
+    MarketNotSettled,
 }

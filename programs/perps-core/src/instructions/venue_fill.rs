@@ -2,8 +2,8 @@ use anchor_lang::prelude::*;
 use crate::errors::PerpsError;
 use crate::oracle::read_price_max_age;
 use crate::state::{
-    venue_margin, within_adverse_bound, within_band, ExecutionSource, Market, Position, ProtocolConfig, Side,
-    UserAccount, Venue, VenueApproval, ROLE_MAKER, ROLE_TAKER, SIDE_LONG, SIDE_SHORT,
+    pool_add, venue_margin, within_adverse_bound, within_band, ExecutionSource, LpPool, Market, Position, ProtocolConfig,
+    Side, UserAccount, Venue, VenueApproval, ROLE_MAKER, ROLE_TAKER, SIDE_LONG, SIDE_SHORT,
 };
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
@@ -127,6 +127,10 @@ pub struct VenueFill<'info> {
     pub maker_position: Box<Account<'info, Position>>,
 
     pub system_program: Program<'info, System>,
+
+    // docs/lp-pool.md §4.8 (account 17)
+    #[account(mut, seeds = [LpPool::SEED, market.key().as_ref()], bump = lp_pool.bump)]
+    pub lp_pool: Box<Account<'info, LpPool>>,
 }
 
 /// Positions are one per fill, so this is the trade tape.
@@ -153,6 +157,8 @@ pub fn handler(ctx: Context<VenueFill>, params: VenueFillParams) -> Result<()> {
     let a = ctx.accounts;
     let now = Clock::get()?.unix_timestamp;
 
+    // No trading before the pool has LPs (D11)
+    require!(a.lp_pool.lp_shares > 0, PerpsError::PoolHasNoLps);
     require!(!a.market.is_settled(), PerpsError::MarketSettled);
     require!(a.market.is_in_session(now), PerpsError::MarketClosed);
     require!(params.size > 0 && params.price > 0, PerpsError::InvalidFillParams);
@@ -189,6 +195,7 @@ pub fn handler(ctx: Context<VenueFill>, params: VenueFillParams) -> Result<()> {
 
     let market_key = a.market.key();
     let funding = a.market.cumulative_funding;
+    pool_fill(&mut a.lp_pool, taker_side, params.size, params.price, funding, taker_collateral, maker_collateral)?;
     a.taker_position.init_open(
         a.taker.key(), market_key, taker_side, params.size, taker_collateral, params.price,
         params.taker_leverage, funding, now, ExecutionSource::Venue, taker_bump,
@@ -237,6 +244,21 @@ pub fn handler(ctx: Context<VenueFill>, params: VenueFillParams) -> Result<()> {
     Ok(())
 }
 
+/// §4.8: both legs' margin moves from free to position collateral
+/// (`−(tc+mc) +(tc+mc)`), and both legs join the aggregates (net unchanged).
+#[inline(never)]
+fn pool_fill(pool: &mut LpPool, taker_side: Side, size: u64, price: u64, funding: i64, tc: u64, mc: u64) -> Result<()> {
+    let both = tc.checked_add(mc).ok_or(PerpsError::MathOverflow)?;
+    pool.free_collateral = pool.free_collateral.checked_sub(both).ok_or(PerpsError::BucketUnderflow)?;
+    pool.position_collateral = pool.position_collateral.checked_add(both).ok_or(PerpsError::MathOverflow)?;
+    let maker_side = match taker_side {
+        Side::Long => Side::Short,
+        Side::Short => Side::Long,
+    };
+    pool_add(pool, taker_side, size, price, funding)?;
+    pool_add(pool, maker_side, size, price, funding)
+}
+
 /// Check one side against its approval and the market, then move its margin
 /// out of free collateral. Returns the collateral posted.
 #[inline(never)]
@@ -279,4 +301,36 @@ fn take_margin(
     approval.fills = approval.fills.checked_add(1).ok_or(PerpsError::MathOverflow)?;
     approval.collateral_committed = approval.collateral_committed.saturating_add(collateral);
     Ok(collateral)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{bucket_total, pool_view, PoolParams};
+
+    /// §17.1 #12: a venue fill is `−(tc+mc) +(tc+mc)`, and the matched pair
+    /// adds nothing to U at any mark (§2.3).
+    #[test]
+    fn pool_fill_is_zero_sum_and_matched() {
+        let m = Market { long_open_interest: 0, short_open_interest: 0, ..Default::default() };
+        let mut pool = LpPool { free_collateral: 5_000_000_000, cash: 1_000_000_000_000, lp_shares: 1_000_000_000_000, params: PoolParams::neutral(), ..Default::default() };
+        let before = bucket_total(&pool, &m);
+        for (side, size, price, f) in [(Side::Long, 100_000_000, 75_030_000, 0i64), (Side::Short, 7_777_777, 74_700_001, -12_345)] {
+            pool_fill(&mut pool, side, size, price, f, 753_300_000, 750_300_000).unwrap();
+            assert_eq!(bucket_total(&pool, &m), before);
+        }
+        assert_eq!(pool.open_positions, 4);
+        assert_eq!((pool.long_entry_sum, pool.long_funding_sum), (pool.short_entry_sum, pool.short_funding_sum));
+        let mut m = m;
+        m.long_open_interest = 107_777_777;
+        m.short_open_interest = 107_777_777;
+        m.cumulative_funding = 99_999;
+        for mark in [1, 60_000_000, 75_000_000, 1_000_000_000] {
+            assert_eq!(pool_view(&pool, &m, mark, 0, 5_000).unwrap().u, 0);
+        }
+        // Not enough free collateral: refused, nothing moves
+        let snapshot = (pool.free_collateral, pool.position_collateral, pool.open_positions);
+        assert_eq!(pool_fill(&mut pool, Side::Long, 1, 1, 0, u64::MAX / 2, 1).unwrap_err(), PerpsError::BucketUnderflow.into());
+        assert_eq!((pool.free_collateral, pool.position_collateral, pool.open_positions), snapshot);
+    }
 }

@@ -48,6 +48,10 @@ pub struct Position {
     pub status: PositionStatus,
     pub execution_source: ExecutionSource,
     pub bump: u8,
+
+    // docs/lp-pool.md §1.1 (appended). Set by `init_open`, never changed:
+    // `entry_price` is the PnL basis and settle_position_pnl resets it.
+    pub opened_price: u64,
 }
 
 impl Position {
@@ -66,7 +70,8 @@ impl Position {
         1 +   // status
         1 +   // execution_source
         1 +   // bump
-        32;   // padding
+        8 +   // opened_price
+        24;   // padding
 
     /// Set every field of a freshly created open position.
     #[allow(clippy::too_many_arguments)]
@@ -98,6 +103,20 @@ impl Position {
         self.status = PositionStatus::Open;
         self.execution_source = execution_source;
         self.bump = bump;
+        self.opened_price = entry_price;
+    }
+
+    /// `floor(size·opened_price, 1e6)`: the notional this position was opened
+    /// at, for `size` of it (D21). Per-account house notional, the close fee
+    /// and the stage-2 reward use it; removing a slice `x` of `q` removes
+    /// `opened_notional(q) − opened_notional(q − x)` so the sum telescopes.
+    pub fn opened_notional(&self, size: u64) -> u64 {
+        crate::pool_math::notional_floor(size, self.opened_price)
+    }
+
+    /// `C + pnl(mark) + accrued_funding(F)`, exact in i128 (§6.1).
+    pub fn equity(&self, mark: u64, cumulative_funding: i64) -> i128 {
+        self.collateral as i128 + self.unrealized_pnl(mark) as i128 + self.accrued_funding(cumulative_funding) as i128
     }
 
     pub fn notional_value(&self) -> u64 {
@@ -161,13 +180,38 @@ impl Position {
         ratio.min(u32::MAX as u128) as u32
     }
 
+    /// `floor(size·mark, 1e6)` (u128): the mark notional liquidation uses (§6.1).
+    pub fn mark_notional(&self, mark: u64) -> u128 {
+        self.size as u128 * mark as u128 / 1_000_000
+    }
+
+    /// Equity as a share of **mark** notional, in bps (display, §6.1).
+    /// `margin_ratio` keeps entry notional (the venue backstop and the UI).
+    pub fn margin_ratio_mark(&self, mark: u64, accrued_funding: i64) -> u32 {
+        let equity = self.collateral as i128 + self.unrealized_pnl(mark) as i128 + accrued_funding as i128;
+        let n = self.mark_notional(mark);
+        if equity <= 0 || n == 0 {
+            return 0;
+        }
+        (equity as u128 * 10_000 / n).min(u32::MAX as u128) as u32
+    }
+
+    /// Liquidatable on mark notional (§6.1): `equity·10_000 < mmr·N_mark`,
+    /// with `N_mark = floor(size·mark, 1e6)`; with `N_mark == 0` only when
+    /// equity is negative.
     pub fn is_liquidatable(
         &self,
         current_price: u64,
         accrued_funding: i64,
         maintenance_margin_ratio: u32,
     ) -> bool {
-        self.margin_ratio(current_price, accrued_funding) < maintenance_margin_ratio
+        let equity = self.collateral as i128 + self.unrealized_pnl(current_price) as i128 + accrued_funding as i128;
+        let n = self.mark_notional(current_price);
+        if n == 0 {
+            return equity < 0;
+        }
+        // |equity| < 2^65 and n·mmr < 2^64·2^32, so neither side overflows
+        equity * 10_000 < (maintenance_margin_ratio as u128 * n) as i128
     }
 }
 
@@ -180,10 +224,13 @@ pub struct UserAccount {
     pub total_trades: u64,
     pub realized_pnl: i64,
     pub bump: u8,
+    // docs/lp-pool.md §1.1 (appended): Σ opened_notional of this user's open
+    // ExecutionSource::OrderBook positions (per-account cap, D21).
+    pub house_entry_notional: u64,
 }
 
 impl UserAccount {
-    pub const LEN: usize = 8 + 32 + 8 + 4 + 8 + 8 + 1 + 16;
+    pub const LEN: usize = 8 + 32 + 8 + 4 + 8 + 8 + 1 + 8 + 8;
 }
 
 #[cfg(test)]
@@ -251,9 +298,68 @@ mod tests {
     fn account_sizes_are_pinned() {
         assert_eq!(Position::LEN, 168);
         let serialized = Position::default().try_to_vec().unwrap().len();
-        assert_eq!(8 + serialized + 32, Position::LEN);
+        assert_eq!(8 + serialized + 24, Position::LEN);
         assert_eq!(ExecutionSource::Venue.try_to_vec().unwrap(), vec![2]);
         assert_eq!(UserAccount::LEN, 85);
+        assert_eq!(8 + UserAccount::default().try_to_vec().unwrap().len() + 8, UserAccount::LEN);
+    }
+
+    /// docs/lp-pool.md §1.1: appended fields, existing offsets unchanged.
+    #[test]
+    fn appended_fields_have_pinned_offsets() {
+        use anchor_lang::AccountSerialize;
+        let p = Position { bump: 0xee, opened_price: 0x0102_0304_0506_0708, ..Default::default() };
+        let mut b = Vec::new();
+        p.try_serialize(&mut b).unwrap();
+        assert_eq!(b[135], 0xee);
+        assert_eq!(&b[136..144], &0x0102_0304_0506_0708u64.to_le_bytes());
+        let u = UserAccount { bump: 0xdd, house_entry_notional: 0x1112_1314_1516_1718, ..Default::default() };
+        let mut b = Vec::new();
+        u.try_serialize(&mut b).unwrap();
+        assert_eq!(b[68], 0xdd);
+        assert_eq!(&b[69..77], &0x1112_1314_1516_1718u64.to_le_bytes());
+    }
+
+    #[test]
+    fn init_open_sets_opened_price() {
+        let mut p = Position::default();
+        p.init_open(Pubkey::default(), Pubkey::default(), Side::Long, 5, 6, 75_030_000, 10_000, 7, 8, ExecutionSource::OrderBook, 9);
+        assert_eq!((p.entry_price, p.opened_price), (75_030_000, 75_030_000));
+        assert_eq!(p.opened_notional(100 * CONTRACT_SIZE), 7_503_000_000);
+    }
+
+    /// §17.1 #16: random partial slices remove exactly opened_notional(size).
+    #[test]
+    fn opened_notional_telescopes() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2_000 {
+            let size = 1 + next() % 1_000_000_000_000;
+            let p = Position { size, opened_price: 1 + next() % 200_000_000, ..Default::default() };
+            let total = p.opened_notional(size);
+            let (mut q, mut removed) = (size, 0u64);
+            while q > 0 {
+                let x = 1 + next() % q;
+                removed += p.opened_notional(q) - p.opened_notional(q - x);
+                q -= x;
+            }
+            assert_eq!(removed, total);
+            // A settle (entry_price reset) does not change it
+            let settled = Position { entry_price: 1, ..p.clone() };
+            assert_eq!(settled.opened_notional(size), total);
+        }
+    }
+
+    #[test]
+    fn equity_is_collateral_plus_pnl_plus_funding() {
+        let long = oil_position(Side::Long);
+        assert_eq!(long.equity(76_000_000, 0), 850 * USDC as i128);
+        assert_eq!(long.equity(75_000_000, 7_500), 750 * USDC as i128 - 750_000);
     }
 
     /// Two legs of a venue fill share size and entry price; their PnL and
@@ -278,7 +384,65 @@ mod tests {
         }
     }
 
+    /// Random companion of the grid above, over the full ranges the engine
+    /// sees (sizes up to MAX_OPEN_INTEREST, any i64 index delta that does not
+    /// clamp): matched legs cancel exactly, so a matched pair realizes 0.
+    #[test]
+    fn pnl_and_funding_are_odd_in_side_random() {
+        let mut x = 0xdead_beef_cafe_f00du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..200_000 {
+            let size = 1 + next() % crate::pool_math::MAX_OPEN_INTEREST;
+            let entry_price = 1 + next() % 1_000_000_000;
+            let f0 = (next() % 2_000_000_000) as i64 - 1_000_000_000;
+            let long = Position { side: Side::Long, size, entry_price, last_funding_payment: f0, collateral: next() % 1_000_000, ..Default::default() };
+            let short = Position { side: Side::Short, ..long.clone() };
+            let mark = 1 + next() % 1_000_000_000;
+            let index = (next() % 4_000_000_000) as i64 - 2_000_000_000;
+            let (pl, ps) = (long.unrealized_pnl(mark), short.unrealized_pnl(mark));
+            let (fl, fs) = (long.accrued_funding(index), short.accrued_funding(index));
+            assert_eq!(pl, -ps);
+            assert_eq!(fl, -fs);
+            assert_eq!(long.equity(mark, index) + short.equity(mark, index), 2 * long.collateral as i128);
+            // Truncation toward zero: within one unit of the exact value
+            let exact = size as i128 * (mark as i128 - entry_price as i128);
+            assert!((pl as i128 * 1_000_000 - exact).abs() < 1_000_000);
+            assert!((pl as i128 * 1_000_000).abs() <= exact.abs());
+        }
+    }
+
     const CONTRACT_SIZE: u64 = 1_000_000;
+
+    /// §17.1 #8: the trigger is on mark notional.
+    #[test]
+    fn liquidation_uses_mark_notional() {
+        // A short at a loss has mark notional above entry notional, so the
+        // mark rule is the stricter one. 100 contracts short at $75 with $750:
+        // at $78.60 equity is $390, 5.2% of entry notional (safe on the old
+        // rule) but 4.96% of the $7,860 mark notional (liquidatable).
+        let short = oil_position(Side::Short);
+        assert!(short.margin_ratio(78_600_000, 0) >= 500);
+        assert!(short.is_liquidatable(78_600_000, 0, 500));
+        assert_eq!(short.margin_ratio_mark(78_600_000, 0), 496);
+        // A long at a loss is the other way round: at $71.20 equity is $370,
+        // 4.93% of entry notional but 5.19% of mark notional (safe)
+        let long = oil_position(Side::Long);
+        assert!(long.margin_ratio(71_200_000, 0) < 500);
+        assert!(!long.is_liquidatable(71_200_000, 0, 500));
+        // Exactly at the line is not liquidatable: equity·1e4 == mmr·N
+        let p = Position { side: Side::Long, size: 1_000_000, collateral: 5_000_000, entry_price: 100_000_000, ..Default::default() };
+        assert!(!p.is_liquidatable(100_000_000, 0, 500));
+        assert!(p.is_liquidatable(100_000_000, -1, 500));
+        // Zero mark notional: only negative equity
+        let dust = Position { side: Side::Long, size: 1, collateral: 0, entry_price: 1, ..Default::default() };
+        assert!(!dust.is_liquidatable(1, 0, 500));
+        assert!(dust.is_liquidatable(1, -1, 500));
+    }
 
     #[test]
     fn margin_ratio_is_zero_when_underwater() {

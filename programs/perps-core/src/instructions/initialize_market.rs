@@ -1,7 +1,11 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
-use crate::state::{Market, ProtocolConfig, Vault};
+use crate::state::{Market, ProtocolConfig, Vault, MAX_OPEN_INTEREST};
 use crate::errors::PerpsError;
+
+/// `funding_interval` bounds, seconds.
+pub const MIN_FUNDING_INTERVAL: i64 = 60;
+pub const MAX_FUNDING_INTERVAL: i64 = 86_400;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct InitializeMarketParams {
@@ -78,6 +82,13 @@ pub fn handler(ctx: Context<InitializeMarket>, params: InitializeMarketParams) -
     // Fees in basis points: at most 10% per trade, liquidation fee at most 100%
     require!(params.taker_fee <= 1_000 && params.maker_fee <= 1_000, PerpsError::InvalidMarketConfig);
     require!(params.liquidation_fee <= 10_000, PerpsError::InvalidMarketConfig);
+    // A zero interval would make update_funding divide by zero (docs/lp-pool.md §4.10)
+    require!(
+        params.funding_interval >= MIN_FUNDING_INTERVAL && params.funding_interval <= MAX_FUNDING_INTERVAL,
+        PerpsError::InvalidMarketConfig
+    );
+    // Bounds every i128 product of the pool valuation (§2.2)
+    require!(params.max_open_interest <= MAX_OPEN_INTEREST, PerpsError::InvalidMarketConfig);
 
     let market = &mut ctx.accounts.market;
     market.authority = ctx.accounts.authority.key();
@@ -99,6 +110,7 @@ pub fn handler(ctx: Context<InitializeMarket>, params: InitializeMarketParams) -
     market.short_open_interest = 0;
     market.cumulative_funding = 0;
     market.funding_rate = 0;
+    market.funding_carry_secs = 0;
     market.last_funding_time = Clock::get()?.unix_timestamp;
     market.insurance_fund = 0;
     market.total_positions = 0;

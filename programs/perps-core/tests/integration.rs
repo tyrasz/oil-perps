@@ -6,7 +6,7 @@ use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
 use perps_core::errors::PerpsError;
 use perps_core::instructions::{InitializeMarketParams, MarketConfigParams, OpenPositionParams, ProtocolRolesParams};
 use perps_core::session::SCHEDULE_CME_GLOBEX;
-use perps_core::state::{Market, Position, PositionStatus, UserAccount};
+use perps_core::state::{LpPool, Market, PoolParams, Position, PositionStatus, UserAccount};
 use pyth_sdk_solana::state::{AccountType, PriceAccount, PriceInfo, PriceStatus, MAGIC, VERSION_2};
 use solana_program_test::{processor, BanksClientError, ProgramTest, ProgramTestContext};
 use solana_sdk::{
@@ -27,6 +27,12 @@ mod support;
 // venue_fill, driven through a relay venue on the shared harness
 #[path = "venue/mod.rs"]
 mod venue;
+// The LP pool's own lifecycle, on the shared harness
+#[path = "lp/mod.rs"]
+mod lp;
+// House trading against the pool: caps, liquidation, ADL, funding
+#[path = "trading/mod.rs"]
+mod trading;
 
 const USDC: u64 = 1_000_000;
 /// Stands in for the Pyth program: owner of every test price feed.
@@ -140,6 +146,7 @@ fn weekend_config() -> MarketConfigParams {
         weekend_maintenance_margin_ratio: 1_000,
         max_confidence_bps: 100,
         min_oracle_price: 0,
+        max_open_interest: 0,
     }
 }
 
@@ -187,6 +194,7 @@ impl Env {
         pt.add_account(oil_oracle, pyth_account(dollars(75.0), 0, -8, WEDNESDAY));
         pt.add_account(gold_oracle, pyth_account(dollars(2_000.0), 0, -8, WEDNESDAY));
         let mut ctx = pt.start_with_context().await;
+        support::install_event_log();
 
         let guardian = Keypair::new();
         let mint = Keypair::new();
@@ -312,8 +320,25 @@ impl Env {
         self.init_market_as(&authority, commodity, params, oracle).await
     }
 
+    /// initialize_market by `signer`, with the LP pool bootstrap in the same
+    /// transaction (D11): `initialize_pool(PoolParams::neutral())`, the
+    /// signer's LpPosition and a `support::LP_SEED` deposit from a wallet it owns.
     async fn init_market_as(&mut self, signer: &Keypair, commodity: &str, params: InitializeMarketParams, oracle: Pubkey) -> Result<(), BanksClientError> {
+        self.init_market_seeded(signer, commodity, params, oracle, support::LP_SEED).await
+    }
+
+    /// The market and its pool, but no LP deposit: trading needs a seed first.
+    async fn init_market_unseeded(&mut self, commodity: &str) -> Result<(), BanksClientError> {
+        let authority = self.authority.insecure_clone();
+        let oracle = self.keys(commodity).oracle;
+        self.init_market_seeded(&authority, commodity, oil_params(commodity), oracle, 0).await
+    }
+
+    async fn init_market_seeded(&mut self, signer: &Keypair, commodity: &str, params: InitializeMarketParams, oracle: Pubkey, seed: u64) -> Result<(), BanksClientError> {
         let k = *self.keys(commodity);
+        let tokens = self.token_account(&signer.pubkey(), seed).await;
+        let lp_pool = support::lp_pool_pda(&k.market);
+        let seed_lp = support::Lp { kp: signer.insecure_clone(), tokens, position: support::lp_position_pda(&lp_pool, &signer.pubkey(), 0) };
         let accounts = perps_core::accounts::InitializeMarket {
             authority: signer.pubkey(),
             config: config_pda(),
@@ -327,7 +352,57 @@ impl Env {
             rent: sysvar::rent::ID,
         };
         let data = perps_core::instruction::InitializeMarket { params };
-        self.exec(accounts, data, &[signer]).await
+        let mut ixs = vec![Instruction { program_id: perps_core::ID, accounts: accounts.to_account_metas(None), data: data.data() }];
+        ixs.extend(support::pool_bootstrap_ixs(&signer.pubkey(), k.market, oracle, &seed_lp, PoolParams::neutral(), seed));
+        send(&mut self.ctx, &ixs, &[signer]).await
+    }
+
+    /// initialize_market alone: no pool.
+    async fn init_market_only(&mut self, commodity: &str) -> Result<(), BanksClientError> {
+        let k = *self.keys(commodity);
+        let signer = self.authority.insecure_clone();
+        let accounts = perps_core::accounts::InitializeMarket {
+            authority: signer.pubkey(),
+            config: config_pda(),
+            market: k.market,
+            vault: k.vault,
+            vault_token_account: k.vault_token,
+            collateral_mint: self.mint,
+            pyth_price_feed: k.oracle,
+            system_program: system_program::ID,
+            token_program: spl_token::ID,
+            rent: sysvar::rent::ID,
+        };
+        self.exec(accounts, perps_core::instruction::InitializeMarket { params: oil_params(commodity) }, &[&signer]).await
+    }
+
+    async fn init_pool(&mut self, signer: &Keypair, commodity: &str, params: PoolParams) -> Result<(), BanksClientError> {
+        let market = self.keys(commodity).market;
+        let accounts = perps_core::accounts::InitializePool {
+            admin: signer.pubkey(),
+            config: config_pda(),
+            market,
+            lp_pool: support::lp_pool_pda(&market),
+            system_program: system_program::ID,
+        };
+        self.exec(accounts, perps_core::instruction::InitializePool { params, adl_keeper: signer.pubkey() }, &[signer]).await
+    }
+
+    async fn patch_market(&mut self, commodity: &str, f: impl FnOnce(&mut Market)) {
+        let address = self.keys(commodity).market;
+        let mut acct = self.ctx.banks_client.get_account(address).await.unwrap().unwrap();
+        let mut m = Market::try_deserialize(&mut acct.data.as_slice()).unwrap();
+        f(&mut m);
+        let mut data = Vec::new();
+        anchor_lang::AccountSerialize::try_serialize(&m, &mut data).unwrap();
+        acct.data[..data.len()].copy_from_slice(&data);
+        self.ctx.set_account(&address, &AccountSharedData::from(acct));
+        support::rebaseline_buckets(&mut self.ctx).await;
+    }
+
+    async fn pool(&mut self, commodity: &str) -> LpPool {
+        let address = support::lp_pool_pda(&self.keys(commodity).market);
+        self.load(address).await
     }
 
     async fn configure(&mut self, commodity: &str, params: MarketConfigParams) -> Result<(), BanksClientError> {
@@ -368,6 +443,7 @@ impl Env {
             vault_token_account: k.vault_token,
             user_token_account: self.alice.token_account,
             token_program: spl_token::ID,
+            lp_pool: support::lp_pool_pda(&k.market),
         };
         self.exec(accounts, perps_core::instruction::DepositCollateral { amount }, &[&owner]).await
     }
@@ -384,6 +460,7 @@ impl Env {
             vault_token_account: k.vault_token,
             user_token_account: self.alice.token_account,
             token_program: spl_token::ID,
+            lp_pool: support::lp_pool_pda(&k.market),
         };
         self.exec(accounts, perps_core::instruction::WithdrawCollateral { amount }, &[&owner]).await
     }
@@ -403,8 +480,9 @@ impl Env {
             position,
             pyth_price_feed: k.oracle,
             system_program: system_program::ID,
+            lp_pool: support::lp_pool_pda(&k.market),
         };
-        let params = OpenPositionParams { side, size: contracts * CONTRACT, leverage: leverage_x * 1_000 };
+        let params = OpenPositionParams { side, size: contracts * CONTRACT, leverage: leverage_x * 1_000, acceptable_price: 0 };
         self.exec(accounts, perps_core::instruction::OpenPosition { params }, &[&owner]).await?;
         Ok(position)
     }
@@ -430,8 +508,9 @@ impl Env {
             user_referral: referral.map(|_| user_referral_pda(&owner.pubkey())),
             referral_code: referral.map(|(code, _)| code),
             referrer_token_account: referral.map(|(_, account)| account),
+            lp_pool: support::lp_pool_pda(&k.market),
         };
-        self.exec(accounts, perps_core::instruction::ClosePosition {}, &[&owner]).await
+        self.exec(accounts, perps_core::instruction::ClosePosition { acceptable_price: 0 }, &[&owner]).await
     }
 
     async fn liquidate(&mut self, commodity: &str, position: Pubkey) -> Result<(), BanksClientError> {
@@ -449,6 +528,7 @@ impl Env {
             liquidator_token_account: self.keeper.token_account,
             pyth_price_feed: k.oracle,
             token_program: spl_token::ID,
+            lp_pool: support::lp_pool_pda(&k.market),
         };
         self.exec(accounts, perps_core::instruction::Liquidate {}, &[&keeper]).await
     }
@@ -522,7 +602,12 @@ async fn send(ctx: &mut ProgramTestContext, ixs: &[Instruction], signers: &[&Key
     all.extend_from_slice(signers);
     let blockhash = ctx.get_new_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &all, blockhash);
-    ctx.banks_client.process_transaction(tx).await
+    let result = ctx.banks_client.process_transaction(tx).await;
+    if result.is_ok() {
+        // §11 after every transaction (docs/lp-pool.md §17.2)
+        support::watch_buckets(ctx, ixs).await;
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +638,8 @@ async fn collateral_is_isolated_per_market() {
     // Her OIL account can't be used against GOLD's vault: the user-account PDA check rejects it
     let constraint_seeds: u32 = anchor_lang::error::ErrorCode::ConstraintSeeds.into();
     assert_eq!(custom_error(env.withdraw_via("GOLD", "OIL", 100 * USDC).await), constraint_seeds);
-    assert_eq!(env.token_balance(env.gold.vault_token).await, 5_000 * USDC);
+    // GOLD's vault also holds its pool's LP seed
+    assert_eq!(env.token_balance(env.gold.vault_token).await, support::LP_SEED + 5_000 * USDC);
     assert_eq!(env.user("OIL").await.collateral_balance, 1_000 * USDC);
 
     env.withdraw_via("OIL", "OIL", 100 * USDC).await.unwrap();
@@ -633,14 +719,16 @@ async fn weekend_margins_liquidate_thin_positions_before_the_close() {
 
     let p: Position = env.load(position).await;
     assert!(p.status == PositionStatus::Liquidated);
-    // Reward: 1% of the 5% maintenance margin on $750 = $0.375
-    assert_eq!(env.token_balance(env.keeper.token_account).await, 375_000);
+    // Reward: 1% of the maintenance margin in force (the weekend 10%) on
+    // $750 = $0.75 (docs/lp-pool.md §6.4, D8; was 375_000 on the 5% MMR)
+    assert_eq!(env.token_balance(env.keeper.token_account).await, 750_000);
 }
 
 #[tokio::test]
 async fn settlement_closes_positions_when_the_oracle_breaks() {
     let mut env = Env::new().await.funded("OIL", 1_000 * USDC).await;
     let position = env.open("OIL", 0, 10, 5).await.unwrap();
+    let abandoned = env.open("OIL", 0, 10, 5).await.unwrap();
     let before = env.token_balance(env.alice.token_account).await;
 
     // April 2020: the price goes negative and the oracle can no longer be used
@@ -657,6 +745,22 @@ async fn settlement_closes_positions_when_the_oracle_breaks() {
     // Closes at $70: $150 - $50 loss - $0.375 fee
     env.close("OIL", position).await.unwrap();
     assert_eq!(env.token_balance(env.alice.token_account).await - before, 99_625_000);
+
+    // Anyone closes a position its owner abandoned, at the settlement price;
+    // the equity goes to the owner's free collateral (docs/lp-pool.md §10.5)
+    let keeper = env.keeper.keypair.insecure_clone();
+    let k = env.oil;
+    let accounts = perps_core::accounts::CloseSettledPosition {
+        signer: keeper.pubkey(),
+        market: k.market,
+        lp_pool: support::lp_pool_pda(&k.market),
+        position: abandoned,
+        position_owner: env.alice.keypair.pubkey(),
+        user_account: user_account(&env.alice.keypair.pubkey(), &k.market),
+    };
+    env.exec(accounts, perps_core::instruction::CloseSettledPosition {}, &[&keeper]).await.unwrap();
+    assert_eq!(env.user("OIL").await.collateral_balance, 700 * USDC + 99_625_000);
+    assert!(env.load::<Position>(abandoned).await.status == PositionStatus::Closed);
 
     assert_eq!(custom_error(env.open("OIL", 0, 1, 5).await.map(|_| ())), code(PerpsError::MarketPaused));
     assert_eq!(custom_error(env.settle("OIL", &authority, 71 * USDC).await), code(PerpsError::MarketSettled));
@@ -775,6 +879,7 @@ async fn user_accounts_cannot_be_used_in_another_market() {
         vault_token_account: gold.vault_token,
         user_token_account: env.alice.token_account,
         token_program: spl_token::ID,
+        lp_pool: support::lp_pool_pda(&gold.market),
     };
     let result = env.exec(deposit, perps_core::instruction::DepositCollateral { amount: 10 * USDC }, &[&alice]).await;
     assert_eq!(custom_error(result), constraint_seeds);
@@ -791,13 +896,15 @@ async fn user_accounts_cannot_be_used_in_another_market() {
         position,
         pyth_price_feed: gold.oracle,
         system_program: system_program::ID,
+        lp_pool: support::lp_pool_pda(&gold.market),
     };
-    let params = OpenPositionParams { side: 0, size: CONTRACT / 100, leverage: 5_000 };
+    let params = OpenPositionParams { side: 0, size: CONTRACT / 100, leverage: 5_000, acceptable_price: 0 };
     let result = env.exec(open, perps_core::instruction::OpenPosition { params }, &[&alice]).await;
     assert_eq!(custom_error(result), constraint_seeds);
 
     assert_eq!(env.user("OIL").await.collateral_balance, 1_000 * USDC);
-    assert_eq!(env.token_balance(gold.vault_token).await, 0);
+    // Only GOLD's pool seed is in its vault
+    assert_eq!(env.token_balance(gold.vault_token).await, support::LP_SEED);
 }
 
 // --- protocol roles ----------------------------------------------------------
@@ -879,4 +986,103 @@ async fn admin_handover_takes_two_steps_and_covers_existing_markets() {
     env.configure_as(&new_admin, "OIL", unpaused()).await.unwrap();
     let gold_oracle = env.gold.oracle;
     env.init_market_as(&new_admin, "GOLD", oil_params("GOLD"), gold_oracle).await.unwrap();
+}
+
+// --- LP pool bootstrap and market config (docs/lp-pool.md §4.10, §4.12, §5) ---
+
+#[tokio::test]
+async fn initialize_pool_needs_the_admin_and_a_fresh_market() {
+    let mut env = Env::new().await;
+    env.init_market_only("GOLD").await.unwrap();
+    let authority = env.authority.insecure_clone();
+    let stranger = env.funded_keypair().await;
+    let neutral = PoolParams::neutral();
+
+    assert_eq!(custom_error(env.init_pool(&stranger, "GOLD", neutral).await), code(PerpsError::Unauthorized));
+    let bad = PoolParams { backstop_threshold_bps: 0, ..neutral };
+    assert_eq!(custom_error(env.init_pool(&authority, "GOLD", bad).await), code(PerpsError::InvalidPoolParams));
+    for f in [
+        (|m: &mut Market| m.insurance_fund = 1) as fn(&mut Market),
+        |m: &mut Market| m.long_open_interest = 1,
+        |m: &mut Market| m.short_open_interest = 1,
+        |m: &mut Market| m.settlement_price = 1,
+    ] {
+        let fresh = env.market("GOLD").await;
+        env.patch_market("GOLD", f).await;
+        assert_eq!(custom_error(env.init_pool(&authority, "GOLD", neutral).await), code(PerpsError::MarketNotFresh));
+        env.patch_market("GOLD", |m| *m = fresh).await;
+    }
+
+    // One unit sent straight to the vault does not block it (red-team F14)
+    let payer = env.ctx.payer.insecure_clone();
+    let ix = spl_token::instruction::mint_to(&spl_token::ID, &env.mint, &env.gold.vault_token, &payer.pubkey(), &[], 1).unwrap();
+    send(&mut env.ctx, &[ix], &[&payer]).await.unwrap();
+    env.init_pool(&authority, "GOLD", neutral).await.unwrap();
+    let pool = env.pool("GOLD").await;
+    assert_eq!((pool.market, pool.adl_keeper, pool.params, pool.lp_shares, pool.cash), (env.gold.market, authority.pubkey(), neutral, 0, 0));
+    assert!(env.init_pool(&authority, "GOLD", neutral).await.is_err(), "a pool can only be created once");
+}
+
+#[tokio::test]
+async fn markets_bootstrap_their_pool_in_one_transaction() {
+    let mut env = Env::new().await;
+    let pool = env.pool("OIL").await;
+    assert_eq!((pool.lp_shares, pool.cash, pool.params), (support::LP_SEED, support::LP_SEED, PoolParams::neutral()));
+    assert_eq!(env.token_balance(env.oil.vault_token).await, support::LP_SEED);
+
+    // Without the seed the pool exists but has no LPs
+    env.init_market_unseeded("GOLD").await.unwrap();
+    let pool = env.pool("GOLD").await;
+    assert_eq!((pool.lp_shares, pool.cash), (0, 0));
+}
+
+#[tokio::test]
+async fn initialize_market_bounds_funding_interval_and_open_interest() {
+    let mut env = Env::new().await;
+    for params in [
+        InitializeMarketParams { funding_interval: 59, ..oil_params("GOLD") },
+        InitializeMarketParams { funding_interval: 86_401, ..oil_params("GOLD") },
+        InitializeMarketParams { funding_interval: 0, ..oil_params("GOLD") },
+        InitializeMarketParams { max_open_interest: perps_core::state::MAX_OPEN_INTEREST + 1, ..oil_params("GOLD") },
+    ] {
+        assert_eq!(custom_error(env.init_market_with("GOLD", params).await), code(PerpsError::InvalidMarketConfig));
+    }
+    let params = InitializeMarketParams { funding_interval: 60, max_open_interest: perps_core::state::MAX_OPEN_INTEREST, ..oil_params("GOLD") };
+    env.init_market_with("GOLD", params).await.unwrap();
+    assert_eq!(env.market("GOLD").await.funding_carry_secs, 0);
+}
+
+#[tokio::test]
+async fn max_open_interest_is_editable_and_zero_keeps_it() {
+    let mut env = Env::new().await.funded("OIL", 1_000 * USDC).await;
+    let cap = MarketConfigParams { max_open_interest: 5 * CONTRACT, ..unpaused() };
+    env.configure("OIL", cap).await.unwrap();
+    assert_eq!(env.market("OIL").await.max_open_interest, 5 * CONTRACT);
+    // unpaused() leaves it at 0: the cap is kept (red-team F19)
+    env.configure("OIL", unpaused()).await.unwrap();
+    assert_eq!(env.market("OIL").await.max_open_interest, 5 * CONTRACT);
+    let too_big = MarketConfigParams { max_open_interest: perps_core::state::MAX_OPEN_INTEREST + 1, ..unpaused() };
+    assert_eq!(custom_error(env.configure("OIL", too_big).await), code(PerpsError::InvalidMarketConfig));
+
+    assert_eq!(custom_error(env.open("OIL", 0, 6, 5).await.map(|_| ())), code(PerpsError::OpenInterestCapExceeded));
+    env.open("OIL", 0, 5, 5).await.unwrap();
+    // Below the current OI it only blocks increases
+    env.configure("OIL", MarketConfigParams { max_open_interest: CONTRACT, ..unpaused() }).await.unwrap();
+    assert_eq!(custom_error(env.open("OIL", 0, 1, 5).await.map(|_| ())), code(PerpsError::OpenInterestCapExceeded));
+}
+
+#[tokio::test]
+async fn trading_needs_the_market_pool() {
+    // docs/lp-pool.md §17.2 #1: every collateral and trading instruction
+    // takes the pool, so a market without one cannot be used. The ones that
+    // need an open position (close, add_margin, liquidate, venue_fill,
+    // settle_position_pnl, adl) are in
+    // venue::every_trading_instruction_needs_the_market_pool
+    let mut env = Env::new().await;
+    env.init_market_only("GOLD").await.unwrap();
+    env.init_user("GOLD").await.unwrap();
+    let not_init: u32 = anchor_lang::error::ErrorCode::AccountNotInitialized.into();
+    assert_eq!(custom_error(env.deposit("GOLD", 10 * USDC).await), not_init);
+    assert_eq!(custom_error(env.withdraw_via("GOLD", "GOLD", 0).await), not_init);
+    assert_eq!(custom_error(env.open("GOLD", 0, 1, 5).await.map(|_| ())), not_init);
 }

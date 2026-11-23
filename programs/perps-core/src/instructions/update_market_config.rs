@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use crate::errors::PerpsError;
 use crate::session;
-use crate::state::{Market, ProtocolConfig};
+use crate::state::{Market, ProtocolConfig, MAX_OPEN_INTEREST};
 
 /// Authority-controlled risk settings. See the field docs on `Market`.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -13,6 +13,10 @@ pub struct MarketConfigParams {
     pub weekend_maintenance_margin_ratio: u32,
     pub max_confidence_bps: u32,
     pub min_oracle_price: u64,
+    /// Per-side open-interest cap in contracts (D6). `0` keeps the current
+    /// value, so `Default`-based callers are unchanged (red-team F19). It may be
+    /// set below the current OI, and then only blocks increases.
+    pub max_open_interest: u64,
 }
 
 const MAX_PRE_CLOSE_WINDOW_SECS: u32 = 2 * 24 * 3_600;
@@ -29,6 +33,7 @@ impl MarketConfigParams {
             // Opening a position must still leave room above the liquidation line
             && weekend_maintenance < weekend_initial
             && self.max_confidence_bps <= 10_000
+            && self.max_open_interest <= MAX_OPEN_INTEREST
     }
 }
 
@@ -65,6 +70,9 @@ pub fn handler(ctx: Context<UpdateMarketConfig>, params: MarketConfigParams) -> 
     market.weekend_maintenance_margin_ratio = params.weekend_maintenance_margin_ratio;
     market.max_confidence_bps = params.max_confidence_bps;
     market.min_oracle_price = params.min_oracle_price;
+    if params.max_open_interest != 0 {
+        market.max_open_interest = params.max_open_interest;
+    }
 
     msg!("Market config updated: {:?}", params);
     Ok(())
@@ -92,6 +100,14 @@ mod tests {
     fn accepts_typical_weekend_config() {
         assert!(oil_weekend().validate(&market()));
         assert!(MarketConfigParams::default().validate(&market()));
+    }
+
+    #[test]
+    fn max_open_interest_is_bounded() {
+        let p = |x| MarketConfigParams { max_open_interest: x, ..oil_weekend() };
+        assert!(p(0).validate(&market()));
+        assert!(p(MAX_OPEN_INTEREST).validate(&market()));
+        assert!(!p(MAX_OPEN_INTEREST + 1).validate(&market()));
     }
 
     #[test]

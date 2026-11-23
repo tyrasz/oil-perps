@@ -86,7 +86,12 @@ async fn send_as(ctx: &mut ProgramTestContext, payer: &Keypair, ixs: &[Instructi
     let mut all: Vec<&Keypair> = vec![payer];
     all.extend_from_slice(others);
     let blockhash = ctx.get_new_latest_blockhash().await.unwrap();
-    ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &all, blockhash)).await
+    let result = ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &all, blockhash)).await;
+    if result.is_ok() {
+        // §11 and the §1.2 sums after every transaction (docs/lp-pool.md §17.2)
+        support::watch_buckets(ctx, ixs).await;
+    }
+    result
 }
 
 async fn rent(base: &mut Base, len: usize) -> u64 {
@@ -214,7 +219,7 @@ impl Env {
             venue_authority: fa.venue_authority, perps_config: fa.config, perps_venue: fa.venue,
             venue_program_data: fa.venue_program_data, market: fa.market, pyth_price_feed: fa.pyth_price_feed,
             taker_user: fa.taker_user, taker_approval: fa.taker_approval, taker_position: fa.taker_position,
-            mm_user: fa.maker_user, mm_approval: fa.maker_approval, mm_position: fa.maker_position,
+            mm_user: fa.maker_user, mm_approval: fa.maker_approval, mm_position: fa.maker_position, perps_lp_pool: fa.lp_pool,
             perps_core_program: perps_core::ID, system_program: system_program::ID,
         };
         tweak(&mut accounts);
@@ -424,6 +429,7 @@ async fn fills_open_matched_perps_positions_and_move_no_tokens() {
     let tx = Transaction::new_signed_with_payer(&ixs, Some(&taker), &[&taker_kp], blockhash);
     let out = env.base.ctx.banks_client.process_transaction_with_metadata(tx).await.unwrap();
     out.result.unwrap();
+    support::watch_buckets(&mut env.base.ctx, &ixs).await;
     let mut data = out.metadata.unwrap().return_data.expect("fill_quote returns its result").data;
     // The runtime strips trailing zero bytes from return data; fee is the last field
     data.resize(24, 0);
@@ -760,6 +766,7 @@ async fn fills_do_not_invalidate_prebuilt_fills() {
     send_as(&mut env.base.ctx, &taker, &ixs2, &[]).await.unwrap();
     open(&mut env.base, &w.t, 0, 1, 5).await.unwrap();
     env.base.ctx.banks_client.process_transaction(prebuilt).await.unwrap();
+    support::watch_buckets(&mut env.base.ctx, &ixs).await;
     assert_eq!(position(&mut env.base, fa.taker_position).await.owner, w.key());
 }
 
@@ -781,11 +788,16 @@ async fn two_quote_sweep_fits_a_legacy_transaction() {
     let (f1, fa1) = env.fill_ix(&taker.pubkey(), &mm, q1, buy(10), n1, |_| {});
     let (f2, fa2) = env.fill_ix(&taker.pubkey(), &w.key(), q2, buy(10), n2, |_| {});
     let blockhash = env.base.ctx.get_new_latest_blockhash().await.unwrap();
-    let tx = Transaction::new_signed_with_payer(&[compute_budget_ix(400_000), approval, f1, f2], Some(&taker.pubkey()), &[&taker], blockhash);
+    // No compute-budget instruction: the perps LP pool account (docs/lp-pool.md
+    // §16.1) adds 32 bytes, which with a SetComputeUnitLimit puts the sweep at
+    // 1,249 bytes. The default 200k CU per instruction covers each fill.
+    let sweep_ixs = [approval, f1, f2];
+    let tx = Transaction::new_signed_with_payer(&sweep_ixs, Some(&taker.pubkey()), &[&taker], blockhash);
     let size = bincode::serialize(&tx).unwrap().len();
     println!("two-quote sweep: {} bytes", size);
     assert!(size <= 1_232, "sweep is {} bytes", size);
     env.base.ctx.banks_client.process_transaction(tx).await.unwrap();
+    support::watch_buckets(&mut env.base.ctx, &sweep_ixs).await;
     for fa in [fa1, fa2] {
         assert_eq!(position(&mut env.base, fa.taker_position).await.size, 10 * CONTRACT);
     }

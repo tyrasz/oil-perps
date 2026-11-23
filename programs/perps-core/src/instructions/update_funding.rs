@@ -2,6 +2,9 @@ use anchor_lang::prelude::*;
 use crate::oracle::read_price;
 use crate::state::{funding_per_contract, Market};
 use crate::errors::PerpsError;
+use crate::events::FundingUpdated;
+use crate::pool_math;
+use crate::session;
 
 #[derive(Accounts)]
 pub struct UpdateFunding<'info> {
@@ -13,7 +16,7 @@ pub struct UpdateFunding<'info> {
         seeds = [b"market", market.collateral_mint.as_ref(), market.commodity_seed()],
         bump = market.bump
     )]
-    pub market: Account<'info, Market>,
+    pub market: Box<Account<'info, Market>>,
 
     /// CHECK: Pyth price feed
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
@@ -24,19 +27,18 @@ pub fn handler(ctx: Context<UpdateFunding>) -> Result<()> {
     let market = &mut ctx.accounts.market;
     let current_time = Clock::get()?.unix_timestamp;
 
-    // Check if enough time has passed
-    let time_elapsed = current_time - market.last_funding_time;
-    require!(
-        time_elapsed >= market.funding_interval,
-        PerpsError::InvalidMarketConfig
-    );
-
+    // 1–2. docs/lp-pool.md §8
     require!(!market.is_settled(), PerpsError::MarketSettled);
     require!(market.is_in_session(current_time), PerpsError::MarketClosed);
-
     let oracle_price = read_price(&ctx.accounts.pyth_price_feed, market, current_time)?;
 
-    // Calculate funding rate based on OI imbalance
+    // 3–5. Open seconds since the last crank plus the carry; missed periods
+    // are charged at once (up to MAX_FUNDING_CATCHUP_PERIODS)
+    let open = session::open_seconds_between(market.session_schedule, market.last_funding_time, current_time);
+    let total = open.saturating_add(market.funding_carry_secs as i64);
+    let c = pool_math::funding_catchup(total, market.funding_interval).ok_or(PerpsError::FundingNotDue)?;
+
+    // 6. Calculate funding rate based on OI imbalance
     // Positive = longs pay shorts, Negative = shorts pay longs
     let long_oi = market.long_open_interest as i128;
     let short_oi = market.short_open_interest as i128;
@@ -51,14 +53,15 @@ pub fn handler(ctx: Context<UpdateFunding>) -> Result<()> {
     } else {
         0
     };
+    let step = funding_per_contract(funding_rate, oracle_price);
 
-    // Update market
+    // 7–8. Update market
     market.funding_rate = funding_rate;
-    market.cumulative_funding = market
-        .cumulative_funding
-        .saturating_add(funding_per_contract(funding_rate, oracle_price));
+    market.cumulative_funding = pool_math::funding_accumulate(market.cumulative_funding, c.n, step);
     market.last_funding_time = current_time;
+    market.funding_carry_secs = c.carry;
 
+    // 9.
     msg!(
         "Funding updated: rate={}, long_oi={}, short_oi={}, price={}",
         funding_rate,
@@ -66,6 +69,14 @@ pub fn handler(ctx: Context<UpdateFunding>) -> Result<()> {
         market.short_open_interest,
         oracle_price
     );
+    emit!(FundingUpdated {
+        periods: c.n,
+        periods_dropped: c.dropped,
+        rate: funding_rate,
+        step,
+        cumulative_funding: market.cumulative_funding,
+        carry_secs: c.carry,
+    });
 
     Ok(())
 }

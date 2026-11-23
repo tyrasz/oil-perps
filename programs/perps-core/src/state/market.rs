@@ -50,6 +50,7 @@ pub struct Market {
     pub min_oracle_price: u64,                // 6 decimals; prices below halt the market; 0 = off
     pub settlement_price: u64,                // 6 decimals; non-zero once settle_market has run
     pub funding_rate: i64,                    // Latest per-period funding rate (6 decimals, 100 = 0.01%)
+    pub funding_carry_secs: u32,              // Open seconds accrued but not yet charged (docs/lp-pool.md §8)
 }
 
 impl Market {
@@ -84,7 +85,8 @@ impl Market {
         8 +   // min_oracle_price
         8 +   // settlement_price
         8 +   // funding_rate
-        15;   // padding for future use
+        4 +   // funding_carry_secs
+        11;   // padding for future use
 
     /// Convert commodity bytes to string
     pub fn commodity_str(&self) -> String {
@@ -124,15 +126,6 @@ impl Market {
             .map(|new_oi| new_oi <= self.max_open_interest)
             .unwrap_or(false)
     }
-
-    /// Credit `credit` to the insurance fund, then use the fund to absorb a
-    /// position's `deficit` (losses beyond its collateral).
-    /// Returns the part of the deficit the fund could not cover.
-    pub fn settle_insurance(&mut self, credit: u64, deficit: u64) -> u64 {
-        let (fund, uncovered) = apply_insurance(self.insurance_fund, credit, deficit);
-        self.insurance_fund = fund;
-        uncovered
-    }
 }
 
 impl Market {
@@ -143,6 +136,20 @@ impl Market {
     /// Whether the market is within its trading session at `now`.
     pub fn is_in_session(&self, now: i64) -> bool {
         session::is_open(self.session_schedule, now)
+    }
+
+    /// Whether funding has been cranked recently enough for LP flows (§8):
+    /// settled, or fewer than `funding_interval` open seconds (plus carry)
+    /// since the last crank.
+    pub fn funding_current(&self, now: i64) -> bool {
+        session::funding_current(
+            self.session_schedule,
+            self.is_settled(),
+            self.last_funding_time,
+            self.funding_carry_secs,
+            self.funding_interval,
+            now,
+        )
     }
 
     /// Whether weekend margin requirements apply at `now`.
@@ -181,42 +188,16 @@ impl Market {
         u64::try_from(collateral).ok()
     }
 
-    /// Liquidator reward: `liquidation_fee` applied to the position's
-    /// maintenance margin. Basing it on the margin requirement rather than on
-    /// whatever collateral is left keeps the reward from falling to zero on
-    /// positions that are already underwater, which are the ones that most
-    /// need liquidating.
-    pub fn liquidation_reward_target(&self, notional: u64) -> u64 {
-        let reward = (notional as u128)
-            * self.maintenance_margin_ratio as u128
-            * self.liquidation_fee as u128
-            / 100_000_000;
+    /// Stage-2 liquidator reward target: `liquidation_fee` applied to the
+    /// maintenance margin **in force** (`mmr`) on `notional`, which callers
+    /// pass as the position's `opened_notional` (docs/lp-pool.md §6.4, D8).
+    /// Basing it on the margin requirement rather than on whatever collateral
+    /// is left keeps the reward from falling to zero on positions that are
+    /// already underwater, which are the ones that most need liquidating.
+    pub fn liquidation_reward_target(&self, notional: u64, mmr: u32) -> u64 {
+        let reward = (notional as u128) * mmr as u128 * self.liquidation_fee as u128 / 100_000_000;
         reward.min(u64::MAX as u128) as u64
     }
-
-    /// Settle a liquidation against the insurance fund.
-    /// Returns `(liquidator_reward, uncovered_bad_debt)`.
-    pub fn settle_liquidation(&mut self, remaining_collateral: u64, deficit: u64, notional: u64) -> (u64, u64) {
-        let target = self.liquidation_reward_target(notional);
-        let (reward, fund, uncovered) =
-            liquidation_payout(self.insurance_fund, remaining_collateral, deficit, target);
-        self.insurance_fund = fund;
-        (reward, uncovered)
-    }
-}
-
-/// Split a liquidated position between the liquidator and the insurance fund.
-///
-/// The reward is paid from the position's remaining collateral first; any
-/// shortfall is topped up from the insurance fund (as far as it can). Leftover
-/// collateral goes to the fund, which then absorbs any bad debt.
-/// Returns `(reward, new_fund, uncovered_bad_debt)`.
-pub fn liquidation_payout(fund: u64, remaining_collateral: u64, deficit: u64, reward_target: u64) -> (u64, u64, u64) {
-    let from_collateral = reward_target.min(remaining_collateral);
-    let fund = fund.saturating_add(remaining_collateral - from_collateral);
-    let top_up = (reward_target - from_collateral).min(fund);
-    let (fund, uncovered) = apply_insurance(fund - top_up, 0, deficit);
-    (from_collateral + top_up, fund, uncovered)
 }
 
 pub(crate) fn ceil_div(a: u128, b: u128) -> u128 {
@@ -229,13 +210,6 @@ pub(crate) fn ceil_div(a: u128, b: u128) -> u128 {
 pub fn funding_per_contract(rate: i64, price: u64) -> i64 {
     let amount = rate as i128 * price as i128 / 1_000_000;
     amount.clamp(i64::MIN as i128, i64::MAX as i128) as i64
-}
-
-/// Returns `(new_fund, uncovered_deficit)`.
-pub fn apply_insurance(fund: u64, credit: u64, deficit: u64) -> (u64, u64) {
-    let available = fund.saturating_add(credit);
-    let covered = deficit.min(available);
-    (available - covered, deficit - covered)
 }
 
 /// Split a position's final equity into what is paid out and what is owed.
@@ -251,21 +225,6 @@ pub fn split_equity(equity: i64) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn credit_with_no_deficit_grows_fund() {
-        assert_eq!(apply_insurance(100, 5, 0), (105, 0));
-    }
-
-    #[test]
-    fn deficit_is_drawn_from_fund() {
-        assert_eq!(apply_insurance(100, 5, 30), (75, 0));
-    }
-
-    #[test]
-    fn deficit_beyond_fund_is_reported_uncovered() {
-        assert_eq!(apply_insurance(10, 5, 40), (0, 25));
-    }
 
     /// OIL as configured by scripts/initialize-market.ts.
     fn oil_market() -> Market {
@@ -357,7 +316,46 @@ mod tests {
     fn account_size_is_unchanged_so_existing_markets_still_load() {
         assert_eq!(Market::LEN, 298);
         let serialized = Market::default().try_to_vec().unwrap().len();
-        assert_eq!(8 + serialized + 15, Market::LEN);
+        assert_eq!(8 + serialized + 11, Market::LEN);
+    }
+
+    /// docs/lp-pool.md §1.1: `funding_carry_secs` is appended after
+    /// `funding_rate`, at 283..287.
+    #[test]
+    fn funding_carry_secs_is_appended() {
+        use anchor_lang::AccountSerialize;
+        let m = Market { funding_rate: -2, funding_carry_secs: 0x0a0b_0c0d, ..Default::default() };
+        let mut b = Vec::new();
+        m.try_serialize(&mut b).unwrap();
+        assert_eq!(&b[275..283], &(-2i64).to_le_bytes());
+        assert_eq!(&b[283..287], &0x0a0b_0c0du32.to_le_bytes());
+        assert_eq!(b.len(), 287);
+    }
+
+    #[test]
+    fn funding_is_current_until_an_interval_of_open_time_passes() {
+        // Wed 2026-11-11 12:00 ET; CME, hourly
+        let m = Market {
+            session_schedule: session::SCHEDULE_CME_GLOBEX,
+            last_funding_time: WEDNESDAY_NOON_ET,
+            funding_interval: 3_600,
+            ..oil_market()
+        };
+        assert!(m.funding_current(WEDNESDAY_NOON_ET + 3_599));
+        assert!(!m.funding_current(WEDNESDAY_NOON_ET + 3_600));
+        // Carry counts
+        let c = Market { funding_carry_secs: 600, ..m.clone() };
+        assert!(c.funding_current(WEDNESDAY_NOON_ET + 2_999));
+        assert!(!c.funding_current(WEDNESDAY_NOON_ET + 3_000));
+        // Closed time does not count: last crank 30 min before the weekly
+        // close is still current all weekend and until 30 min after the reopen
+        let fri = Market { last_funding_time: FRIDAY_CLOSE - 1_800, ..m.clone() };
+        let sunday_open = FRIDAY_CLOSE + 49 * 3_600;
+        assert!(fri.funding_current(sunday_open + 1_799));
+        assert!(!fri.funding_current(sunday_open + 1_800));
+        // Settled markets are always current
+        let s = Market { settlement_price: 1, ..m };
+        assert!(s.funding_current(WEDNESDAY_NOON_ET + 10 * 86_400));
     }
 
     // Fri 2026-11-13: 22:00 UTC is the 17:00 ET weekly close.
@@ -407,33 +405,15 @@ mod tests {
     }
 
     #[test]
-    fn liquidation_reward_is_share_of_maintenance_margin() {
+    fn liquidation_reward_is_share_of_maintenance_margin_in_force() {
         // 1% of the 5% maintenance margin on $7,500 = $3.75
-        assert_eq!(oil_market().liquidation_reward_target(NOTIONAL), 3_750_000);
+        assert_eq!(oil_market().liquidation_reward_target(NOTIONAL, 500), 3_750_000);
+        // The weekend MMR (10%) doubles it
+        assert_eq!(oil_market().liquidation_reward_target(NOTIONAL, 1_000), 7_500_000);
     }
 
-    #[test]
-    fn liquidation_reward_comes_from_collateral_when_available() {
-        // $40 left, $3 reward: liquidator gets $3, fund gets the other $37
-        assert_eq!(liquidation_payout(100, 40, 0, 3), (3, 137, 0));
-    }
-
-    #[test]
-    fn underwater_liquidation_still_pays_reward_from_fund() {
-        // Nothing left and $25 of bad debt: fund pays the $3 reward and the debt
-        assert_eq!(liquidation_payout(100, 0, 25, 3), (3, 72, 0));
-    }
-
-    #[test]
-    fn partial_collateral_is_topped_up_from_fund() {
-        assert_eq!(liquidation_payout(100, 1, 0, 3), (3, 98, 0));
-    }
-
-    #[test]
-    fn empty_fund_limits_reward_and_reports_bad_debt() {
-        assert_eq!(liquidation_payout(0, 0, 25, 3), (0, 0, 25));
-        assert_eq!(liquidation_payout(2, 0, 25, 3), (2, 0, 25));
-    }
+    // The stage-2 split that replaced liquidation_payout / apply_insurance is
+    // tested in instructions/liquidate.rs (§6.4).
 
     #[test]
     fn funding_per_contract_uses_the_period_price() {

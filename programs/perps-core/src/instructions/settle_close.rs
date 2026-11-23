@@ -1,0 +1,357 @@
+//! The shared body of a full close (docs/lp-pool.md §4.5 steps 2–7), used by
+//! `close_settled_position` (§10.5) and by `close_position`.
+//!
+//! The caller picks the price (step 1: settlement price, or the oracle and
+//! the skew execution price), does the token transfers and the logging
+//! (steps 8–9). Everything here only moves value between buckets.
+
+use anchor_lang::prelude::*;
+use crate::errors::PerpsError;
+use crate::instructions::close_position::{referral_fees, referral_reward_paid};
+use crate::pool_math;
+use crate::session;
+use crate::state::{
+    absorb_deficit, distribute_fee, pay_profit, pool_remove, pool_view, touch_peak, ExecutionSource, LpPool, Market,
+    PoolView, Position, PositionStatus, Side, UserAccount,
+};
+
+/// What a close realized. `fee` is what was collected (`fee_c`), after any
+/// referral discount; `payout` is the equity owed to the owner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CloseOutcome {
+    pub pnl: i64,
+    pub funding: i64,
+    /// Realized PnL incl. funding after the haircuts, before the fee.
+    pub p_eff: i64,
+    pub solvency_hc: u64,
+    pub bad_debt_hc: u64,
+    /// The fee after the referral discount (what the position owed).
+    pub fee_charged: u64,
+    /// `fee_c`: the part of `fee_charged` the position covered.
+    pub fee: u64,
+    pub referral_paid: u64,
+    pub payout: u64,
+    pub deficit: u64,
+}
+
+/// Close-path caps (§3 "Net (close)" and "Weekend net", D14): a close that
+/// raises `|net|` must fit the net cap and, inside `W`, the weekend cap, both
+/// against `B`. Not applied to settled markets, liquidations or ADL.
+#[inline(never)]
+pub fn check_close_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, size: u64, mark: u64, now: i64) -> Result<()> {
+    let s = size as i128;
+    let after = match side {
+        Side::Long => v.net - s,
+        Side::Short => v.net + s,
+    };
+    if after.unsigned_abs() <= v.net.unsigned_abs() {
+        return Ok(());
+    }
+    let nn = pool_math::ceil_u(
+        after.unsigned_abs().checked_mul(mark as u128).ok_or(PerpsError::MathOverflow)?,
+        1_000_000,
+    );
+    let p = &pool.params;
+    require!(pool_math::net_cap_ok(nn, p.k_net_bps, v.b), PerpsError::PoolExposureLimit);
+    if session::in_pre_close_window(m.session_schedule, now, p.weekend_cap_window_secs) {
+        require!(
+            pool_math::weekend_cap_ok(nn, p.g_bps(m), p.weekend_lp_loss_bps, v.b),
+            PerpsError::PoolWeekendExposureLimit
+        );
+    }
+    Ok(())
+}
+
+/// `ceil(opened_notional(size)·taker_fee, 10_000)` (D21).
+pub fn close_base_fee(position: &Position, taker_fee: u32) -> u64 {
+    let n = position.opened_notional(position.size) as u128;
+    let fee = pool_math::ceil_u(n * taker_fee as u128, 10_000);
+    u64::try_from(fee).unwrap_or(u64::MAX)
+}
+
+fn to_i64(x: i128) -> i64 {
+    x.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// §4.5 steps 2–7 at `mark` (valuation) and `exec` (the position's price).
+/// `referral` is `(discount_bps, reward_bps)` when a valid referral applies.
+/// On return the position is Closed, its collateral has left
+/// `position_collateral`, the aggregates and OI no longer hold it, and the
+/// fee has been split; the caller pays `payout` (and `referral_paid`) out.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn settle_close(
+    m: &mut Market,
+    pool: &mut LpPool,
+    position: &mut Position,
+    user: &mut UserAccount,
+    position_key: Pubkey,
+    mark: u64,
+    exec: u64,
+    now: i64,
+    referral: Option<(u16, u16)>,
+) -> Result<CloseOutcome> {
+    let settled = m.is_settled();
+    let side = position.side;
+    let size = position.size;
+    let c = position.collateral;
+
+    // 2. Value and caps
+    let v = pool_view(pool, m, mark, now, pool.params.redeem_loss_haircut_bps)?;
+    touch_peak(pool, &v, now);
+    let pnl = position.unrealized_pnl(exec);
+    let fnd = position.accrued_funding(m.cumulative_funding);
+    let p = pnl as i128 + fnd as i128;
+    if !settled {
+        check_close_caps(m, pool, &v, side, size, mark, now)?;
+    }
+
+    // 3. Profit (paid out of cash, after the haircuts) or loss
+    let (p_eff, solvency_hc, bad_debt_hc) = if p > 0 {
+        let amount = u64::try_from(p).map_err(|_| error!(PerpsError::MathOverflow))?;
+        let po = pay_profit(pool, &v, side, amount, false)?;
+        (po.paid as i128, po.solvency_hc, po.bad_debt_hc)
+    } else {
+        (p, 0, 0)
+    };
+
+    // 4. Fee and referral
+    let base_fee = close_base_fee(position, m.taker_fee);
+    let (fee, reward) = referral_fees(base_fee, referral);
+    let eq_before_fee = c as i128 + p_eff;
+    let fee_c = eq_before_fee.clamp(0, fee as i128) as u64;
+    let referral_paid = referral_reward_paid(reward, fee, to_i64(eq_before_fee));
+
+    // 5. Equity
+    let e = eq_before_fee - fee_c as i128;
+
+    // 6. Pool
+    let (payout, deficit) = if e >= 0 {
+        if p_eff <= 0 {
+            let loss = u64::try_from(-p_eff).map_err(|_| error!(PerpsError::MathOverflow))?;
+            pool.cash = pool.cash.checked_add(loss).ok_or(PerpsError::MathOverflow)?;
+        }
+        distribute_fee(m, pool, fee_c.checked_sub(referral_paid).ok_or(PerpsError::BucketUnderflow)?)?;
+        (u64::try_from(e).map_err(|_| error!(PerpsError::MathOverflow))?, 0u64)
+    } else {
+        // Only when p_eff < 0, so fee_c == referral_paid == 0
+        let d = u64::try_from(-e).map_err(|_| error!(PerpsError::MathOverflow))?;
+        pool.cash = pool.cash.checked_add(c).ok_or(PerpsError::MathOverflow)?;
+        absorb_deficit(m, pool, position_key, d, side, v.nav_redeem, now)?;
+        (0u64, d)
+    };
+    pool.position_collateral = pool.position_collateral.checked_sub(c).ok_or(PerpsError::BucketUnderflow)?;
+    pool_remove(pool, side, size, position.entry_price, position.last_funding_payment)?;
+    match side {
+        Side::Long => {
+            m.long_open_interest = m.long_open_interest.checked_sub(size).ok_or(PerpsError::MathOverflow)?;
+        }
+        Side::Short => {
+            m.short_open_interest = m.short_open_interest.checked_sub(size).ok_or(PerpsError::MathOverflow)?;
+        }
+    }
+    if position.execution_source == ExecutionSource::OrderBook {
+        user.house_entry_notional = user
+            .house_entry_notional
+            .checked_sub(position.opened_notional(size))
+            .ok_or(PerpsError::BucketUnderflow)?;
+    }
+
+    // 7. Position and user
+    position.status = PositionStatus::Closed;
+    position.realized_pnl = position.realized_pnl.saturating_add(to_i64(p_eff - fee_c as i128));
+    position.last_updated_at = now;
+    user.realized_pnl = user.realized_pnl.saturating_add(position.realized_pnl);
+    user.total_trades = user.total_trades.saturating_add(1);
+
+    Ok(CloseOutcome {
+        pnl,
+        funding: fnd,
+        p_eff: to_i64(p_eff),
+        solvency_hc,
+        bad_debt_hc,
+        fee_charged: fee,
+        fee: fee_c,
+        referral_paid,
+        payout,
+        deficit,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{bucket_total, pool_add, PoolParams};
+
+    const C6: u64 = 1_000_000;
+
+    fn market() -> Market {
+        Market {
+            maintenance_margin_ratio: 500,
+            initial_margin_ratio: 1_000,
+            taker_fee: 5,
+            max_open_interest: u64::MAX,
+            ..Default::default()
+        }
+    }
+
+    fn mk_pool(cash: u64) -> LpPool {
+        LpPool { cash, lp_shares: cash.max(1), params: PoolParams::neutral(), ..Default::default() }
+    }
+
+    /// Open `contracts` at `entry` dollars with `collateral` dollars, mirrored
+    /// into the pool and the market as the house open will do it.
+    fn open(m: &mut Market, pool: &mut LpPool, user: &mut UserAccount, side: Side, contracts: u64, entry: u64, collateral: u64) -> Position {
+        let mut p = Position::default();
+        p.init_open(Pubkey::default(), Pubkey::default(), side, contracts * C6, collateral * C6, entry * C6, 5_000, m.cumulative_funding, 0, ExecutionSource::OrderBook, 0);
+        pool_add(pool, side, p.size, p.entry_price, p.last_funding_payment).unwrap();
+        pool.position_collateral += p.collateral;
+        match side {
+            Side::Long => m.long_open_interest += p.size,
+            Side::Short => m.short_open_interest += p.size,
+        }
+        user.house_entry_notional += p.opened_notional(p.size);
+        p
+    }
+
+    /// Run settle_close at `mark` and check the bucket step: the buckets fall
+    /// by exactly what leaves (`payout + referral_paid`), §11.
+    fn close(m: &mut Market, pool: &mut LpPool, user: &mut UserAccount, p: &mut Position, mark: u64, referral: Option<(u16, u16)>) -> CloseOutcome {
+        let before = bucket_total(pool, m);
+        let o = settle_close(m, pool, p, user, Pubkey::new_unique(), mark * C6, mark * C6, 1, referral).unwrap();
+        assert_eq!(bucket_total(pool, m), before - o.payout as u128 - o.referral_paid as u128);
+        assert!(p.status == PositionStatus::Closed);
+        o
+    }
+
+    #[test]
+    fn matched_pair_closes_are_zero_sum_and_unwind_the_aggregates() {
+        let (mut m, mut pool, mut user) = (market(), mk_pool(1_000_000 * C6), UserAccount::default());
+        let mut long = open(&mut m, &mut pool, &mut user, Side::Long, 10, 75, 150);
+        let mut short = open(&mut m, &mut pool, &mut user, Side::Short, 10, 75, 150);
+        // Winner first: paid from cash; $750 at 5 bps = $0.375 fee
+        let o = close(&mut m, &mut pool, &mut user, &mut short, 70, None);
+        assert_eq!((o.p_eff, o.fee, o.payout, o.deficit), (50 * C6 as i64, 375_000, 199_625_000, 0));
+        assert_eq!(pool.cash, 1_000_000 * C6 - 50 * C6);
+        let o = close(&mut m, &mut pool, &mut user, &mut long, 70, None);
+        assert_eq!((o.p_eff, o.payout), (-50 * C6 as i64, 99_625_000));
+        // Cash is back where it started; fees went to insurance (neutral target)
+        assert_eq!(pool.cash, 1_000_000 * C6);
+        assert_eq!(m.insurance_fund, 750_000);
+        assert_eq!((pool.open_positions, pool.long_entry_sum, pool.short_entry_sum, pool.position_collateral), (0, 0, 0, 0));
+        assert_eq!((m.long_open_interest, m.short_open_interest, user.house_entry_notional), (0, 0, 0));
+        assert_eq!(long.realized_pnl, -50 * C6 as i64 - 375_000);
+    }
+
+    #[test]
+    fn deficit_goes_through_the_waterfall() {
+        let (mut m, mut pool, mut user) = (market(), mk_pool(1_000_000 * C6), UserAccount::default());
+        m.insurance_fund = 10 * C6;
+        let mut long = open(&mut m, &mut pool, &mut user, Side::Long, 10, 75, 75);
+        let _short = open(&mut m, &mut pool, &mut user, Side::Short, 10, 75, 150);
+        // $150 loss on $75: $75 deficit, $10 from insurance, the rest the LP absorbs
+        let o = close(&mut m, &mut pool, &mut user, &mut long, 60, None);
+        assert_eq!((o.payout, o.fee, o.deficit), (0, 0, 75 * C6));
+        assert_eq!(m.insurance_fund, 0);
+        assert_eq!(pool.cash, 1_000_000 * C6 + 75 * C6 + 10 * C6);
+        assert_eq!((pool.lp_absorbed_window, pool.ins_paid_window, pool.bad_debt_cum), (65 * C6, 10 * C6, 75 * C6));
+        assert!(!pool.adl_required());
+        assert_eq!(user.realized_pnl, -150 * C6 as i64);
+    }
+
+    #[test]
+    fn winner_needs_cash_and_pays_opposite_pending_first() {
+        let (mut m, mut pool, mut user) = (market(), mk_pool(20 * C6), UserAccount::default());
+        let mut short = open(&mut m, &mut pool, &mut user, Side::Short, 10, 75, 150);
+        let _other = open(&mut m, &mut pool, &mut user, Side::Short, 10, 75, 150);
+        // Two unhedged shorts up $50 each with $20 of cash: U = $100 > cash, so
+        // each winner is paid pro rata, 50·20/100 = $10
+        let o = close(&mut m, &mut pool, &mut user, &mut short, 70, None);
+        assert_eq!((o.p_eff, o.solvency_hc), (10 * C6 as i64, 40 * C6));
+
+        // Pending long bad debt is repaid by a short winner before it is paid
+        let (mut m2, mut pool2, mut user2) = (market(), mk_pool(1_000_000 * C6), UserAccount::default());
+        let mut short2 = open(&mut m2, &mut pool2, &mut user2, Side::Short, 10, 75, 150);
+        let _long2 = open(&mut m2, &mut pool2, &mut user2, Side::Long, 10, 75, 150);
+        pool2.pending_bad_debt_long = 30 * C6;
+        pool2.pending_since = 1;
+        let o = close(&mut m2, &mut pool2, &mut user2, &mut short2, 70, None);
+        assert_eq!((o.p_eff, o.bad_debt_hc), (20 * C6 as i64, 30 * C6));
+        assert_eq!((pool2.pending_bad_debt_long, pool2.pending_since, pool2.bad_debt_recovered_cum), (0, 0, 30 * C6));
+    }
+
+    #[test]
+    fn winner_without_cash_fails() {
+        let (mut m, mut pool, mut user) = (market(), mk_pool(10 * C6), UserAccount::default());
+        let mut short = open(&mut m, &mut pool, &mut user, Side::Short, 10, 75, 150);
+        let mut long = open(&mut m, &mut pool, &mut user, Side::Long, 10, 75, 150);
+        m.settlement_price = 70 * C6; // settled: no close-path caps
+        // U = 0 (matched), so no solvency haircut, and $50 > $10 of cash
+        let e = settle_close(&mut m, &mut pool, &mut short, &mut user, Pubkey::default(), 70 * C6, 70 * C6, 1, None).unwrap_err();
+        assert_eq!(e, PerpsError::PoolCashInsufficient.into());
+        // The loser settles in first, then the winner is paid
+        close(&mut m, &mut pool, &mut user, &mut long, 70, None);
+        close(&mut m, &mut pool, &mut user, &mut short, 70, None);
+    }
+
+    #[test]
+    fn referral_reward_leaves_with_the_payout() {
+        let (mut m, mut pool, mut user) = (market(), mk_pool(1_000_000 * C6), UserAccount::default());
+        let mut long = open(&mut m, &mut pool, &mut user, Side::Long, 10, 75, 150);
+        // 10% discount: fee $0.3375, 20% of it ($0.0675) to the referrer
+        let o = close(&mut m, &mut pool, &mut user, &mut long, 75, Some((1_000, 2_000)));
+        assert_eq!((o.fee, o.referral_paid, o.payout), (337_500, 67_500, 150 * C6 - 337_500));
+        assert_eq!(m.insurance_fund, 337_500 - 67_500);
+    }
+
+    #[test]
+    fn close_fee_is_a_ceiling_of_opened_notional() {
+        let mut p = Position::default();
+        // 1 contract at $75.000001: notional 75.000001, fee 0.0375000005 → 37_501
+        p.init_open(Pubkey::default(), Pubkey::default(), Side::Long, C6, C6, 75_000_001, 1_000, 0, 0, ExecutionSource::OrderBook, 0);
+        assert_eq!(close_base_fee(&p, 5), 37_501);
+        p.entry_price = 1; // settle_position_pnl rewrites entry, not the fee basis (D21)
+        assert_eq!(close_base_fee(&p, 5), 37_501);
+        p.opened_price = 75 * C6;
+        assert_eq!(close_base_fee(&p, 5), 37_500);
+    }
+
+    #[test]
+    fn close_caps_apply_only_when_net_rises() {
+        let m = market();
+        let mut pool = mk_pool(1_000_000 * C6);
+        pool.params.k_net_bps = 10_000;
+        // B = $1M; net = +20k contracts long (the counterparties left already)
+        let v = PoolView { net: 20_000 * C6 as i128, b: 1_000_000 * C6 as u128, ..Default::default() };
+        // Closing a long lowers net: never capped
+        check_close_caps(&m, &pool, &v, Side::Long, 1_000 * C6, 75 * C6, 0).unwrap();
+        // Closing a short raises it: 21k · $75 = $1.575M > 1 × $1M
+        let e = check_close_caps(&m, &pool, &v, Side::Short, 1_000 * C6, 75 * C6, 0).unwrap_err();
+        assert_eq!(e, PerpsError::PoolExposureLimit.into());
+        // Exactly at the cap is allowed: (13_333_333_333 + 1)·75 rounds up to ≥ $1M
+        let v0 = PoolView { net: 0, b: 1_000_000 * C6 as u128, ..Default::default() };
+        let at_cap = 13_333_333_333;
+        check_close_caps(&m, &pool, &v0, Side::Short, at_cap, 75 * C6, 0).unwrap();
+        assert!(check_close_caps(&m, &pool, &v0, Side::Short, at_cap + 1, 75 * C6, 0).is_err());
+    }
+
+    #[test]
+    fn weekend_close_cap_inside_the_window() {
+        let mut m = market();
+        m.session_schedule = session::SCHEDULE_CME_GLOBEX;
+        m.weekend_initial_margin_ratio = 2_000;
+        let mut pool = mk_pool(1_000_000 * C6);
+        pool.params.weekend_cap_window_secs = 86_400;
+        pool.params.weekend_lp_loss_bps = 1_000; // α/G = 0.5 × B = $500k
+        let v = PoolView { net: 0, b: 1_000_000 * C6 as u128, ..Default::default() };
+        let size = 8_000 * C6; // $600k of net
+        let friday_close = 1_794_607_200;
+        let wednesday = 1_794_416_400;
+        check_close_caps(&m, &pool, &v, Side::Short, size, 75 * C6, wednesday).unwrap();
+        let e = check_close_caps(&m, &pool, &v, Side::Short, size, 75 * C6, friday_close - 3_600).unwrap_err();
+        assert_eq!(e, PerpsError::PoolWeekendExposureLimit.into());
+        // An explicit G of 10% doubles the room
+        pool.params.weekend_gap_bps = 1_000;
+        check_close_caps(&m, &pool, &v, Side::Short, size, 75 * C6, friday_close - 3_600).unwrap();
+    }
+}

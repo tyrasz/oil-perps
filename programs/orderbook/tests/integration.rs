@@ -156,6 +156,7 @@ impl Env {
             maker_user: fa.maker_user,
             maker_approval: fa.maker_approval,
             maker_position: fa.maker_position,
+            perps_lp_pool: fa.lp_pool,
             perps_core_program: perps_core::ID,
             system_program: system_program::ID,
         };

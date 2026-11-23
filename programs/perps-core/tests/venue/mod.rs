@@ -22,7 +22,7 @@ pub const RELAY2: Pubkey = Pubkey::new_from_array([0x7f; 32]);
 /// accounts: `[perps_core program, ..venue_fill accounts in order]`;
 /// data: venue_fill instruction data, forwarded verbatim. Signer flags are
 /// forwarded as received, plus this program's venue authority.
-fn relay(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+pub(crate) fn relay(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let (perps, rest) = accounts.split_first().unwrap();
     // venue_fill passes the market 4th; other forwarded instructions may have fewer accounts
     let market = rest.get(3).map(|a| *a.key).unwrap_or_default();
@@ -69,7 +69,7 @@ fn relay_ix(relay_program: &Pubkey, fa: &FillAccounts, payer: &Pubkey, params: V
     Instruction { program_id: *relay_program, accounts: metas, data }
 }
 
-async fn relay_fill(base: &mut Base, relay_program: &Pubkey, fa: &FillAccounts, params: VenueFillParams, signers: &[&Keypair]) -> Result<(), BanksClientError> {
+pub(crate) async fn relay_fill(base: &mut Base, relay_program: &Pubkey, fa: &FillAccounts, params: VenueFillParams, signers: &[&Keypair]) -> Result<(), BanksClientError> {
     let payer = base.ctx.payer.pubkey();
     let ix = relay_ix(relay_program, fa, &payer, params, signers);
     send(&mut base.ctx, &[ix], signers).await
@@ -88,6 +88,11 @@ impl Env {
     /// Relay registered (band 50 bps, 15 s oracle, min_signers 0); taker and
     /// maker with $10,000 each and $100,000 approvals in their roles.
     async fn new() -> Env {
+        Env::with_pool(perps_core::state::PoolParams::neutral(), LP_SEED).await
+    }
+
+    /// `new` with the pool on `params`, seeded with `seed` (0 = no LPs).
+    async fn with_pool(params: perps_core::state::PoolParams, seed: u64) -> Env {
         let mut pt = ProgramTest::default();
         // add_program with prefer_bpf off is add_builtin_program; processor!
         // can't be unwrapped here without naming solana-program-runtime's
@@ -96,7 +101,7 @@ impl Env {
         pt.add_program("relay", RELAY, processor!(relay));
         pt.add_program("relay2", RELAY2, processor!(relay));
         pt.prefer_bpf(is_sbf());
-        let mut base = start(pt).await;
+        let mut base = start_seeded(pt, params, seed).await;
         let venue = register_venue(&mut base, &RELAY, default_venue_params()).await;
         let taker = trader(&mut base, DEPOSIT).await;
         let maker = trader(&mut base, DEPOSIT).await;
@@ -888,4 +893,324 @@ async fn a_venue_cannot_widen_a_signing_takers_approval() {
     let revoke = relay_wrap(&RELAY, revoke_ix(&taker.pubkey(), &venue, ROLE_TAKER));
     send(&mut env.base.ctx, &[revoke], &[&taker]).await.unwrap();
     assert!(!exists(&mut env.base, approval_pda(&taker.pubkey(), &venue, ROLE_TAKER)).await);
+}
+
+// --- the LP pool behind venue pairs (docs/lp-pool.md §4.8, §17.2 #1, #4–#6, #9, #10) ---
+
+/// LP mark NAV, `cash − U` (no vesting in these tests).
+async fn nav_mark(base: &mut Base, mark: u64) -> i128 {
+    let v = pool_view_at(base, mark).await;
+    pool(base).await.cash as i128 - v.u
+}
+
+#[tokio::test]
+async fn venue_fills_need_a_seeded_pool_and_feed_it() {
+    let mut env = Env::with_pool(perps_core::state::PoolParams::neutral(), 0).await;
+    let (fa, n) = env.std_accounts();
+    env.rejects(&fa, fill_params(n), &[], perr(PerpsError::PoolHasNoLps)).await;
+
+    let mut env = Env::new().await;
+    let (tp, mp) = env.std_fill().await;
+    let pl = pool(&mut env.base).await;
+    // −(tc+mc) from free, +(tc+mc) to position collateral; both legs in the aggregates
+    assert_eq!(pl.free_collateral, 2 * DEPOSIT - 753_300_000 - 750_300_000);
+    assert_eq!(pl.position_collateral, 753_300_000 + 750_300_000);
+    assert_eq!((pl.open_positions, pl.long_entry_sum, pl.short_entry_sum), (2, 100 * CONTRACT as u128 * 75_030_000, 100 * CONTRACT as u128 * 75_030_000));
+    let owners = [env.taker.key(), env.maker.key()];
+    assert_conservation(&mut env.base, 75_000_000, &owners, &[tp, mp]).await;
+    assert_eq!(pool_view_at(&mut env.base, 80_000_000).await.u, 0);
+}
+
+/// §17.2 #1, the instructions `trading_needs_the_market_pool` in
+/// integration.rs does not reach: with the market's pool account gone,
+/// venue_fill, close_position, add_margin, liquidate, settle_position_pnl
+/// and adl all fail `AccountNotInitialized` (as do deposit and withdraw).
+#[tokio::test]
+async fn every_trading_instruction_needs_the_market_pool() {
+    let mut env = Env::new().await;
+    let (tp, _mp) = env.std_fill().await;
+    let lp_pool = env.base.lp_pool;
+    env.base.ctx.set_account(&lp_pool, &solana_sdk::account::AccountSharedData::default());
+    let not_init = aerr(AnchorError::AccountNotInitialized);
+    let (fa, n) = env.std_accounts();
+    assert_eq!(custom_error(env.fill(&fa, fill_params(n)).await), not_init);
+    let (taker, keeper) = (env.taker.key(), env.keeper.kp.insecure_clone());
+    let t = Trader { kp: env.taker.kp.insecure_clone(), tokens: env.taker.tokens, user: env.taker.user };
+    assert_eq!(custom_error(close(&mut env.base, &t, tp).await), not_init);
+    assert_eq!(custom_error(add_margin(&mut env.base, &t, tp, USDC).await), not_init);
+    let k = Trader { kp: keeper, tokens: env.keeper.tokens, user: env.keeper.user };
+    assert_eq!(custom_error(liquidate(&mut env.base, &k, &taker, tp).await), not_init);
+    assert_eq!(custom_error(settle_pnl(&mut env.base, tp).await), not_init);
+    assert_eq!(custom_error(adl(&mut env.base, None, &taker, tp, 0, 0).await), not_init);
+    assert_eq!(custom_error(deposit(&mut env.base, &t, USDC).await), not_init);
+    assert_eq!(custom_error(withdraw(&mut env.base, &t, USDC).await), not_init);
+}
+
+#[tokio::test]
+async fn matched_pairs_leave_nav_unchanged() {
+    let mut env = Env::new().await;
+    let start_cash = pool(&mut env.base).await.cash;
+    let v0 = pool_view_at(&mut env.base, 75_000_000).await;
+    let (tp, mp) = env.std_fill().await;
+    // A second pair at the other band edge, taker short
+    let (fa, n) = env.std_accounts();
+    let p2 = VenueFillParams { taker_side: 1, price: 74_700_000, ..fill_params(n) };
+    env.fill(&fa, p2).await.unwrap();
+    let owners = [env.taker.key(), env.maker.key()];
+    let all = [tp, mp, fa.taker_position, fa.maker_position];
+    for (t, price) in [(WEDNESDAY + 3_600, 78.0), (WEDNESDAY + 7_200, 71.5), (WEDNESDAY + 10_800, 75.0)] {
+        set_time(&mut env.base, t).await;
+        set_price(&mut env.base, price).await;
+        update_funding(&mut env.base).await.unwrap();
+        let mark = usd(price);
+        let v = pool_view_at(&mut env.base, mark).await;
+        // Matched: U is exactly 0, NAV is the seed within slack
+        assert_eq!(v.u, 0);
+        assert!((v.nav_mint - v0.nav_mint).abs() <= 8 && (v.nav_redeem - v0.nav_redeem).abs() <= 8);
+        assert_conservation(&mut env.base, mark, &owners, &all).await;
+    }
+    set_price(&mut env.base, 76.0).await;
+    for (who, p) in [(0, tp), (1, mp), (0, fa.taker_position), (1, fa.maker_position)] {
+        let t = if who == 0 { &env.taker } else { &env.maker };
+        let ix = close_ix(&env.base, t, p);
+        send(&mut env.base.ctx, &[ix], &[&t.kp]).await.unwrap();
+    }
+    // Cash is back where it started; the close fees went to insurance (neutral target)
+    let fees = 4 * 3_751_500 - 2 * 3_751_500 + 2 * 3_735_000;
+    assert_eq!(pool(&mut env.base).await.cash, start_cash);
+    assert_eq!(market(&mut env.base).await.insurance_fund, fees);
+    assert_buckets(&mut env.base).await;
+}
+
+#[tokio::test]
+async fn an_orphan_leg_is_valued_like_any_position() {
+    for winner_first in [true, false] {
+        let mut env = Env::new().await;
+        let (tp, mp) = env.std_fill().await;
+        set_price(&mut env.base, 78.0).await;
+        let before = nav_mark(&mut env.base, 78_000_000).await;
+        let (first, p) = if winner_first { (&env.taker, tp) } else { (&env.maker, mp) };
+        let ix = close_ix(&env.base, first, p);
+        let kp = first.kp.insecure_clone();
+        send(&mut env.base.ctx, &[ix], &[&kp]).await.unwrap();
+        // The survivor is ordinary net exposure: NAV moves only by the fee
+        // (insurance) and the 1-unit truncation slack
+        let after = nav_mark(&mut env.base, 78_000_000).await;
+        assert!((after - before).abs() <= 1, "{} vs {}", after, before);
+        let v = pool_view_at(&mut env.base, 78_000_000).await;
+        assert_eq!(v.u, if winner_first { -297 * USDC as i128 } else { 297 * USDC as i128 });
+    }
+}
+
+#[tokio::test]
+async fn a_settled_loser_does_not_haircut_the_winner() {
+    let mut env = Env::new().await;
+    let (tp, mp) = env.std_fill().await;
+    set_price(&mut env.base, 78.0).await;
+    // The losing short settles its −$297 into cash; NAV does not move (F3)
+    let before = nav_mark(&mut env.base, 78_000_000).await;
+    let maker_before: Position = load(&mut env.base, mp).await;
+    settle_pnl(&mut env.base, mp).await.unwrap();
+    let m: Position = load(&mut env.base, mp).await;
+    assert_eq!((m.entry_price, m.collateral, m.realized_pnl), (78_000_000, 750_300_000 - 297 * USDC, -297 * USDC as i64));
+    assert_eq!(m.equity(78_000_000, 0), maker_before.equity(78_000_000, 0));
+    assert_eq!(m.opened_price, 75_030_000);
+    assert_eq!(nav_mark(&mut env.base, 78_000_000).await, before);
+    // The winner closes with no haircut: $753.30 + $297 − $3.7515
+    let paid = token_balance(&mut env.base, env.taker.tokens).await;
+    close(&mut env.base, &env.taker, tp).await.unwrap();
+    assert_eq!(token_balance(&mut env.base, env.taker.tokens).await - paid, 1_046_548_500);
+    // LP exits stay open
+    let seed = Lp { kp: env.base.seed_lp.kp.insecure_clone(), tokens: env.base.seed_lp.tokens, position: env.base.seed_lp.position };
+    lp_request(&mut env.base, &seed, 1_000 * USDC).await.unwrap();
+    lp_withdraw(&mut env.base, &seed).await.unwrap();
+    // The maker later closes at $78 for its remaining collateral less the
+    // fee on its opened notional (D21): realized PnL accumulates
+    close(&mut env.base, &env.maker, mp).await.unwrap();
+    let m: Position = load(&mut env.base, mp).await;
+    assert_eq!(m.realized_pnl, -297 * USDC as i64 - 3_751_500);
+    assert_eq!(user(&mut env.base, &env.maker.key()).await.realized_pnl, -297 * USDC as i64 - 3_751_500);
+    assert_buckets(&mut env.base).await;
+}
+
+#[tokio::test]
+async fn winners_wait_for_cash_and_settle_pnl_brings_it() {
+    let mut env = Env::new().await;
+    let (tp, mp) = env.std_fill().await;
+    set_price(&mut env.base, 78.0).await;
+    // A house long of 200 at $78 makes the taker's close lower |net| (no
+    // close cap) and keeps U at 0
+    let carol = trader(&mut env.base, 5_000 * USDC).await;
+    open(&mut env.base, &carol, 0, 200, 5).await.unwrap();
+    // Drain LP cash to $100 (as if LPs had lost it): U = 0, so no solvency
+    // haircut, and the $297 payout does not fit
+    let lp = env.base.lp_pool;
+    patch::<perps_core::state::LpPool>(&mut env.base, lp, |p| p.cash = 100 * USDC).await;
+    assert_eq!(custom_error(close(&mut env.base, &env.taker, tp).await), perr(PerpsError::PoolCashInsufficient));
+    // Settling a winner, or a loss the collateral cannot cover, is refused
+    assert_eq!(custom_error(settle_pnl(&mut env.base, tp).await), perr(PerpsError::NothingToSettle));
+    set_price(&mut env.base, 85.0).await;
+    assert_eq!(custom_error(settle_pnl(&mut env.base, mp).await), perr(PerpsError::SettleWouldBankrupt));
+    set_price(&mut env.base, 78.0).await;
+    settle_pnl(&mut env.base, mp).await.unwrap();
+    assert_eq!(pool(&mut env.base).await.cash, 397 * USDC);
+    close(&mut env.base, &env.taker, tp).await.unwrap();
+    assert_eq!(token_balance(&mut env.base, env.taker.tokens).await, 1_046_548_500);
+    assert_eq!(pool(&mut env.base).await.cash, 100 * USDC);
+}
+
+/// Red-team F1: a self-crossed pair cannot dump naked net on the pool by
+/// closing one leg.
+#[tokio::test]
+async fn closing_one_leg_of_a_self_cross_is_capped() {
+    // Net cap 0.5% of $1M = $5,000 of net
+    let params = perps_core::state::PoolParams { k_net_bps: 50, adl_net_target_bps: 0, ..perps_core::state::PoolParams::neutral() };
+    let mut env = Env::with_pool(params, LP_SEED).await;
+    // House net +60 contracts ($4,500)
+    let carol = trader(&mut env.base, 10_000 * USDC).await;
+    open(&mut env.base, &carol, 0, 60, 5).await.unwrap();
+    let (tp, mp) = env.std_fill().await;
+    // Closing the short leg takes net to +160 ($12,000): refused
+    assert_eq!(custom_error(close(&mut env.base, &env.maker, mp).await), perr(PerpsError::PoolExposureLimit));
+    // Hedging on the venue leaves net unchanged, so it is never capped
+    let (fa, n) = env.std_accounts();
+    env.fill(&fa, VenueFillParams { taker_side: 1, ..fill_params(n) }).await.unwrap();
+    // Closing the long leg lowers |net| (60 → 40): allowed
+    close(&mut env.base, &env.taker, tp).await.unwrap();
+    assert_buckets(&mut env.base).await;
+}
+
+/// Review finding (deficit ADL bypassing the caps): while bad debt is
+/// pending, house opens are frozen, but a permissionless deficit ADL of one
+/// leg of a self-cross would leave its other leg as naked net. A mode-0 ADL
+/// that raises |net| is held to the close-path caps like a close.
+#[tokio::test]
+async fn deficit_adl_of_one_leg_of_a_self_cross_is_capped() {
+    // Net cap 0.5% of $1M = $5,000 of net
+    let params = perps_core::state::PoolParams { k_net_bps: 50, adl_net_target_bps: 0, ..perps_core::state::PoolParams::neutral() };
+    let mut env = Env::with_pool(params, LP_SEED).await;
+    // House net +60 contracts ($4,500)
+    let carol = trader(&mut env.base, 10_000 * USDC).await;
+    open(&mut env.base, &carol, 0, 60, 5).await.unwrap();
+    let (_tp, mp) = env.std_fill().await;
+    // $1 of long bad debt pending, its floor fully decayed; the short leg
+    // (entry $75.03) is a winner at $75
+    let t = env.now().await;
+    let lp_pool = env.base.lp_pool;
+    patch::<perps_core::state::LpPool>(&mut env.base, lp_pool, |p| {
+        p.pending_bad_debt_long = USDC;
+        p.pending_since = t;
+    })
+    .await;
+    set_time(&mut env.base, t + perps_core::state::ADL_FLOOR_DECAY_SECS).await;
+    set_price(&mut env.base, 75.0).await;
+    let maker = env.maker.key();
+    // House opens are frozen while debt is pending
+    assert_eq!(custom_error(open(&mut env.base, &carol, 0, 1, 5).await.map(|_| ())), perr(PerpsError::PoolAdlPending));
+    // ADL of the whole short leg would take net to +160 ($12,000): refused
+    assert_eq!(custom_error(adl(&mut env.base, None, &maker, mp, 0, 0).await), perr(PerpsError::PoolExposureLimit));
+    // 6 contracts (net 66, $4,950) fit
+    adl(&mut env.base, None, &maker, mp, 0, 6 * CONTRACT).await.unwrap();
+    assert_eq!(pool_view_at(&mut env.base, 75_000_000).await.net, 66 * CONTRACT as i128);
+    assert_buckets(&mut env.base).await;
+}
+
+/// §17.2 #2: `max_pool_cash` is compared with NAV_mint, so a matched loser
+/// settling its loss into cash does not use up the cap.
+#[tokio::test]
+async fn max_pool_cash_ignores_a_matched_loser_settling_in() {
+    let mut env = Env::new().await;
+    let (_tp, mp) = env.std_fill().await;
+    set_price(&mut env.base, 78.0).await;
+    let v0 = pool_view_at(&mut env.base, 78_000_000).await;
+    let admin = env.base.admin.insecure_clone();
+    set_max_pool_cash(&mut env.base, &admin, v0.nav_mint as u64 + 100 * USDC).await.unwrap();
+    // The losing short pays $297 into cash; U rises by the same amount
+    let cash0 = pool(&mut env.base).await.cash;
+    settle_pnl(&mut env.base, mp).await.unwrap();
+    assert_eq!(pool(&mut env.base).await.cash, cash0 + 297 * USDC);
+    let v1 = pool_view_at(&mut env.base, 78_000_000).await;
+    assert!((v1.nav_mint - v0.nav_mint).abs() <= 2, "{} vs {}", v1.nav_mint, v0.nav_mint);
+    // The $100 of headroom is still there (less the slack)
+    let l2 = lp(&mut env.base, 200 * USDC).await;
+    lp_deposit(&mut env.base, &l2, 100 * USDC - 10, 0).await.unwrap();
+    assert_eq!(custom_error(lp_deposit(&mut env.base, &l2, 20 * USDC, 0).await), perr(PerpsError::PoolCashCapExceeded));
+}
+
+/// §17.2 #8, red-team F7: a pending withdrawal shrinks capNAV for new opens
+/// but not B, which the close-path cap uses.
+#[tokio::test]
+async fn pending_withdrawals_shrink_capnav_but_not_b_for_closes() {
+    // Net cap 10%: $100k of net on B ≈ $1M
+    let params = perps_core::state::PoolParams { k_net_bps: 1_000, adl_net_target_bps: 0, ..perps_core::state::PoolParams::neutral() };
+    let mut env = Env::with_pool(params, LP_SEED).await;
+    let carol = trader(&mut env.base, 100_000 * USDC).await;
+    open(&mut env.base, &carol, 0, 1_200, 5).await.unwrap(); // $90k of net
+    let (_tp, mp) = env.std_fill().await;
+    let seed = Lp { kp: env.base.seed_lp.kp.insecure_clone(), tokens: env.base.seed_lp.tokens, position: env.base.seed_lp.position };
+    lp_request(&mut env.base, &seed, LP_SEED / 2).await.unwrap();
+    let v = pool_view_at(&mut env.base, 75_000_000).await;
+    assert!(v.cap_nav * 2 <= v.b + 2 && v.b > 999_990 * USDC as u128);
+    // Opens: capNAV ≈ $500k, cap ≈ $50k, already exceeded
+    assert_eq!(custom_error(open(&mut env.base, &carol, 0, 1, 5).await.map(|_| ())), perr(PerpsError::PoolExposureLimit));
+    // Closing the short leg raises net to 1,300 contracts ($97.5k): within 10% of B
+    close(&mut env.base, &env.maker, mp).await.unwrap();
+    assert_eq!(pool_view_at(&mut env.base, 75_000_000).await.net, 1_300 * CONTRACT as i128);
+}
+
+/// Red-team F1 inside the weekend window: closing one leg of a self-cross is
+/// held to the weekend cap (`PoolWeekendExposureLimit`).
+#[tokio::test]
+async fn closing_one_leg_of_a_self_cross_is_weekend_capped_inside_the_window() {
+    // α = 0.1%, G derived = 20% (weekend IM): $5,000 of net inside W
+    let params = perps_core::state::PoolParams { weekend_cap_window_secs: 86_400, weekend_lp_loss_bps: 10, ..perps_core::state::PoolParams::neutral() };
+    let mut env = Env::with_pool(params, LP_SEED).await;
+    configure(&mut env.base, cme_config()).await.unwrap();
+    // House net +60 contracts ($4,500), opened on Wednesday
+    let carol = trader(&mut env.base, 10_000 * USDC).await;
+    open(&mut env.base, &carol, 0, 60, 5).await.unwrap();
+    // Friday 10:00 ET: inside the 24 h window, outside the 2 h margin window
+    let friday_morning = FRIDAY_CLOSE - 7 * 3_600;
+    set_time(&mut env.base, friday_morning).await;
+    let venue = env.venue;
+    for (kp, role) in [(env.taker.kp.insecure_clone(), ROLE_TAKER), (env.maker.kp.insecure_clone(), ROLE_MAKER)] {
+        update_approval(&mut env.base, &kp, &venue, role, approval_params(ALLOWANCE, friday_morning)).await.unwrap();
+    }
+    // A venue pair is never capped
+    let (tp, mp) = env.std_fill().await;
+    // Closing the short leg takes net to +160 ($12,000): over the weekend cap
+    // (the 10× net cap would allow it)
+    assert_eq!(custom_error(close(&mut env.base, &env.maker, mp).await), perr(PerpsError::PoolWeekendExposureLimit));
+    // Closing the long leg lowers |net| (60 → 40): allowed inside W
+    close(&mut env.base, &env.taker, tp).await.unwrap();
+    assert_buckets(&mut env.base).await;
+}
+
+/// §6.3 on a venue leg: a stage-1 slice keeps the remainder open, never
+/// touches the house notional (venue positions are not house risk), and the
+/// pool's aggregates follow the slice (checked after every transaction).
+#[tokio::test]
+async fn venue_legs_take_stage_one_slices() {
+    let params = perps_core::state::PoolParams {
+        backstop_threshold_bps: 6_667,
+        liq_penalty_bps: 200,
+        liq_keeper_share_bps: 2_000,
+        min_liq_slice_bps: 2_000,
+        liq_min_remaining_notional: 100 * USDC,
+        ..perps_core::state::PoolParams::neutral()
+    };
+    let mut env = Env::with_pool(params, LP_SEED).await;
+    let (tp, mp) = env.std_fill().await;
+    // Taker long 100 @ $75.03 with $753.30: at $71 equity is $350.30, 4.93% of mark notional
+    set_price(&mut env.base, 71.0).await;
+    let keeper = env.keeper.kp.insecure_clone();
+    let ix = liquidate_ix(&env.base, &env.keeper, &env.taker.key(), tp);
+    let ev: Vec<perps_core::events::PositionLiquidated> = send_events(&mut env.base.ctx, &[ix], &[&keeper]).await.unwrap();
+    assert_eq!(ev[0].stage, 1);
+    let t: Position = load(&mut env.base, tp).await;
+    assert!(t.status == PositionStatus::Open && t.size < 100 * CONTRACT && t.size + ev[0].size_closed == 100 * CONTRACT);
+    assert_eq!(user(&mut env.base, &env.taker.key()).await.house_entry_notional, 0);
+    // The short leg is the only other position
+    let owners = [env.taker.key(), env.maker.key(), env.keeper.key()];
+    assert_conservation(&mut env.base, 71 * USDC, &owners, &[tp, mp]).await;
 }
