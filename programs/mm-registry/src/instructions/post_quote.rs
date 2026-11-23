@@ -54,14 +54,11 @@ pub fn handler(ctx: Context<PostQuote>, params: PostQuoteParams) -> Result<()> {
     // Validate quote parameters
     require!(params.bid_price > 0, MmRegistryError::InvalidPrice);
     require!(params.ask_price > params.bid_price, MmRegistryError::InvalidPrice);
-    require!(
-        params.bid_size >= registry.min_quote_size && params.bid_size <= registry.max_quote_size,
-        MmRegistryError::QuoteSizeTooSmall
-    );
-    require!(
-        params.ask_size >= registry.min_quote_size && params.ask_size <= registry.max_quote_size,
-        MmRegistryError::QuoteSizeTooLarge
-    );
+    // Each bound reports its own error (they used to be keyed by side)
+    for size in [params.bid_size, params.ask_size] {
+        require!(size >= registry.min_quote_size, MmRegistryError::QuoteSizeTooSmall);
+        require!(size <= registry.max_quote_size, MmRegistryError::QuoteSizeTooLarge);
+    }
 
     // Check spread
     let spread = (params.ask_price - params.bid_price) as u128 * 10000 / params.bid_price as u128;

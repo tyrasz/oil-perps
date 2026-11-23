@@ -62,14 +62,11 @@ pub fn handler(ctx: Context<UpdateQuote>, params: UpdateQuoteParams) -> Result<(
     let new_bid_size = params.bid_size.unwrap_or(quote.bid_size);
     let new_ask_size = params.ask_size.unwrap_or(quote.ask_size);
 
-    require!(
-        new_bid_size >= registry.min_quote_size && new_bid_size <= registry.max_quote_size,
-        MmRegistryError::QuoteSizeTooSmall
-    );
-    require!(
-        new_ask_size >= registry.min_quote_size && new_ask_size <= registry.max_quote_size,
-        MmRegistryError::QuoteSizeTooLarge
-    );
+    // Each bound reports its own error (they used to be keyed by side)
+    for size in [new_bid_size, new_ask_size] {
+        require!(size >= registry.min_quote_size, MmRegistryError::QuoteSizeTooSmall);
+        require!(size <= registry.max_quote_size, MmRegistryError::QuoteSizeTooLarge);
+    }
 
     // Calculate new remaining based on size changes
     let bid_filled = quote.bid_size - quote.bid_remaining;

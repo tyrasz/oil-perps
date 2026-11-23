@@ -609,6 +609,24 @@ async fn legacy_quotes_are_cancellable() {
     assert!(!exists(&mut env.base, quote).await);
 }
 
+/// Size bounds report which bound was broken, on either side.
+#[tokio::test]
+async fn quote_size_errors_name_the_broken_bound() {
+    let mut env = Env::new().await;
+    let mm = env.mm.t.kp.insecure_clone();
+    let reg: MmRegistry = load(&mut env.base, env.registry).await;
+    let (too_small, too_large) = (reg.min_quote_size - 1, reg.max_quote_size + 1);
+    for (bid_size, ask_size, code) in [
+        (too_small, CONTRACT * 10, MmRegistryError::QuoteSizeTooSmall),
+        (too_large, CONTRACT * 10, MmRegistryError::QuoteSizeTooLarge),
+        (CONTRACT * 10, too_small, MmRegistryError::QuoteSizeTooSmall),
+        (CONTRACT * 10, too_large, MmRegistryError::QuoteSizeTooLarge),
+    ] {
+        let params = PostQuoteParams { bid_size, ask_size, ..quote_params() };
+        assert_eq!(custom_error(env.post_quote(&mm, params).await.map(|_| ())), mm_error(code));
+    }
+}
+
 /// The old post_quote allowed any expiry; a legacy quote must not become
 /// fillable for years once it is given a leverage.
 #[tokio::test]
