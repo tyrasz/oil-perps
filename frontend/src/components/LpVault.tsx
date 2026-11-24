@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useVault } from '../hooks/useVault';
 import { useMarketStore } from '../stores/marketStore';
-import { adlRequired, drawdownNow, fromUnits, isSettled, toUnits, depositShares } from '../utils/pool';
+import { adlRequired, drawdownNow, fromUnits, isSettled, toUnits, depositShares, withdrawRefusal } from '../utils/pool';
 import { redeemValue, unvested } from '../utils/poolMath';
 import { explainProgramError, type ErrorContext } from '../utils/errors';
 import { formatDuration } from '../utils/session';
@@ -90,6 +90,21 @@ export function LpVault() {
   };
 
   const netSide = view ? (view.net > 0n ? 'SHORT' : view.net < 0n ? 'LONG' : 'FLAT') : 'FLAT';
+  // lp_withdraw's post-checks on the payout (§9.4 step 8): the cash, the
+  // hard-net line and, with the weekend bound on, G·net ≤ α·B' (D43)
+  const refusal = request && request.state === 'claimable' && view ? withdrawRefusal(market, pool, view, request.payout) : null;
+  const refusalText =
+    refusal?.line === 'weekend'
+      ? "Claiming now would leave the pool's capital below its weekend bound: a weekend gap of G on the traders' open net must cost " +
+        `LPs at most ${bps(p.weekendLpLossBps)} of the capital that stays, so capital backing that net cannot leave. ` +
+        'Claim part of it (cancel and request fewer shares), or wait until traders close and the net shrinks. ' +
+        'Exposure ADL does not make this room: it stops at this same line, so with the net held at the cap a claim stays refused ' +
+        '(an open owner decision, docs/lp-pool.md §18).'
+      : refusal?.line === 'hard_net'
+      ? explainProgramError('PoolCapWouldBreach', { action: 'lpWithdraw' })
+      : refusal
+      ? explainProgramError(refusal.error, { action: 'lpWithdraw' })
+      : null;
   const flowGates = action === 'deposit' ? gates?.deposit ?? [] : gates?.request ?? [];
 
   return (
@@ -199,6 +214,7 @@ export function LpVault() {
                   {m}
                 </div>
               ))}
+            {refusalText && <div className="cooldown-notice">{refusalText}</div>}
             <div className="request-actions">
               {request.state === 'claimable' && (
                 <button className="submit-btn withdraw" onClick={() => withdraw().catch(() => {})} disabled={isLoading}>
@@ -297,6 +313,12 @@ export function LpVault() {
         <div className="info-item">
           <span title="No LP withdrawals this long before the weekly close (W)">Pre-close exit block</span>
           <span>{p.weekendCapWindowSecs > 0n ? formatDuration(Number(p.weekendCapWindowSecs)) : 'off'}</span>
+        </div>
+        <div className="info-item">
+          <span title="With the weekend bound on, the pool's net is held to α/G of its capital at all times, and LP capital backing it cannot be withdrawn (D43)">
+            Weekend bound
+          </span>
+          <span>{p.weekendCapWindowSecs > 0n ? `gap loss ≤ ${bps(p.weekendLpLossBps)} of capital` : 'off'}</span>
         </div>
         <div className="info-item">
           <span title="No LP deposits or withdrawals this long after each session open (Q)">Reopen quiet</span>

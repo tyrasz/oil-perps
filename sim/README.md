@@ -47,9 +47,11 @@ Options: `--scenario normal|stress|adversarial`, `--seed N`, `--days D` (default
   sandwich around a donation, a flash move that makes the prober's 10x long
   stage-1 liquidatable (self-liquidation must lose against a close; an LP
   sandwich around the keeper's liquidations gains nothing), a self-crossed
-  venue pair whose legs close until the net cap (and, inside `W`, the
-  weekend cap) refuses one (a house open past it too; a free LP request
-  must not make exposure ADL eligible), and a 30% gap at one daily reopen
+  venue pair whose legs close until the net cap (and the weekend cap,
+  inside `W` and outside it, with the weekend IM raised first so the
+  always-on weekend cap is the tighter, D43) refuses one (a house open past
+  it too; a free LP request must not make exposure ADL eligible; in longer
+  runs an LP claim with the net at the weekend cap), and a 30% gap at one daily reopen
   under a pair sized to leave bad debt pending: the winner's close and its
   own mode-0 ADL inside the profit-close quiet time, a mode-0 ADL under the
   fresh floor, LP flows inside `Q`, in `W` and while debt is pending are
@@ -123,7 +125,11 @@ The report's `pool` section has the NAV path (hourly), the drawdown,
 capital use (`capNAV`, `B`, net against the caps), haircuts by kind,
 PoolCashInsufficient rejections, deficits and how the waterfall took them,
 ADL by mode and trigger, funding `periods_dropped` (must be 0), and per
-weekly close the net, `G·net/B`, the carried-in excess over `α·B/G`, the
+weekly close the net, `G·net/B`, the carried-in excess over `α·B/G` and
+the documented exceptions that explain it (`weekend_bound_breaks` totals
+every step that broke `G·net ≤ α·B`; the exceptions cover a step by size,
+and an excess with any step they do not cover fails invariant 15, D43,
+D44), the
 reopen gap and the weekend drawdown against its bound (docs/lp-pool.md
 §17.4), with the week's liquidations, ADL by mode, haircuts, deficits, LP
 flows and peak drawdown. The `probes` section lists each probe's checks and

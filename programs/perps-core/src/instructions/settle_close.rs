@@ -35,10 +35,15 @@ pub struct CloseOutcome {
 }
 
 /// Close-path caps (§3 "Net (close)" and "Weekend net", D14): a close that
-/// raises `|net|` must fit the net cap and, inside `W`, the weekend cap, both
-/// against `B`. Not applied to settled markets, liquidations or ADL.
+/// raises `|net|` must fit the net cap and, with the weekend bound on
+/// (`weekend_cap_window_secs > 0`, D43), the weekend cap, both against `B`;
+/// the weekend cap's `B` is net of the close's skew-premium shortfall at
+/// `exec` (`premium_shortfall`; mode-0 ADL closes at the mark, so all of
+/// its `Δx`). Not applied to settled markets or liquidations; mode-0 ADL
+/// uses it (D25).
 #[inline(never)]
-pub fn check_close_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, size: u64, mark: u64, now: i64) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn check_close_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, size: u64, mark: u64, exec: u64) -> Result<()> {
     let s = size as i128;
     let after = match side {
         Side::Long => v.net - s,
@@ -53,9 +58,12 @@ pub fn check_close_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, siz
     );
     let p = &pool.params;
     require!(pool_math::net_cap_ok(nn, p.k_net_bps, v.b), PerpsError::PoolExposureLimit);
-    if session::in_pre_close_window(m.session_schedule, now, p.weekend_cap_window_secs) {
+    // Always on with the weekend bound (D43), not only inside W
+    if p.weekend_bound_on() {
+        let short = pool_math::premium_shortfall(v.net, after, mark, exec, size, p.skew_scale, p.max_impact_bps)
+            .ok_or(PerpsError::MathOverflow)?;
         require!(
-            pool_math::weekend_cap_ok(nn, p.g_bps(m), p.weekend_lp_loss_bps, v.b),
+            pool_math::weekend_cap_ok(nn, p.g_bps(m), p.weekend_lp_loss_bps, v.b.saturating_sub(short)),
             PerpsError::PoolWeekendExposureLimit
         );
     }
@@ -127,7 +135,7 @@ pub fn settle_close(
     // D35)
     require!(!(p > 0 && in_profit_close_quiet(m, pool, now)), PerpsError::ProfitCloseQuiet);
     if !settled {
-        check_close_caps(m, pool, &v, side, size, mark, now)?;
+        check_close_caps(m, pool, &v, side, size, mark, exec)?;
     }
 
     // 3. Profit (paid out of cash, after the haircuts) or loss
@@ -388,19 +396,60 @@ mod tests {
         // B = $1M; net = +20k contracts long (the counterparties left already)
         let v = PoolView { net: 20_000 * C6 as i128, b: 1_000_000 * C6 as u128, ..Default::default() };
         // Closing a long lowers net: never capped
-        check_close_caps(&m, &pool, &v, Side::Long, 1_000 * C6, 75 * C6, 0).unwrap();
+        check_close_caps(&m, &pool, &v, Side::Long, 1_000 * C6, 75 * C6, 75 * C6).unwrap();
         // Closing a short raises it: 21k · $75 = $1.575M > 1 × $1M
-        let e = check_close_caps(&m, &pool, &v, Side::Short, 1_000 * C6, 75 * C6, 0).unwrap_err();
+        let e = check_close_caps(&m, &pool, &v, Side::Short, 1_000 * C6, 75 * C6, 75 * C6).unwrap_err();
         assert_eq!(e, PerpsError::PoolExposureLimit.into());
         // Exactly at the cap is allowed: (13_333_333_333 + 1)·75 rounds up to ≥ $1M
         let v0 = PoolView { net: 0, b: 1_000_000 * C6 as u128, ..Default::default() };
         let at_cap = 13_333_333_333;
-        check_close_caps(&m, &pool, &v0, Side::Short, at_cap, 75 * C6, 0).unwrap();
-        assert!(check_close_caps(&m, &pool, &v0, Side::Short, at_cap + 1, 75 * C6, 0).is_err());
+        check_close_caps(&m, &pool, &v0, Side::Short, at_cap, 75 * C6, 75 * C6).unwrap();
+        assert!(check_close_caps(&m, &pool, &v0, Side::Short, at_cap + 1, 75 * C6, 75 * C6).is_err());
     }
 
+    /// D43 review finding (skew clamp): the weekend cap on a net-raising
+    /// close counts the close's skew-premium shortfall against `B`, and a
+    /// deficit-mode ADL (at the mark, no premium) all of its `Δx`.
     #[test]
-    fn weekend_close_cap_inside_the_window() {
+    fn weekend_close_cap_counts_the_premium_shortfall() {
+        let mut m = market();
+        m.weekend_initial_margin_ratio = 2_000;
+        let mut pool = mk_pool(1_000_000 * C6);
+        pool.params.weekend_cap_window_secs = 86_400;
+        pool.params.weekend_lp_loss_bps = 1_000;
+        pool.params.skew_scale = 2_500_000_000_000;
+        pool.params.max_impact_bps = 100;
+        let o = 75 * C6;
+        // net +25k; B $12.75M: α·B/G = $6.375M = 85k contracts at $75
+        let n = 25_000 * C6 as i128;
+        let v = PoolView { net: n, b: 12_750_000 * C6 as u128, ..Default::default() };
+        let s = 60_000 * C6;
+        // Closing a short is a buy at the clamped skew price
+        let exec = crate::state::skew_price(o, n, s as i128, &pool.params).unwrap();
+        assert_eq!(exec, o + o / 100);
+        // Without the skew the 60k close sits exactly on the cap
+        let mut flat = pool.clone();
+        flat.params.skew_scale = 0;
+        check_close_caps(&m, &flat, &v, Side::Short, s, o, o).unwrap();
+        // With it, $9,375 of B is owed on top: refused at the edge ...
+        let e = check_close_caps(&m, &pool, &v, Side::Short, s, o, exec).unwrap_err();
+        assert_eq!(e, PerpsError::PoolWeekendExposureLimit.into());
+        // ... and allowed once G·nn fits α·(B − shortfall)
+        let short = pool_math::premium_shortfall(n, n + s as i128, o, exec, s, pool.params.skew_scale, 100).unwrap();
+        assert_eq!(short, 9_375 * C6 as u128);
+        let v_more = PoolView { b: v.b + short, ..v };
+        check_close_caps(&m, &pool, &v_more, Side::Short, s, o, exec).unwrap();
+        // ADL at the mark: all of Δx (here $54,375) comes off B
+        let e = check_close_caps(&m, &pool, &v_more, Side::Short, s, o, o).unwrap_err();
+        assert_eq!(e, PerpsError::PoolWeekendExposureLimit.into());
+        let v_adl = PoolView { b: v.b + 54_375 * C6 as u128, ..v };
+        check_close_caps(&m, &pool, &v_adl, Side::Short, s, o, o).unwrap();
+    }
+
+    /// D43: the weekend cap binds a net-raising close at any time while the
+    /// weekend bound is on (W > 0), not only inside W, and not when W = 0.
+    #[test]
+    fn weekend_close_cap_is_always_on() {
         let mut m = market();
         m.session_schedule = session::SCHEDULE_CME_GLOBEX;
         m.weekend_initial_margin_ratio = 2_000;
@@ -409,14 +458,26 @@ mod tests {
         pool.params.weekend_lp_loss_bps = 1_000; // α/G = 0.5 × B = $500k
         let v = PoolView { net: 0, b: 1_000_000 * C6 as u128, ..Default::default() };
         let size = 8_000 * C6; // $600k of net
-        let friday_close = 1_794_607_200;
-        let wednesday = 1_794_416_400;
-        check_close_caps(&m, &pool, &v, Side::Short, size, 75 * C6, wednesday).unwrap();
-        let e = check_close_caps(&m, &pool, &v, Side::Short, size, 75 * C6, friday_close - 3_600).unwrap_err();
+        let e = check_close_caps(&m, &pool, &v, Side::Short, size, 75 * C6, 75 * C6).unwrap_err();
         assert_eq!(e, PerpsError::PoolWeekendExposureLimit.into());
+        // The edge: floor($500k / $75) contracts fit, one unit more does not
+        let edge = 500_000 * C6 * C6 / (75 * C6);
+        check_close_caps(&m, &pool, &v, Side::Short, edge, 75 * C6, 75 * C6).unwrap();
+        assert!(check_close_caps(&m, &pool, &v, Side::Short, edge + 1, 75 * C6, 75 * C6).is_err());
         // An explicit G of 10% doubles the room
         pool.params.weekend_gap_bps = 1_000;
-        check_close_caps(&m, &pool, &v, Side::Short, size, 75 * C6, friday_close - 3_600).unwrap();
+        check_close_caps(&m, &pool, &v, Side::Short, size, 75 * C6, 75 * C6).unwrap();
+        // A derived G follows the market's IM: raised to 25% after the
+        // params were applied, the cap tightens to 0.4 × B = $400k
+        pool.params.weekend_gap_bps = 0;
+        m.weekend_initial_margin_ratio = 2_500;
+        let at_04 = 400_000 * C6 * C6 / (75 * C6);
+        check_close_caps(&m, &pool, &v, Side::Short, at_04, 75 * C6, 75 * C6).unwrap();
+        let e = check_close_caps(&m, &pool, &v, Side::Short, at_04 + 1, 75 * C6, 75 * C6).unwrap_err();
+        assert_eq!(e, PerpsError::PoolWeekendExposureLimit.into());
+        // W = 0 turns the weekend bound off
+        pool.params.weekend_cap_window_secs = 0;
+        check_close_caps(&m, &pool, &v, Side::Short, size, 75 * C6, 75 * C6).unwrap();
     }
 
     /// Mutation finding: equity exactly 0 after the fee is the solvent branch.
@@ -449,12 +510,12 @@ mod tests {
         pool.params.k_net_bps = 10_000;
         // net +5, closing a 10 long: |after| = |net|, no check even with B = 0
         let v = PoolView { net: 5, b: 0, ..Default::default() };
-        check_close_caps(&m, &pool, &v, Side::Long, 10, 75 * C6, 0).unwrap();
+        check_close_caps(&m, &pool, &v, Side::Long, 10, 75 * C6, 75 * C6).unwrap();
         // net 0, closing 3 units of a short at $75.000001: 225.000003 → 226
         let v = PoolView { net: 0, b: 225, ..Default::default() };
-        let e = check_close_caps(&m, &pool, &v, Side::Short, 3, 75_000_001, 0).unwrap_err();
+        let e = check_close_caps(&m, &pool, &v, Side::Short, 3, 75_000_001, 75_000_001).unwrap_err();
         assert_eq!(e, PerpsError::PoolExposureLimit.into());
         let v = PoolView { net: 0, b: 226, ..Default::default() };
-        check_close_caps(&m, &pool, &v, Side::Short, 3, 75_000_001, 0).unwrap();
+        check_close_caps(&m, &pool, &v, Side::Short, 3, 75_000_001, 75_000_001).unwrap();
     }
 }

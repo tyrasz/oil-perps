@@ -201,8 +201,10 @@ pub fn slice_close_fee(position: &PositionData, x: u64, taker_fee: u32) -> u64 {
 }
 
 /// `check_close_caps` (D14): a close of `size` on `side` that raises `|net|`
-/// must fit the net cap and, inside `W`, the weekend cap, against `B`.
-pub fn check_close_caps(m: &MarketData, pool: &LpPoolData, v: &PoolView, side: u8, size: u64, mark: u64, now: i64) -> Result<(), Reject> {
+/// must fit the net cap and, while the weekend bound is on (`W > 0`, D43,
+/// at any time), the weekend cap, against `B`; the weekend cap's `B` is net
+/// of the skew-premium shortfall at `exec` (the mark for an ADL slice).
+pub fn check_close_caps(m: &MarketData, pool: &LpPoolData, v: &PoolView, side: u8, size: u64, mark: u64, exec: u64) -> Result<(), Reject> {
     let s = size as i128;
     let after = if side == SIDE_LONG { v.net - s } else { v.net + s };
     if after.unsigned_abs() <= v.net.unsigned_abs() {
@@ -213,10 +215,12 @@ pub fn check_close_caps(m: &MarketData, pool: &LpPoolData, v: &PoolView, side: u
     if !pool_math::net_cap_ok(nn, p.k_net_bps, v.b) {
         return Err(Reject::PoolExposureLimit);
     }
-    if session::in_pre_close_window(m.session_schedule, now, p.weekend_cap_window_secs)
-        && !pool_math::weekend_cap_ok(nn, p.g_bps(m), p.weekend_lp_loss_bps, v.b)
-    {
-        return Err(Reject::PoolWeekendExposureLimit);
+    if pool_math::weekend_bound_on(p.weekend_cap_window_secs) {
+        let short = pool_math::premium_shortfall(v.net, after, mark, exec, size, p.skew_scale, p.max_impact_bps)
+            .ok_or(Reject::MathOverflow)?;
+        if !pool_math::weekend_cap_ok(nn, p.g_bps(m), p.weekend_lp_loss_bps, v.b.saturating_sub(short)) {
+            return Err(Reject::PoolWeekendExposureLimit);
+        }
     }
     Ok(())
 }
@@ -376,7 +380,7 @@ pub fn adl_plan(m: &MarketData, pool: &LpPoolData, v: &PoolView, position: &Posi
             return Err(Reject::ProfitCloseQuiet);
         }
         if !m.is_settled() {
-            check_close_caps(m, pool, v, position.side, x, mark, now)?;
+            check_close_caps(m, pool, v, position.side, x, mark, mark)?;
         }
         (0u8, 0u128)
     } else {
@@ -802,7 +806,7 @@ mod tests {
     }
 
     /// settle_close.rs `close_caps_apply_only_when_net_rises`,
-    /// `weekend_close_cap_inside_the_window` and
+    /// `weekend_close_cap_is_always_on` and
     /// `close_caps_skip_equal_net_and_ceil_the_notional`.
     #[test]
     fn close_caps() {
@@ -810,11 +814,11 @@ mod tests {
         let mut pool = LpPoolData { params: PoolParamsData::neutral(), ..Default::default() };
         pool.params.k_net_bps = 10_000;
         let v = PoolView { net: 20_000 * C6 as i128, b: 1_000_000 * C6 as u128, ..Default::default() };
-        check_close_caps(&m, &pool, &v, SIDE_LONG, 1_000 * C6, 75 * C6, 0).unwrap();
-        assert_eq!(check_close_caps(&m, &pool, &v, SIDE_SHORT, 1_000 * C6, 75 * C6, 0), Err(Reject::PoolExposureLimit));
+        check_close_caps(&m, &pool, &v, SIDE_LONG, 1_000 * C6, 75 * C6, 75 * C6).unwrap();
+        assert_eq!(check_close_caps(&m, &pool, &v, SIDE_SHORT, 1_000 * C6, 75 * C6, 75 * C6), Err(Reject::PoolExposureLimit));
         let v0 = PoolView { net: 0, b: 1_000_000 * C6 as u128, ..Default::default() };
-        check_close_caps(&m, &pool, &v0, SIDE_SHORT, 13_333_333_333, 75 * C6, 0).unwrap();
-        assert!(check_close_caps(&m, &pool, &v0, SIDE_SHORT, 13_333_333_334, 75 * C6, 0).is_err());
+        check_close_caps(&m, &pool, &v0, SIDE_SHORT, 13_333_333_333, 75 * C6, 75 * C6).unwrap();
+        assert!(check_close_caps(&m, &pool, &v0, SIDE_SHORT, 13_333_333_334, 75 * C6, 75 * C6).is_err());
 
         let mut m = market();
         m.session_schedule = session::SCHEDULE_CME_GLOBEX;
@@ -823,18 +827,29 @@ mod tests {
         pool.params.weekend_cap_window_secs = 86_400;
         pool.params.weekend_lp_loss_bps = 1_000;
         let size = 8_000 * C6;
-        check_close_caps(&m, &pool, &v0, SIDE_SHORT, size, 75 * C6, WEDNESDAY).unwrap();
-        assert_eq!(check_close_caps(&m, &pool, &v0, SIDE_SHORT, size, 75 * C6, FRIDAY_CLOSE - 3_600), Err(Reject::PoolWeekendExposureLimit));
+        // Always on (D43): refused whatever the time
+        assert_eq!(check_close_caps(&m, &pool, &v0, SIDE_SHORT, size, 75 * C6, 75 * C6), Err(Reject::PoolWeekendExposureLimit));
+        let edge = 500_000 * C6 * C6 / (75 * C6);
+        check_close_caps(&m, &pool, &v0, SIDE_SHORT, edge, 75 * C6, 75 * C6).unwrap();
+        assert!(check_close_caps(&m, &pool, &v0, SIDE_SHORT, edge + 1, 75 * C6, 75 * C6).is_err());
         pool.params.weekend_gap_bps = 1_000;
-        check_close_caps(&m, &pool, &v0, SIDE_SHORT, size, 75 * C6, FRIDAY_CLOSE - 3_600).unwrap();
+        check_close_caps(&m, &pool, &v0, SIDE_SHORT, size, 75 * C6, 75 * C6).unwrap();
+        // A raised weekend IM tightens a derived G: 25% gives 0.4 × B
+        pool.params.weekend_gap_bps = 0;
+        m.weekend_initial_margin_ratio = 2_500;
+        let at_04 = 400_000 * C6 * C6 / (75 * C6);
+        check_close_caps(&m, &pool, &v0, SIDE_SHORT, at_04, 75 * C6, 75 * C6).unwrap();
+        assert_eq!(check_close_caps(&m, &pool, &v0, SIDE_SHORT, at_04 + 1, 75 * C6, 75 * C6), Err(Reject::PoolWeekendExposureLimit));
+        pool.params.weekend_cap_window_secs = 0;
+        check_close_caps(&m, &pool, &v0, SIDE_SHORT, size, 75 * C6, 75 * C6).unwrap();
 
         let m = market();
         let mut pool = LpPoolData { params: PoolParamsData::neutral(), ..Default::default() };
         pool.params.k_net_bps = 10_000;
-        check_close_caps(&m, &pool, &PoolView { net: 5, b: 0, ..Default::default() }, SIDE_LONG, 10, 75 * C6, 0).unwrap();
-        let e = check_close_caps(&m, &pool, &PoolView { net: 0, b: 225, ..Default::default() }, SIDE_SHORT, 3, 75_000_001, 0);
+        check_close_caps(&m, &pool, &PoolView { net: 5, b: 0, ..Default::default() }, SIDE_LONG, 10, 75 * C6, 75 * C6).unwrap();
+        let e = check_close_caps(&m, &pool, &PoolView { net: 0, b: 225, ..Default::default() }, SIDE_SHORT, 3, 75_000_001, 75_000_001);
         assert_eq!(e, Err(Reject::PoolExposureLimit));
-        check_close_caps(&m, &pool, &PoolView { net: 0, b: 226, ..Default::default() }, SIDE_SHORT, 3, 75_000_001, 0).unwrap();
+        check_close_caps(&m, &pool, &PoolView { net: 0, b: 226, ..Default::default() }, SIDE_SHORT, 3, 75_000_001, 75_000_001).unwrap();
     }
 
     /// settle_close.rs `profitable_closes_wait_out_the_quiet_time` and

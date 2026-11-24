@@ -181,6 +181,23 @@ export function unwindPremium(net: bigint, mark: bigint, skewScale: bigint, maxI
 }
 
 /**
+ * `premium_shortfall` (D43): what a net-raising trade of `size` at `exec`
+ * can take out of `B` through the skew premium, the rise in the unwind
+ * premium beyond the premium paid, `max(0, Δx − floor(size·|exec−oracle|/1e6))`.
+ * 0 in the quadratic branch up to rounding; up to `o·skew_scale·max_impact²/2`
+ * across the clamp. `null` on overflow.
+ */
+export function premiumShortfall(netBefore: bigint, netAfter: bigint, oracle: bigint, exec: bigint, size: bigint, skewScale: bigint, maxImpactBps: bigint): bigint | null {
+  const x0 = unwindPremium(netBefore, oracle, skewScale, maxImpactBps);
+  const x1 = unwindPremium(netAfter, oracle, skewScale, maxImpactBps);
+  if (x0 === null || x1 === null) return null;
+  const paid = (size * abs(exec - oracle)) / SCALE;
+  if (size * abs(exec - oracle) > U128_MAX) return null;
+  const d = x1 - x0 - paid;
+  return d > 0n ? d : 0n;
+}
+
+/**
  * O(1) pool valuation (§2.2). `null` on arithmetic overflow (`MathOverflow`).
  * `hBps` is `redeem_loss_haircut_bps`; `skewScale` and `maxImpactBps` price
  * the refundable skew premium, which `NAV_redeem` and the mark NAV count as
@@ -353,6 +370,16 @@ export function netCapOk(netNotional: bigint, kNetBps: bigint, capital: bigint):
 /** Weekend net cap: `net_notional·G ≤ α·capital`; skipped when `G == 0`. */
 export function weekendCapOk(netNotional: bigint, g: bigint, alphaBps: bigint, capital: bigint): boolean {
   return g === 0n || leMul(netNotional, g, alphaBps, capital);
+}
+
+/** D43: the weekend bound is on with `weekend_cap_window_secs > 0` (always-on weekend cap, LP withdraw check). */
+export function weekendBoundOn(weekendCapWindowSecs: bigint): boolean {
+  return weekendCapWindowSecs > 0n;
+}
+
+/** D43 validate rule with the bound on: `k_net·G ≤ α·10_000`. */
+export function kNetWithinWeekendBound(kNetBps: bigint, g: bigint, alphaBps: bigint): boolean {
+  return kNetBps * g <= alphaBps * BPS;
 }
 
 /** Per-account cap: `(house + opened)·1e8 ≤ per_account·k_net·capNAV`; `perAccountCapBps == 0` is off. */

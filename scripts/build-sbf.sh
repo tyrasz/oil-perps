@@ -51,6 +51,9 @@ PY
     CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo generate-lockfile
     # ... and pin the ones that don't declare it (blake3 >= 1.6 needs edition 2024 crates)
     cargo update -p blake3 --precise 1.5.0
+    # ahash 0.8.13 / 0.7.9 (Nov 2026) pull getrandom 0.4 (edition 2024) and declare no rust-version
+    cargo update -p ahash@0.8.13 --precise 0.8.12 2>/dev/null || true
+    cargo update -p ahash@0.7.9 --precise 0.7.8 2>/dev/null || true
     # platform-tools' cargo 1.75 reads lockfile v3, not v4
     python3 -c "import pathlib; p = pathlib.Path('Cargo.lock'); p.write_text(p.read_text().replace('\nversion = 4\n', '\nversion = 3\n', 1))"
     cargo-build-sbf --sbf-out-dir "$OUT" 2>&1 | tee build.log

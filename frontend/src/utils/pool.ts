@@ -129,8 +129,8 @@ export function productionPoolParams(): PoolParams {
     insuranceTarget: 250_000_000_000n,
     insuranceClaimCapPerWindow: 0n,
     liqMinRemainingNotional: 100_000_000n,
-    kNetBps: 10_000n,
-    hardNetBps: 15_000n,
+    kNetBps: 5_000n,
+    hardNetBps: 7_500n,
     perAccountCapBps: 2_500n,
     weekendLpLossBps: 1_000n,
     weekendGapBps: 0n,
@@ -138,7 +138,7 @@ export function productionPoolParams(): PoolParams {
     withdrawalDelaySecs: 345_600n,
     withdrawalClaimWindowSecs: 259_200n,
     lpReopenQuietSecs: 1_800n,
-    adlNetTargetBps: 5_000n,
+    adlNetTargetBps: 2_500n,
     adlExposureScoreFloorBps: 0n,
     ddFreezeBps: 1_000n,
     ddAdlBps: 1_500n,
@@ -339,6 +339,7 @@ export function decodeLpPosition(raw: Record<string, unknown>): LpPositionAccoun
 
 export const isSettled = (m: MarketState) => m.settlementPrice > 0n;
 const max = (a: bigint, b: bigint) => (a > b ? a : b);
+const min = (a: bigint, b: bigint) => (a < b ? a : b);
 const ceilDiv = (a: bigint, b: bigint) => (a + b - 1n) / b;
 
 /** `Market::margin_ratios`: `[initial, maintenance]` in force at `now`, bps. */
@@ -464,9 +465,14 @@ export function checkOpenCaps(
     if (pm.ddFreeze(drawdownNow(pool, v, now), p.ddFreezeBps)) return 'PoolDrawdownFreeze';
     const nn = pm.ceilU(abs(after) * oracle, SCALE);
     if (!pm.netCapOk(nn, p.kNetBps, v.capNav)) return 'PoolExposureLimit';
-    if (inPreCloseWindow(m.sessionSchedule, now, Number(p.weekendCapWindowSecs))) {
+    // Always on with the weekend bound (D43), not only inside W, against
+    // capNAV net of the open's skew-premium shortfall
+    if (pm.weekendBoundOn(p.weekendCapWindowSecs)) {
       const g = pm.gBps(p.weekendGapBps, m.initialMarginRatio, m.weekendInitialMarginRatio);
-      if (!pm.weekendCapOk(nn, g, p.weekendLpLossBps, v.capNav)) return 'PoolWeekendExposureLimit';
+      const exec = pm.skewPriceRaw(oracle, skewOf(m), isLong ? size : -size, p.skewScale, p.maxImpactBps);
+      const short = exec === null ? null : pm.premiumShortfall(v.net, after, oracle, exec, size, p.skewScale, p.maxImpactBps);
+      if (short === null) return 'MathOverflow';
+      if (!pm.weekendCapOk(nn, g, p.weekendLpLossBps, max(0n, v.capNav - short))) return 'PoolWeekendExposureLimit';
     }
   }
   if (!pm.perAccountOk(houseEntryNotional, openedNotional, p.perAccountCapBps, p.kNetBps, v.capNav)) return 'AccountExposureLimit';
@@ -479,7 +485,7 @@ function contractsWithin(limitNotional: bigint, oracle: bigint): bigint {
 }
 
 export interface OpenHeadroom {
-  /** Contracts a long / short house open can add before a net cap (net, or weekend inside `W`) binds. */
+  /** Contracts a long / short house open can add before a net cap (net, or weekend while the bound is on, D43) binds. */
   long: bigint;
   short: bigint;
   /** Which net cap is the tighter one now. */
@@ -502,7 +508,7 @@ export function openHeadroom(m: MarketState, pool: LpPoolAccount, v: pm.PoolView
   const p = pool.params;
   let limit = pm.bpsOf(p.kNetBps, v.capNav); // net cap, notional
   let netCap: OpenHeadroom['netCap'] = 'net';
-  if (inPreCloseWindow(m.sessionSchedule, now, Number(p.weekendCapWindowSecs))) {
+  if (pm.weekendBoundOn(p.weekendCapWindowSecs)) {
     const g = pm.gBps(p.weekendGapBps, m.initialMarginRatio, m.weekendInitialMarginRatio);
     const weekend = pm.weekendTarget(p.weekendLpLossBps, v.capNav, g);
     if (weekend < limit) {
@@ -513,14 +519,37 @@ export function openHeadroom(m: MarketState, pool: LpPoolAccount, v: pm.PoolView
   const maxNet = contractsWithin(limit, oracle);
   const absNet = v.net < 0n ? -v.net : v.net;
   const bound = max(absNet, maxNet);
+  // The weekend cap counts the open's skew-premium shortfall (D43): past the
+  // closed form, the largest accepted |net| by bisection (monotone)
+  const weekendOk = (isLong: boolean, s: bigint): boolean => {
+    if (!pm.weekendBoundOn(p.weekendCapWindowSecs) || p.skewScale === 0n || s === 0n) return true;
+    const after = isLong ? v.net + s : v.net - s;
+    const g = pm.gBps(p.weekendGapBps, m.initialMarginRatio, m.weekendInitialMarginRatio);
+    const exec = pm.skewPriceRaw(oracle, skewOf(m), isLong ? s : -s, p.skewScale, p.maxImpactBps);
+    const short = exec === null ? null : pm.premiumShortfall(v.net, after, oracle, exec, s, p.skewScale, p.maxImpactBps);
+    if (short === null) return false;
+    const nn = pm.ceilU((after < 0n ? -after : after) * oracle, SCALE);
+    return pm.weekendCapOk(nn, g, p.weekendLpLossBps, max(0n, v.capNav - short));
+  };
+  const largest = (isLong: boolean, hi: bigint): bigint => {
+    // Sizes that do not raise |net| (up to 2·|net| the other way) always pass
+    let lo = (isLong ? v.net < 0n : v.net > 0n) ? min(hi, 2n * absNet) : 0n;
+    if (weekendOk(isLong, hi)) return hi;
+    while (lo < hi) {
+      const mid = lo + (hi - lo + 1n) / 2n;
+      if (weekendOk(isLong, mid)) lo = mid;
+      else hi = mid - 1n;
+    }
+    return lo;
+  };
   let frozen: OpenHeadroom['frozen'] = null;
   if (pool.lpShares === 0n) frozen = 'PoolHasNoLps';
   else if (adlRequired(pool)) frozen = 'PoolAdlPending';
   else if (pm.ddFreeze(drawdownNow(pool, v, now), p.ddFreezeBps)) frozen = 'PoolDrawdownFreeze';
   // Frozen: only opens that do not raise |net| (up to 2·|net| the other way)
   const cap = frozen ? absNet : bound;
-  const long = max(0n, cap - v.net);
-  const short = max(0n, cap + v.net);
+  const long = frozen ? max(0n, cap - v.net) : largest(true, max(0n, cap - v.net));
+  const short = frozen ? max(0n, cap + v.net) : largest(false, max(0n, cap + v.net));
   let account: bigint | null = null;
   if (p.perAccountCapBps > 0n) {
     const lim = (p.perAccountCapBps * p.kNetBps * v.capNav) / (BPS * BPS);
@@ -563,8 +592,14 @@ export function triggerAcceptablePrice(m: MarketState, pool: LpPoolAccount, isLo
   return acceptablePrice(!isLong, basis, Number(pool.params.maxImpactBps) + extraBps);
 }
 
-/** `check_close_caps`: a close that raises `|net|` must fit the net and weekend caps against `B`. */
-export function checkCloseCaps(m: MarketState, pool: LpPoolAccount, v: pm.PoolView, isLong: boolean, size: bigint, mark: bigint, now: number): string | null {
+/**
+ * `check_close_caps`: a close that raises `|net|` must fit the net and (while
+ * the weekend bound is on, D43) weekend caps against `B`, the weekend cap's
+ * `B` net of the close's skew-premium shortfall at `exec` (default: the
+ * close's skew price, `closeExecPrice`).
+ */
+// `_now` is kept for callers: the weekend cap no longer depends on the time (D43)
+export function checkCloseCaps(m: MarketState, pool: LpPoolAccount, v: pm.PoolView, isLong: boolean, size: bigint, mark: bigint, _now: number, exec?: bigint): string | null {
   if (isSettled(m)) return null;
   const after = isLong ? v.net - size : v.net + size;
   const abs = (x: bigint) => (x < 0n ? -x : x);
@@ -572,9 +607,12 @@ export function checkCloseCaps(m: MarketState, pool: LpPoolAccount, v: pm.PoolVi
   const nn = pm.ceilU(abs(after) * mark, SCALE);
   const p = pool.params;
   if (!pm.netCapOk(nn, p.kNetBps, v.b)) return 'PoolExposureLimit';
-  if (inPreCloseWindow(m.sessionSchedule, now, Number(p.weekendCapWindowSecs))) {
+  if (pm.weekendBoundOn(p.weekendCapWindowSecs)) {
     const g = pm.gBps(p.weekendGapBps, m.initialMarginRatio, m.weekendInitialMarginRatio);
-    if (!pm.weekendCapOk(nn, g, p.weekendLpLossBps, v.b)) return 'PoolWeekendExposureLimit';
+    const e = exec ?? pm.skewPriceRaw(mark, skewOf(m), isLong ? -size : size, p.skewScale, p.maxImpactBps);
+    const short = e === null ? null : pm.premiumShortfall(v.net, after, mark, e, size, p.skewScale, p.maxImpactBps);
+    if (short === null) return 'MathOverflow';
+    if (!pm.weekendCapOk(nn, g, p.weekendLpLossBps, max(0n, v.b - short))) return 'PoolWeekendExposureLimit';
   }
   return null;
 }
@@ -700,12 +738,32 @@ export function withdrawalRequest(m: MarketState, pool: LpPoolAccount, pos: LpPo
   return { ...base, claimDeadline, state };
 }
 
-/** `lp_withdraw` steps 7–8: cash must cover the payout, and (unless settled) the hard-net line must hold after it. */
+/**
+ * `lp_withdraw` steps 7–8: cash must cover the payout, and (unless settled)
+ * the hard-net line and, with the weekend bound on, `G·net ≤ α·B'` must hold
+ * after it (D43).
+ */
 export function withdrawPostChecks(m: MarketState, pool: LpPoolAccount, v: pm.PoolView, payout: bigint): string | null {
-  if (payout > pool.cash) return 'PoolCashInsufficient';
+  return withdrawRefusal(m, pool, v, payout)?.error ?? null;
+}
+
+export interface WithdrawRefusal {
+  error: 'PoolCashInsufficient' | 'PoolCapWouldBreach';
+  /** Which line `PoolCapWouldBreach` is about. */
+  line: 'cash' | 'hard_net' | 'weekend';
+}
+
+/** `withdrawPostChecks` with the line that refused it, for the LP vault's explanation. */
+export function withdrawRefusal(m: MarketState, pool: LpPoolAccount, v: pm.PoolView, payout: bigint): WithdrawRefusal | null {
+  if (payout > pool.cash) return { error: 'PoolCashInsufficient', line: 'cash' };
   if (!isSettled(m)) {
+    const p = pool.params;
     const bAfter = v.navRedeem - payout > 0n ? v.navRedeem - payout : 0n;
-    if (!pm.hardNetOk(v.netNotional, pool.params.hardNetBps, bAfter)) return 'PoolCapWouldBreach';
+    if (!pm.hardNetOk(v.netNotional, p.hardNetBps, bAfter)) return { error: 'PoolCapWouldBreach', line: 'hard_net' };
+    const g = pm.gBps(p.weekendGapBps, m.initialMarginRatio, m.weekendInitialMarginRatio);
+    if (pm.weekendBoundOn(p.weekendCapWindowSecs) && !pm.weekendCapOk(v.netNotional, g, p.weekendLpLossBps, bAfter)) {
+      return { error: 'PoolCapWouldBreach', line: 'weekend' };
+    }
   }
   return null;
 }
@@ -717,7 +775,10 @@ export function depositShares(pool: LpPoolAccount, v: pm.PoolView, amount: bigin
 }
 
 /** `PoolParams::validate` (state/pool.rs): false means `InvalidPoolParams`. */
-export function validatePoolParams(p: PoolParams, m: Pick<MarketState, 'maintenanceMarginRatio' | 'takerFee'>): string[] {
+export function validatePoolParams(
+  p: PoolParams,
+  m: Pick<MarketState, 'maintenanceMarginRatio' | 'takerFee' | 'initialMarginRatio' | 'weekendInitialMarginRatio'>
+): string[] {
   const bad: string[] = [];
   const bps = (x: bigint) => x <= 10_000n;
   const need = (ok: boolean, why: string) => {
@@ -741,6 +802,11 @@ export function validatePoolParams(p: PoolParams, m: Pick<MarketState, 'maintena
   need(
     p.withdrawalClaimWindowSecs === 0n || p.withdrawalClaimWindowSecs >= pm.minClaimWindowSecs(p.weekendCapWindowSecs, p.lpReopenQuietSecs),
     'withdrawal_claim_window_secs is 0 or ≥ W + 5·Q + 1 day'
+  );
+  need(
+    !pm.weekendBoundOn(p.weekendCapWindowSecs) ||
+      pm.kNetWithinWeekendBound(p.kNetBps, pm.gBps(p.weekendGapBps, m.initialMarginRatio, m.weekendInitialMarginRatio), p.weekendLpLossBps),
+    'with the weekend bound on (W > 0): k_net_bps·G ≤ weekend_lp_loss_bps·10,000 (D43)'
   );
   need(bps(p.ddFreezeBps) && bps(p.ddAdlBps) && bps(p.ddWithdrawBlockBps), 'drawdown lines ≤ 10,000');
   need(p.ddFreezeBps === 0n || p.ddAdlBps === 0n || p.ddFreezeBps <= p.ddAdlBps, 'dd_freeze_bps ≤ dd_adl_bps');

@@ -4,7 +4,6 @@ use crate::instructions::update_funding::crank_funding;
 use crate::events::PositionOpened;
 use crate::oracle::read_price;
 use crate::pool_math;
-use crate::session;
 use crate::state::{
     distribute_fee, drawdown_now, pool_add, pool_view, side_u8, skew_price, touch_peak, venue_margin, ExecutionSource,
     LpPool, Market, Position, PoolView, Side, UserAccount,
@@ -101,12 +100,15 @@ pub fn house_quote(m: &Market, pool: &LpPool, side: Side, size: u64, leverage: u
 }
 
 /// §4.4 steps 7–8: the pool's caps on a house open, at the oracle. Net-raising
-/// opens must clear the bad-debt and drawdown freezes, the net cap and (in
-/// `W`) the weekend cap, all against `capNAV`; every open must fit the
-/// per-account cap on `opened_notional`.
+/// opens must clear the bad-debt and drawdown freezes, the net cap and (with
+/// the weekend bound on, D43) the weekend cap, all against `capNAV`; the
+/// weekend cap's `capNAV` is net of the trade's own skew-premium shortfall
+/// at `exec` (`premium_shortfall`), so `G·net_notional ≤ α·B` holds after
+/// the open too. Every open must fit the per-account cap on
+/// `opened_notional`.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub fn check_open_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, size: u64, oracle: u64, house_entry_notional: u64, opened_notional: u64, now: i64) -> Result<()> {
+pub fn check_open_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, size: u64, oracle: u64, exec: u64, house_entry_notional: u64, opened_notional: u64) -> Result<()> {
     let p = &pool.params;
     let after = match side {
         Side::Long => v.net + size as i128,
@@ -120,9 +122,14 @@ pub fn check_open_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, size
             1_000_000,
         );
         require!(pool_math::net_cap_ok(nn, p.k_net_bps, v.cap_nav), PerpsError::PoolExposureLimit);
-        if session::in_pre_close_window(m.session_schedule, now, p.weekend_cap_window_secs) {
+        // Always on with the weekend bound (D43), not only inside W: G can
+        // rise after the params were applied, and net opened before W is
+        // the net carried into the close
+        if p.weekend_bound_on() {
+            let short = pool_math::premium_shortfall(v.net, after, oracle, exec, size, p.skew_scale, p.max_impact_bps)
+                .ok_or(PerpsError::MathOverflow)?;
             require!(
-                pool_math::weekend_cap_ok(nn, p.g_bps(m), p.weekend_lp_loss_bps, v.cap_nav),
+                pool_math::weekend_cap_ok(nn, p.g_bps(m), p.weekend_lp_loss_bps, v.cap_nav.saturating_sub(short)),
                 PerpsError::PoolWeekendExposureLimit
             );
         }
@@ -142,7 +149,7 @@ pub fn check_open_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, size
 pub fn house_open_pool(m: &mut Market, pool: &mut LpPool, user: &mut UserAccount, side: Side, size: u64, oracle: u64, q: &HouseQuote, now: i64) -> Result<PoolView> {
     let v = pool_view(pool, m, oracle, now, pool.params.redeem_loss_haircut_bps)?;
     touch_peak(pool, &v, now);
-    check_open_caps(m, pool, &v, side, size, oracle, user.house_entry_notional, q.notional, now)?;
+    check_open_caps(m, pool, &v, side, size, oracle, q.exec, user.house_entry_notional, q.notional)?;
 
     let total = q.margin.checked_add(q.fee).ok_or(PerpsError::MathOverflow)?;
     user.collateral_balance = user.collateral_balance.checked_sub(total).ok_or(PerpsError::InsufficientCollateral)?;
@@ -247,4 +254,70 @@ pub fn handler(ctx: Context<OpenPosition>, params: OpenPositionParams) -> Result
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{pool_add, PoolParams};
+
+    const C6: u64 = 1_000_000;
+
+    /// Review finding (D43, skew clamp): a net-raising house open that
+    /// crosses into the `max_impact` clamp pays `s·o·1%` but raises the
+    /// unwind premium `NAV_redeem` owes by more, so `B` falls in the same
+    /// transaction. The weekend cap counts that shortfall, so an open at the
+    /// cap still leaves `G·net_notional ≤ α·B` after it.
+    #[test]
+    fn weekend_cap_holds_after_a_clamped_open() {
+        let m = Market {
+            maintenance_margin_ratio: 500, initial_margin_ratio: 1_000, weekend_initial_margin_ratio: 2_000,
+            max_leverage: 20_000, taker_fee: 5, max_open_interest: u64::MAX, ..Default::default()
+        };
+        let params = PoolParams {
+            skew_scale: 2_500_000_000_000, max_impact_bps: 100, redeem_loss_haircut_bps: 5_000,
+            weekend_cap_window_secs: 86_400, weekend_lp_loss_bps: 1_000, ..PoolParams::neutral()
+        };
+        let o = 75 * C6;
+        // +25k contracts of venue net at $75 (quadratic branch), B ≈ $12.75M
+        let base = |cash: u64| {
+            let (mut m, mut pool) = (m, LpPool { cash, lp_shares: cash, params, ..Default::default() });
+            let n0 = 25_000 * C6;
+            pool_add(&mut pool, Side::Long, n0, o, 0).unwrap();
+            m.long_open_interest = n0;
+            (m, pool)
+        };
+        let (m0, pool0) = base(12_760_000 * C6);
+        let v = pool_view(&pool0, &m0, o, 0, params.redeem_loss_haircut_bps).unwrap();
+        let g = params.g_bps(&m0);
+        assert_eq!(g, 2_000);
+        // The largest long the pre-trade view alone would allow: G·nn ≤ α·capNAV
+        let nn_max = pool_math::weekend_target(params.weekend_lp_loss_bps, v.cap_nav, g);
+        let n_max = (nn_max * 1_000_000 / o as u128) as u64;
+        let s = n_max - 25_000 * C6;
+        assert!(s > 50_000 * C6, "the trade crosses into the clamp: {}", s);
+        let try_open = |s: u64| -> Result<PoolView> {
+            let (mut m, mut pool) = (m0.clone(), pool0.clone());
+            let mut user = UserAccount { collateral_balance: 10_000_000 * C6, ..Default::default() };
+            pool.free_collateral = user.collateral_balance;
+            let q = house_quote(&m, &pool, Side::Long, s, 1_000, o, 0, 0)?;
+            house_open_pool(&mut m, &mut pool, &mut user, Side::Long, s, o, &q, 0)?;
+            pool_view(&pool, &m, o, 0, params.redeem_loss_haircut_bps)
+        };
+        let post_ok = |w: &PoolView| pool_math::weekend_cap_ok(w.net_notional, g, params.weekend_lp_loss_bps, w.b);
+        // At the pre-trade edge the open would end above the bound: refused
+        match try_open(s) {
+            Ok(w) => assert!(post_ok(&w), "open at the pre-trade edge left G·nn {} over α·B {}", w.net_notional * g as u128, w.b * 1_000),
+            Err(e) => assert_eq!(e, PerpsError::PoolWeekendExposureLimit.into()),
+        }
+        // The largest open the cap accepts keeps the bound after it
+        let (mut lo, mut hi) = (0u64, s);
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            if try_open(mid).is_ok() { lo = mid } else { hi = mid - 1 }
+        }
+        assert!(lo > 50_000 * C6 && lo < s);
+        let w = try_open(lo).unwrap();
+        assert!(post_ok(&w), "G·nn {} over α·B {}", w.net_notional * g as u128, w.b * 1_000);
+    }
 }

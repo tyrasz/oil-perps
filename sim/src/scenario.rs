@@ -81,6 +81,8 @@ impl Scenario {
                 "probe.winner_close_in_quiet", "probe.lp_deposit_in_q", "probe.adl_mode0_below_floor", "probe.opposite_winner_haircut",
                 "probe.lp_withdraw_adl_required", "probe.self_adl_in_quiet", "probe.lp_withdraw_in_w", "probe.dust_pending_slice",
                 "probe.selfcross_close_weekend_cap", "probe.house_open_weekend_cap",
+                // D43: the always-on weekend cap outside W, with G raised after the params
+                "probe.selfcross_close_weekend_bound", "probe.house_open_weekend_bound",
                 "probe.settled_winner_close_quiet", "probe.settled_owner_close_quiet", "probe.lp_sandwich_sweep",
                 "probe.settled_lp_withdraw_quiet",
                 "bad_debt.pending", "adl.mode0", "donate_to_pool",

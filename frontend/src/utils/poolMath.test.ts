@@ -42,8 +42,11 @@ import {
   skewPriceRaw,
   unvested,
   unwindPremium,
+  premiumShortfall,
   wTrig,
   weekendCapOk,
+  weekendBoundOn,
+  kNetWithinWeekendBound,
   weekendTarget,
   weightedSince,
   type PoolState,
@@ -356,6 +359,10 @@ describe('caps and triggers', () => {
     expect(netCapOk(0n, 0n, 0n)).toBe(true);
     expect(weekendCapOk(500_000n, 2_000n, 1_000n, 1_000_000n)).toBe(true);
     expect(weekendCapOk(500_001n, 2_000n, 1_000n, 1_000_000n)).toBe(false);
+    // D43 (pool_math.rs): on with W > 0; k_net·G ≤ α·1e4 at the edge
+    expect([weekendBoundOn(0n), weekendBoundOn(1n)]).toEqual([false, true]);
+    expect(kNetWithinWeekendBound(5_000n, 2_000n, 1_000n)).toBe(true);
+    expect(kNetWithinWeekendBound(5_001n, 2_000n, 1_000n)).toBe(false);
     expect(weekendCapOk(U128_MAX, 0n, 0n, 0n)).toBe(true);
     expect(gBps(0n, 1_000n, 2_000n)).toBe(2_000n);
     expect(gBps(0n, 1_000n, 0n)).toBe(1_000n);
@@ -521,5 +528,23 @@ describe('LP share math', () => {
   it('saturates notional', () => {
     expect(notionalFloor(1_500_000n, 75_000_001n)).toBe(112_500_001n);
     expect(notionalFloor(U64_MAX, U64_MAX)).toBe(U64_MAX);
+  });
+});
+
+describe('premium_shortfall (D43)', () => {
+  it('matches the program: rounding in the quadratic branch, o·K·1%²/2 across the clamp', () => {
+    const [k, imp, o, c] = [2_500_000_000_000n, 100n, 75_000_000n, 1_000_000n];
+    for (const [n, s] of [[0n, 1_000n], [10_000n, 5_000n], [-20_000n, -10_000n], [0n, 1n]]) {
+      const exec = skewPriceRaw(o, n * c, s * c, k, imp)!;
+      const size = s < 0n ? -s * c : s * c;
+      expect(premiumShortfall(n * c, (n + s) * c, o, exec, size, k, imp)! <= 2n).toBe(true);
+    }
+    const [n, s] = [25_000n * c, 60_000n * c];
+    const exec = skewPriceRaw(o, n, s, k, imp)!;
+    expect(exec).toBe(o + o / 100n);
+    expect(premiumShortfall(n, n + s, o, exec, s, k, imp)).toBe(9_375n * c);
+    // An ADL slice at the mark: all of Δx
+    expect(premiumShortfall(n, n + s, o, o, s, k, imp)).toBe(63_750n * c - 9_375n * c);
+    expect(premiumShortfall(n + s, n, o, o, s, k, imp)).toBe(0n);
   });
 });

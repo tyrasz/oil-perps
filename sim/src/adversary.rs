@@ -36,6 +36,20 @@ use perps_core::state::{PoolParams, Position};
 use rand::Rng;
 use std::collections::HashSet;
 
+/// Which cap `probe_caps` pushes against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapProbe {
+    Net,
+    WeekendInW,
+    /// Open and net-raising close outside W (D43)
+    WeekendOutsideW,
+    /// Net-raising closes to the cap, then lp-bound's claim outside W (D43)
+    WeekendWithdraw,
+}
+
+/// lp-bound's deposit: its whole request is claimed against the weekend bound (D43).
+const LP_BOUND: u64 = 200_000 * USDC;
+
 #[derive(Default)]
 pub struct AdversaryState {
     /// Orders the colluders placed for each other
@@ -685,6 +699,15 @@ impl Sim {
         let q = crate::chain::pool_params().lp_reopen_quiet_secs as i64;
         let calm = pending == 0 && !self.within_open(q) && self.secs_to_close() >= 7_200;
         let gap_over = self.adversary.gap.as_ref().map_or(true, |g| g.phase >= 5);
+        // D43, outside W: the LP-withdraw half takes its own slot once
+        // lp-bound's request is claimable with no debt pending (in a two-day
+        // run the forced gap's debt covers that time, so it is reached in
+        // longer runs), and does not hold up the chain below
+        self.lp_bound_prepare().await;
+        if !self.adversary.done.contains("weekend_bound_withdraw") && calm && !self.in_w() && self.lp_bound_claimable().await {
+            self.probe_caps(CapProbe::WeekendWithdraw).await;
+            return;
+        }
         if !self.adversary.done.contains("donation") {
             if calm {
                 self.probe_donation().await;
@@ -695,10 +718,14 @@ impl Sim {
             }
         } else if !self.adversary.done.contains("net_cap") {
             if calm && !self.in_w() {
-                self.probe_caps(false).await;
+                self.probe_caps(CapProbe::Net).await;
+            }
+        } else if !self.adversary.done.contains("weekend_bound") {
+            if calm && !self.in_w() {
+                self.probe_caps(CapProbe::WeekendOutsideW).await;
             }
         } else if !self.adversary.done.contains("weekend_cap") && gap_over && calm && self.in_w() {
-            self.probe_caps(true).await;
+            self.probe_caps(CapProbe::WeekendInW).await;
         }
     }
 
@@ -1034,22 +1061,60 @@ impl Sim {
         }
     }
 
-    /// Push the net to the net cap (`weekend` false: k_net·B, outside W) or
-    /// the weekend cap (α·B/G, inside W) by self-crossing a venue pair and
-    /// closing the legs on the side that raises |net| (F1, D14): every close
-    /// that lands fits the cap; the one past it is refused with
-    /// PoolExposureLimit / PoolWeekendExposureLimit. A house open past it is
-    /// refused the same way. Outside W, a free withdrawal request then must
-    /// not make exposure ADL eligible (F7: triggers use B, not capNAV).
-    async fn probe_caps(&mut self, weekend: bool) {
-        let (name, open_name, code) = if weekend {
-            ("selfcross_close_weekend_cap", "house_open_weekend_cap", "PoolWeekendExposureLimit")
-        } else {
-            ("selfcross_close_net_cap", "house_open_net_cap", "PoolExposureLimit")
+    /// Push the net to the net cap (`Net`: k_net·B, outside W) or the weekend
+    /// cap (α·B/G: `WeekendInW` inside W, `WeekendOutsideW` outside it, D43)
+    /// by self-crossing a venue pair and closing the legs on the side that
+    /// raises |net| (F1, D14): every close that lands fits the cap; the one
+    /// past it is refused with PoolExposureLimit / PoolWeekendExposureLimit.
+    /// A house open past it is refused the same way. Outside W, a free
+    /// withdrawal request then must not make exposure ADL eligible (F7:
+    /// triggers use B, not capNAV).
+    ///
+    /// Production k_net is α/G (D43), so the two caps coincide and the net
+    /// cap, checked first, would answer. The weekend probes therefore raise
+    /// the weekend IM to 25% first (G 20% → 25%, as `update_market_config`
+    /// may at any time, unseen by the pool): the always-on weekend cap must
+    /// tighten to 0.4 × capital on its own. Outside W, lp-bound's matured
+    /// withdrawal must then be refused (PoolCapWouldBreach): the capital
+    /// behind the net cannot leave below the bound. The weekend IM is put
+    /// back before the probe returns, so nothing else sees it.
+    async fn probe_caps(&mut self, kind: CapProbe) {
+        let weekend = kind != CapProbe::Net;
+        let (name, open_name, code) = match kind {
+            CapProbe::Net => ("selfcross_close_net_cap", "house_open_net_cap", "PoolExposureLimit"),
+            CapProbe::WeekendInW => ("selfcross_close_weekend_cap", "house_open_weekend_cap", "PoolWeekendExposureLimit"),
+            CapProbe::WeekendOutsideW => ("selfcross_close_weekend_bound", "house_open_weekend_bound", "PoolWeekendExposureLimit"),
+            CapProbe::WeekendWithdraw => ("selfcross_close_weekend_bound_lp", "", "PoolWeekendExposureLimit"),
         };
-        self.adversary.done.insert(if weekend { "weekend_cap" } else { "net_cap" });
+        self.adversary.done.insert(match kind {
+            CapProbe::Net => "net_cap",
+            CapProbe::WeekendInW => "weekend_cap",
+            CapProbe::WeekendOutsideW => "weekend_bound",
+            CapProbe::WeekendWithdraw => "weekend_bound_withdraw",
+        });
+        let restore = if weekend {
+            // G well above α·1e4/(0.7·k_net), so the weekend cap stays under
+            // the net cap even on capNAV with pending withdrawals (≤ 30%)
+            let m = self.market().await;
+            let k = crate::chain::pool_params();
+            let g0 = m.weekend_initial_margin_ratio.max(m.initial_margin_ratio);
+            let floor = (k.weekend_lp_loss_bps as u64 * 10_000 * 10 / (7 * k.k_net_bps.max(1) as u64)) as u32 + 1;
+            let raised = (g0 + 500).max(floor).min(10_000);
+            if !self.set_weekend_im(raised).await {
+                self.probe_skip(name, "update_market_config refused");
+                return;
+            }
+            Some(m.weekend_initial_margin_ratio)
+        } else {
+            None
+        };
         let st = self.st().await;
-        let Ok(v) = model::view(&st.pool, &st.m, self.px, self.now) else { return };
+        let Ok(v) = model::view(&st.pool, &st.m, self.px, self.now) else {
+            if let Some(w) = restore {
+                self.set_weekend_im(w).await;
+            }
+            return;
+        };
         let params = st.pool.params;
         let g = model::g_bps(&st.m, &params) as u128;
         let cap = |b: u128| if weekend { b * params.weekend_lp_loss_bps as u128 / g } else { b * params.k_net_bps as u128 / 10_000 };
@@ -1092,6 +1157,8 @@ impl Sim {
         }
         if !refused {
             self.probe_skip(name, "the cap was not reached with the pair built");
+        } else if kind == CapProbe::WeekendWithdraw {
+            self.probe_lp_bound_withdraw().await;
         } else {
             // A house open past the same cap (capNAV ≤ B): refused at the cap, before the per-account limit
             let st = self.st().await;
@@ -1114,13 +1181,100 @@ impl Sim {
                     self.probe_rejected(open_name, n0, code);
                 }
             }
-            if !weekend && !self.probe_request_then_mode1().await {
+            if kind == CapProbe::Net && !self.probe_request_then_mode1().await {
                 // Hold the net at the cap for a few ticks until some position is in profit
                 self.adversary.mode1_retries = Some(6);
                 return;
             }
         }
+        if let Some(w) = restore {
+            self.set_weekend_im(w).await;
+        }
         self.unwind_probe_positions(&[a, b]).await;
+    }
+
+    /// update_market_config as the admin with the weekend IM changed (the
+    /// rest as it is), checked against the model.
+    async fn set_weekend_im(&mut self, weekend_im: u32) -> bool {
+        let m = self.market().await;
+        let params = perps_core::instructions::MarketConfigParams {
+            is_paused: m.is_paused,
+            session_schedule: m.session_schedule,
+            pre_close_window_secs: m.pre_close_window_secs,
+            weekend_initial_margin_ratio: weekend_im,
+            weekend_maintenance_margin_ratio: m.weekend_maintenance_margin_ratio,
+            max_confidence_bps: m.max_confidence_bps,
+            min_oracle_price: m.min_oracle_price,
+            max_open_interest: 0,
+        };
+        let admin = self.chain.base.admin.insecure_clone();
+        let accounts = perps_core::accounts::UpdateMarketConfig { authority: admin.pubkey(), config: config_pda(), market: self.chain.base.market };
+        let ix = ix(perps_core::ID, accounts, perps_core::instruction::UpdateMarketConfig { params });
+        let mut st = self.st().await;
+        let predicted = model::update_market_config(&mut st.m, &params).err();
+        if self.run("update_market_config", &[ix], &[&admin], predicted).await.is_ok() {
+            self.expect_st("update_market_config", &st).await;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// lp-bound deposits, then requests everything, so a request is
+    /// claimable a day into the run for the D43 withdrawal probe.
+    async fn lp_bound_prepare(&mut self) {
+        let Some(l) = self.lp_named("lp-bound") else { return };
+        if self.adversary.done.contains("weekend_bound_withdraw") {
+            return;
+        }
+        let pos = self.lp_position(l).await;
+        if pos.shares == 0 && pos.deposited_cum == 0 {
+            if !self.within_open(crate::chain::pool_params().lp_reopen_quiet_secs as i64) && !self.in_w() {
+                self.lp_deposit(l, LP_BOUND, 0, "lp_deposit").await;
+            }
+        } else if pos.pending_shares == 0 && pos.shares > 0 && pos.requested_at == 0 {
+            self.lp_request(l, pos.shares, "lp_request").await;
+        }
+    }
+
+    /// lp-bound's request can be claimed now (gates aside from the caps).
+    async fn lp_bound_claimable(&mut self) -> bool {
+        let Some(l) = self.lp_named("lp-bound") else { return false };
+        let pos = self.lp_position(l).await;
+        if pos.pending_shares == 0 || self.now < pos.unlock_at {
+            return false;
+        }
+        let p = crate::chain::pool_params();
+        let window = pm::effective_claim_window_secs(pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
+        let live = window == 0 || open_secs_between(pos.unlock_at, self.now) as u64 <= window;
+        live && schedule::is_open(self.now) && !self.within_open(p.lp_reopen_quiet_secs as i64)
+    }
+
+    /// D43: with the net at the weekend cap, lp-bound's claim would leave
+    /// G·net over α·B': refused with PoolCapWouldBreach, and the model must
+    /// say so for that reason (the hard-net line alone would let it out).
+    async fn probe_lp_bound_withdraw(&mut self) {
+        let name = "lp_withdraw_weekend_bound";
+        let Some(l) = self.lp_named("lp-bound") else { return };
+        self.crank_funding().await;
+        let st = self.st().await;
+        let pos = self.lp_position(l).await;
+        let Ok(v) = model::view(&st.pool, &st.m, self.px, self.now) else { return };
+        let p = st.pool.params;
+        let value = pm::redeem_value(pos.pending_shares, st.pool.lp_shares, v.nav_redeem).min(pos.requested_value);
+        let b_after = (v.nav_redeem - value as i128).max(0) as u128;
+        let g = model::g_bps(&st.m, &p);
+        if !pm::hard_net_ok(v.net_notional, p.hard_net_bps, b_after) {
+            self.probe_skip(name, "the hard-net line refuses it first");
+            return;
+        }
+        if pm::weekend_cap_ok(v.net_notional, g, p.weekend_lp_loss_bps, b_after) {
+            self.probe_skip(name, "the claim would not breach the weekend bound");
+            return;
+        }
+        let n0 = self.chain.transactions;
+        self.lp_withdraw(l, "lp_withdraw_probe").await;
+        self.probe_rejected(name, n0, "PoolCapWouldBreach");
     }
 
     /// F7: the seed LP requests half its shares (capNAV falls, B does not);

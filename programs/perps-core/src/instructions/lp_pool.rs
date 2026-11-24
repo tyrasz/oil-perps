@@ -394,6 +394,13 @@ pub fn lp_withdraw(ctx: Context<LpWithdraw>) -> Result<()> {
             pool_math::hard_net_ok(v.net_notional, pool.params.hard_net_bps, b_after),
             PerpsError::PoolCapWouldBreach
         );
+        // The capital behind the net cannot leave below the weekend bound
+        // (D43): G·net_notional ≤ α·B' with the bound on
+        require!(
+            !pool.params.weekend_bound_on()
+                || pool_math::weekend_cap_ok(v.net_notional, pool.params.g_bps(m), pool.params.weekend_lp_loss_bps, b_after),
+            PerpsError::PoolCapWouldBreach
+        );
     }
 
     // 9. Transfer, signed by the vault PDA

@@ -1158,30 +1158,30 @@ async fn pending_withdrawals_shrink_capnav_but_not_b_for_closes() {
     assert_eq!(pool_view_at(&mut env.base, 75_000_000).await.net, 1_300 * CONTRACT as i128);
 }
 
-/// Red-team F1 inside the weekend window: closing one leg of a self-cross is
-/// held to the weekend cap (`PoolWeekendExposureLimit`).
+/// Red-team F1 against the weekend bound (D43): closing one leg of a
+/// self-cross is held to the weekend cap (`PoolWeekendExposureLimit`) at any
+/// time while `W > 0`, not only inside the window.
 #[tokio::test]
-async fn closing_one_leg_of_a_self_cross_is_weekend_capped_inside_the_window() {
-    // α = 0.1%, G derived = 20% (weekend IM): $5,000 of net inside W
-    let params = perps_core::state::PoolParams { weekend_cap_window_secs: 86_400, weekend_lp_loss_bps: 10, ..perps_core::state::PoolParams::neutral() };
+async fn closing_one_leg_of_a_self_cross_is_weekend_capped_outside_the_window_too() {
+    // α = 0.2%; k_net = 2% of capital validates at G = IM = 10%. The CME
+    // config then sets the weekend IM, so G = 20%: $10,000 of net on the
+    // weekend cap, $20,000 on the net cap
+    let params = perps_core::state::PoolParams { weekend_cap_window_secs: 86_400, weekend_lp_loss_bps: 20, k_net_bps: 200, adl_net_target_bps: 0, ..perps_core::state::PoolParams::neutral() };
     let mut env = Env::with_pool(params, LP_SEED).await;
     configure(&mut env.base, cme_config()).await.unwrap();
     // House net +60 contracts ($4,500), opened on Wednesday
     let carol = trader(&mut env.base, 10_000 * USDC).await;
     open(&mut env.base, &carol, 0, 60, 5).await.unwrap();
+    // A venue pair is never capped
+    let (tp, mp) = env.std_fill().await;
+    // Closing the short leg takes net to +160 ($12,000): over the weekend
+    // cap (the net cap would allow it), on Wednesday, outside W
+    assert_eq!(custom_error(close(&mut env.base, &env.maker, mp).await), perr(PerpsError::PoolWeekendExposureLimit));
     // Friday 10:00 ET: inside the 24 h window, outside the 2 h margin window
     let friday_morning = FRIDAY_CLOSE - 7 * 3_600;
     set_time(&mut env.base, friday_morning).await;
-    let venue = env.venue;
-    for (kp, role) in [(env.taker.kp.insecure_clone(), ROLE_TAKER), (env.maker.kp.insecure_clone(), ROLE_MAKER)] {
-        update_approval(&mut env.base, &kp, &venue, role, approval_params(ALLOWANCE, friday_morning)).await.unwrap();
-    }
-    // A venue pair is never capped
-    let (tp, mp) = env.std_fill().await;
-    // Closing the short leg takes net to +160 ($12,000): over the weekend cap
-    // (the 10× net cap would allow it)
     assert_eq!(custom_error(close(&mut env.base, &env.maker, mp).await), perr(PerpsError::PoolWeekendExposureLimit));
-    // Closing the long leg lowers |net| (60 → 40): allowed inside W
+    // Closing the long leg lowers |net| (60 → 40): allowed
     close(&mut env.base, &env.taker, tp).await.unwrap();
     assert_buckets(&mut env.base).await;
 }

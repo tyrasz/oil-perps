@@ -56,7 +56,10 @@ pub const PROBES: &str = "13_probe_outcomes";
 pub const LP_GATES: &str = "14_lp_gates";
 /// §17.4: across each weekend whose reopen gap is at most G, the per-share
 /// NAV drawdown is at most G·net/B at the close plus the deficits beyond
-/// insurance booked meanwhile, over B.
+/// insurance booked meanwhile, over B. D43: a weekly close whose net is over
+/// α·B/G needs a documented exception (§3.1) since the bound last held, every
+/// net-raising transaction keeps G·net_after ≤ α·B_before, and every LP
+/// withdrawal G·net ≤ α·B'.
 pub const WEEKEND: &str = "15_weekend_criterion";
 /// Coverage (third review): every required scenario path is reached (runs
 /// of at least two days), and no label has its transactions skipped by a

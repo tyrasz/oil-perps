@@ -764,8 +764,13 @@ pub fn open(st: &mut St, u: &mut UserAccount, o: &OracleView, now: i64, side: Si
         if !pm::net_cap_ok(nn, p.k_net_bps, v.cap_nav) {
             return Err(core("PoolExposureLimit"));
         }
-        if in_pool_window(&st.m, &p, now) && !pm::weekend_cap_ok(nn, g_bps(&st.m, &p), p.weekend_lp_loss_bps, v.cap_nav) {
-            return Err(core("PoolWeekendExposureLimit"));
+        // Always on with the weekend bound (D43), not only inside W
+        // Against capNAV net of the trade's skew-premium shortfall (D43)
+        if pm::weekend_bound_on(p.weekend_cap_window_secs) {
+            let short = pm::premium_shortfall(v.net, after, oracle, exec, size, p.skew_scale, p.max_impact_bps).ok_or_else(overflow)?;
+            if !pm::weekend_cap_ok(nn, g_bps(&st.m, &p), p.weekend_lp_loss_bps, v.cap_nav.saturating_sub(short)) {
+                return Err(core("PoolWeekendExposureLimit"));
+            }
         }
     }
     if !pm::per_account_ok(u.house_entry_notional, notional_exec, p.per_account_cap_bps, p.k_net_bps, v.cap_nav) {
@@ -838,8 +843,10 @@ pub struct CloseOut {
 }
 
 /// D14: a close (or mode-0 ADL slice) that raises |net| fits the net cap and,
-/// inside W, the weekend cap, both against B.
-pub fn check_close_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, size: u64, mark: u64, now: i64) -> Result<(), Rej> {
+/// while the weekend bound is on (W > 0, D43, at any time), the weekend cap,
+/// both against B; the weekend cap's B is net of the skew-premium shortfall
+/// at `exec` (the mark for an ADL slice).
+pub fn check_close_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, size: u64, mark: u64, exec: u64) -> Result<(), Rej> {
     let after = v.net - sign(side) * size as i128;
     if after.unsigned_abs() <= v.net.unsigned_abs() {
         return Ok(());
@@ -849,8 +856,11 @@ pub fn check_close_caps(m: &Market, pool: &LpPool, v: &PoolView, side: Side, siz
     if !pm::net_cap_ok(nn, p.k_net_bps, v.b) {
         return Err(core("PoolExposureLimit"));
     }
-    if in_pool_window(m, p, now) && !pm::weekend_cap_ok(nn, g_bps(m, p), p.weekend_lp_loss_bps, v.b) {
-        return Err(core("PoolWeekendExposureLimit"));
+    if pm::weekend_bound_on(p.weekend_cap_window_secs) {
+        let short = pm::premium_shortfall(v.net, after, mark, exec, size, p.skew_scale, p.max_impact_bps).ok_or_else(overflow)?;
+        if !pm::weekend_cap_ok(nn, g_bps(m, p), p.weekend_lp_loss_bps, v.b.saturating_sub(short)) {
+            return Err(core("PoolWeekendExposureLimit"));
+        }
     }
     Ok(())
 }
@@ -872,7 +882,7 @@ pub fn settle_close(st: &mut St, p: &mut Position, u: &mut UserAccount, mark: u6
         return Err(core("ProfitCloseQuiet"));
     }
     if !is_settled {
-        check_close_caps(&st.m, &st.pool, &v, side, size, mark, now)?;
+        check_close_caps(&st.m, &st.pool, &v, side, size, mark, exec)?;
     }
     let (p_eff, solvency_hc, bad_debt_hc) = if total > 0 {
         let po = pay_profit(&mut st.pool, &v, side, to_u64(total)?, false)?;
@@ -1390,7 +1400,7 @@ pub fn adl_core(st: &mut St, p: &mut Position, u: &mut UserAccount, mode: u8, si
             return Err(core("ProfitCloseQuiet"));
         }
         if !settled(&st.m) {
-            check_close_caps(&st.m, &st.pool, &v, p.side, x, mark, now)?;
+            check_close_caps(&st.m, &st.pool, &v, p.side, x, mark, mark)?;
         }
         (0, 0)
     } else {
@@ -1676,6 +1686,12 @@ pub fn lp_withdraw(st: &mut St, lp: &mut LpPosition, o: &OracleView, now: i64) -
     if !is_settled {
         let b_after = (v.nav_redeem - value as i128).max(0) as u128;
         if !pm::hard_net_ok(v.net_notional, params.hard_net_bps, b_after) {
+            return Err(core("PoolCapWouldBreach"));
+        }
+        // D43: the capital behind the net stays within the weekend bound
+        if pm::weekend_bound_on(params.weekend_cap_window_secs)
+            && !pm::weekend_cap_ok(v.net_notional, g_bps(&st.m, &params), params.weekend_lp_loss_bps, b_after)
+        {
             return Err(core("PoolCapWouldBreach"));
         }
     }

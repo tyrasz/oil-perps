@@ -280,7 +280,7 @@ pub fn adl_plan(m: &Market, pool: &LpPool, v: &PoolView, position: &Position, mo
         // self-ADL puts unbounded net on the pool while house opens are
         // frozen
         if !m.is_settled() {
-            check_close_caps(m, pool, v, position.side, x, mark, now)?;
+            check_close_caps(m, pool, v, position.side, x, mark, mark)?;
         }
         (0u8, 0u128)
     } else {

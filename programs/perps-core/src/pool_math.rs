@@ -384,6 +384,39 @@ pub fn weekend_cap_ok(net_notional: u128, g_bps: u64, alpha_bps: u32, capital: u
     g_bps == 0 || le_mul(net_notional, g_bps as u128, alpha_bps as u128, capital)
 }
 
+/// What a net-raising trade can take out of `B` through the skew premium
+/// (D43): the rise in the unwind premium `NAV_redeem` counts as owed
+/// (`unwind_premium`, D39) beyond the premium the trader paid,
+/// `max(0, x(net_after) − x(net_before) − floor(size·|exec − oracle|/1e6))`.
+/// Up to rounding it is 0 while the skew stays in the quadratic branch; a
+/// trade that crosses into the `max_impact` clamp pays `size·o·max_impact`
+/// but adds more to `x`, up to `o·skew_scale·max_impact²/2`. A deficit-mode
+/// ADL closes at the mark (`exec == oracle`), so its whole `Δx` counts.
+/// The weekend cap subtracts it from the capital it checks against, so a
+/// capped trade keeps `G·net_notional ≤ α·B` after it. `None` on overflow.
+#[inline(never)]
+pub fn premium_shortfall(net_before: i128, net_after: i128, oracle: u64, exec: u64, size: u64, skew_scale: u64, max_impact_bps: u16) -> Option<u128> {
+    let x0 = unwind_premium(net_before, oracle, skew_scale, max_impact_bps)?;
+    let x1 = unwind_premium(net_after, oracle, skew_scale, max_impact_bps)?;
+    let paid = (size as u128).checked_mul(exec.abs_diff(oracle) as u128)? / SCALE as u128;
+    Some(x1.saturating_sub(x0).saturating_sub(paid))
+}
+
+/// Whether the weekend bound is on (D43): `weekend_cap_window_secs > 0`.
+/// The weekend cap then binds every net-raising house open, close and
+/// deficit-mode ADL at all times, not only inside `W`, and `lp_withdraw`
+/// keeps the capital behind the net (`weekend_cap_ok` against `B'`).
+pub fn weekend_bound_on(weekend_cap_window_secs: u32) -> bool {
+    weekend_cap_window_secs > 0
+}
+
+/// `validate` with the weekend bound on (D43): `k_net·G ≤ α·10_000`, so the
+/// net cap alone keeps `net_notional·G ≤ α·capital` at the `G` in force when
+/// the params are applied (0.5× with G 20% and α 10%).
+pub fn k_net_within_weekend_bound(k_net_bps: u32, g_bps: u64, alpha_bps: u32) -> bool {
+    k_net_bps as u128 * g_bps as u128 <= alpha_bps as u128 * BPS
+}
+
 /// Per-account cap: `(house + opened)·1e8 ≤ per_account·k_net·capNAV`.
 /// `per_account_cap_bps == 0` is off.
 pub fn per_account_ok(house_entry_notional: u64, opened_notional: u64, per_account_cap_bps: u32, k_net_bps: u32, cap_nav: u128) -> bool {
@@ -976,6 +1009,39 @@ mod tests {
         }
     }
 
+    /// D43 review finding: the skew-premium shortfall of a net-raising
+    /// trade. Production skew (K 2.5M contracts, 1% clamp) at $75.
+    #[test]
+    fn premium_shortfall_counts_the_clamp_crossing() {
+        let (k, imp, o) = (2_500_000_000_000u64, 100u16, 75_000_000u64);
+        let c = 1_000_000i128;
+        let buy = |n: i128, s: i128| skew_price_raw(o, n, s, k, imp).unwrap() as u64;
+        // Quadratic branch on both sides: the premium paid covers Δx up to rounding
+        for (n, s) in [(0, 1_000), (10_000, 5_000), (-20_000, -10_000), (0, 1)] {
+            let (n, s) = (n * c, s * c);
+            let exec = skew_price_raw(o, n, s, k, imp).unwrap() as u64;
+            let short = premium_shortfall(n, n + s, o, exec, s.unsigned_abs() as u64, k, imp).unwrap();
+            assert!(short <= 2, "{} {} {}", n, s, short);
+        }
+        // +25k then a 60k long: N/2K 0.5% before, (N+s)/2K 1.7% after. The
+        // trader pays 1% of $4.5M = $45k; x rises from o·N²/2K = $9,375 to
+        // the 1% cap on $6.375M, $63,750: $9,375 short (o·K·1%²/2 at most)
+        let (n, s) = (25_000 * c, 60_000 * c);
+        let exec = buy(n, s);
+        assert_eq!(exec, o + o / 100);
+        let short = premium_shortfall(n, n + s, o, exec, s as u64, k, imp).unwrap();
+        let x0 = unwind_premium(n, o, k, imp).unwrap();
+        let x1 = unwind_premium(n + s, o, k, imp).unwrap();
+        assert_eq!((x0, x1), (9_375_000_000, 63_750_000_000));
+        assert_eq!(short, x1 - x0 - 45_000_000_000);
+        assert_eq!(short, 9_375_000_000);
+        // A deficit-mode ADL closes at the mark: no premium, all of Δx counts
+        assert_eq!(premium_shortfall(n, n + s, o, o, s as u64, k, imp).unwrap(), x1 - x0);
+        // No skew, or a trade that lowers |net|: nothing
+        assert_eq!(premium_shortfall(n, n + s, o, o, s as u64, 0, imp).unwrap(), 0);
+        assert_eq!(premium_shortfall(n + s, n, o, o, s as u64, k, imp).unwrap(), 0);
+    }
+
     #[test]
     fn caps_and_triggers() {
         // Net cap at the limit and +1 unit
@@ -986,6 +1052,12 @@ mod tests {
         assert!(weekend_cap_ok(500_000, 2_000, 1_000, 1_000_000));
         assert!(!weekend_cap_ok(500_001, 2_000, 1_000, 1_000_000));
         assert!(weekend_cap_ok(u128::MAX, 0, 0, 0));
+        // D43: the bound is on with W > 0; k_net·G ≤ α·1e4 at the edge
+        assert!(!weekend_bound_on(0) && weekend_bound_on(1));
+        assert!(k_net_within_weekend_bound(5_000, 2_000, 1_000));
+        assert!(!k_net_within_weekend_bound(5_001, 2_000, 1_000));
+        assert!(k_net_within_weekend_bound(100_000, 0, 0));
+        assert!(k_net_within_weekend_bound(u32::MAX, 0, 0));
         assert_eq!(g_bps(0, 1_000, 2_000), 2_000);
         assert_eq!(g_bps(0, 1_000, 0), 1_000);
         assert_eq!(g_bps(1_500, 1_000, 2_000), 1_500);

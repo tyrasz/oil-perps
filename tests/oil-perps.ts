@@ -1431,6 +1431,8 @@ describe("oil-perps", () => {
       await expectErr(cancelParams(), "NoPendingParams");
       await expectErr(apply(), "ParamsTimelocked");
       await expectErr(propose({ ...neutralPoolParams(), kNetBps: 100_001 }), "InvalidPoolParams");
+      // D43: with the weekend bound on (W > 0), k_net·G ≤ α·10_000; 10× is far over it for any G ≥ 1%
+      await expectErr(propose({ ...neutralPoolParams(), weekendCapWindowSecs: 86_400 }), "InvalidPoolParams");
       await expectErr(propose(neutralPoolParams(), user1), "Unauthorized");
 
       const t0 = await chainTime();

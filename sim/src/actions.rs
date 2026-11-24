@@ -115,6 +115,8 @@ impl Sim {
         let ok = self.checks.check(tick, now, "9_settlement_accounting", diffs.is_empty(), || {
             format!("{}: market/pool differ from the model: {}", label, diffs.join("; "))
         });
+        let pre = self.shadow.take();
+        self.bound_step(label, pre.as_ref(), &chain);
         self.shadow = Some(chain);
         ok
     }
@@ -122,7 +124,10 @@ impl Sim {
     /// The shadow follows the chain after a transaction the model does not
     /// price field by field (a landed rejection, already flagged).
     pub async fn resync(&mut self) {
-        self.shadow = Some(self.st().await);
+        let chain = self.st().await;
+        let pre = self.shadow.take();
+        self.bound_step("unmodelled", pre.as_ref(), &chain);
+        self.shadow = Some(chain);
     }
 
     /// A position after a landed transaction must equal the model's.

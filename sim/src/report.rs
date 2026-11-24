@@ -221,6 +221,8 @@ impl Sim {
             "adl": { "by_kind": p.adl_by_kind, "events": p.adl_events },
             "funding_periods_dropped": self.metrics.funding_periods_dropped,
             "weekly_closes": p.weekly_closes,
+            // Steps that broke G·net ≤ α·B, by documented exception (§3.1, D43) or "other:<label>"
+            "weekend_bound_breaks": p.bound.breaks,
             "lp_flows": p.lp_flows.len(),
             "lp_flow_events": p.lp_flows,
             "hourly": p.series,

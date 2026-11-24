@@ -237,6 +237,8 @@ impl Sim {
             lps.push(("lp-sandwich", 300_000 * USDC, crate::agents::LpPersona::Sandwich));
             // Holds a matured request for the withdrawal-gate probes
             lps.push(("lp-probe", 50_000 * USDC, crate::agents::LpPersona::Sandwich));
+            // Holds a matured request for the weekend-bound withdrawal probe (D43)
+            lps.push(("lp-bound", 200_000 * USDC, crate::agents::LpPersona::Sandwich));
         }
         for (name, usdc, persona) in lps {
             let w = lp(sim.chain.base(), usdc).await;

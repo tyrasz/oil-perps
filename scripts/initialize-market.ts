@@ -164,8 +164,8 @@ function productionPoolParams() {
     insuranceTarget: new anchor.BN('250000000000'),
     insuranceClaimCapPerWindow: new anchor.BN(0),
     liqMinRemainingNotional: new anchor.BN(100_000_000),
-    kNetBps: 10_000,
-    hardNetBps: 15_000,
+    kNetBps: 5_000, // 0.5× = α/G with G 20%: the hard weekend bound (D43)
+    hardNetBps: 7_500,
     perAccountCapBps: 2_500,
     weekendLpLossBps: 1_000,
     weekendGapBps: 0,
@@ -173,7 +173,7 @@ function productionPoolParams() {
     withdrawalDelaySecs: 345_600,
     withdrawalClaimWindowSecs: 259_200,
     lpReopenQuietSecs: 1_800,
-    adlNetTargetBps: 5_000,
+    adlNetTargetBps: 2_500,
     adlExposureScoreFloorBps: 0,
     ddFreezeBps: 1_000,
     ddAdlBps: 1_500,
@@ -189,6 +189,28 @@ function productionPoolParams() {
     lpLossCapWindowBps: 500,
     profitCloseQuietSecs: 300, // D23
   };
+}
+
+/**
+ * Production params for one commodity. With the weekend bound on, validate
+ * needs `k_net·G ≤ α·10_000` (D43), G = max(IM, weekend IM): the pool is
+ * created before applyRiskConfig sets the weekend IM, and the always-on
+ * weekend cap would then bind below k_net anyway, so a market whose weekend
+ * IM exceeds 20% gets k_net = floor(α·10_000/G), with hard_net and the
+ * drawdown-ADL target kept at 1.5× and 0.5× of it as in production.
+ */
+function poolParamsFor(commodity: string) {
+  const p = productionPoolParams();
+  const g = Math.max(MARKET_CONFIGS[commodity]?.initialMarginRatio ?? 0, RISK_CONFIGS[commodity]?.weekendInitialMarginRatio ?? 0);
+  if (g > 0) {
+    const kNet = Math.min(p.kNetBps, Math.floor((p.weekendLpLossBps * 10_000) / g));
+    if (kNet < p.kNetBps) {
+      p.kNetBps = kNet;
+      p.hardNetBps = Math.floor((kNet * 3) / 2);
+      p.adlNetTargetBps = Math.floor(kNet / 2);
+    }
+  }
+  return p;
 }
 
 // Seed failures that a later run can retry (session, quiet time, oracle, funding)
@@ -220,7 +242,7 @@ async function poolBootstrapIxs(
   authority: Keypair,
   marketPda: PublicKey,
   pythPriceFeed: PublicKey,
-  opts: { createPool: boolean; withSeed: boolean }
+  opts: { createPool: boolean; withSeed: boolean; commodity: string }
 ): Promise<{ ixs: anchor.web3.TransactionInstruction[]; seeded: boolean }> {
   const [lpPool] = getLpPoolPDA(marketPda);
   const [lpPosition] = getLpPositionPDA(lpPool, authority.publicKey);
@@ -228,7 +250,7 @@ async function poolBootstrapIxs(
   if (opts.createPool) {
     ixs.push(
       await program.methods
-        .initializePool(productionPoolParams(), adlKeeper(authority))
+        .initializePool(poolParamsFor(opts.commodity), adlKeeper(authority))
         .accounts({
           admin: authority.publicKey,
           config: getConfigPDA()[0],
@@ -306,6 +328,7 @@ async function ensurePool(
   const { ixs, seeded } = await poolBootstrapIxs(program, connection, authority, marketPda, PYTH_PRICE_FEEDS[commodity], {
     createPool: !exists,
     withSeed: true,
+    commodity,
   });
   if (ixs.length === 0) return;
   const tx = new anchor.web3.Transaction().add(...ixs);
@@ -394,6 +417,7 @@ async function initializeMarket(
   const withSeed = await poolBootstrapIxs(program, connection, authority, marketPda, pythPriceFeed, {
     createPool: true,
     withSeed: true,
+    commodity,
   });
   let tx: string;
   try {
@@ -405,6 +429,7 @@ async function initializeMarket(
     const poolOnly = await poolBootstrapIxs(program, connection, authority, marketPda, pythPriceFeed, {
       createPool: true,
       withSeed: false,
+      commodity,
     });
     tx = await initMarket().postInstructions(poolOnly.ixs).rpc();
     withSeed.seeded = false;

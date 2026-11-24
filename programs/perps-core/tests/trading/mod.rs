@@ -165,23 +165,41 @@ async fn pending_withdrawals_shrink_capnav_for_opens() {
     open(&mut base, &alice, 0, 600, 5).await.unwrap();
 }
 
+/// D43: with the weekend bound on (W > 0) the weekend cap binds every
+/// net-raising house open, inside W or not, and follows G. The params
+/// validate at G = IM = 10% (no weekend IM yet) with k_net = 1×; raising the
+/// weekend IM to 20% afterwards tightens the cap to 0.5 × capNAV with no
+/// params change. With W = 0, or a fixed G override, it does not.
 #[tokio::test]
-async fn the_weekend_cap_binds_inside_the_window() {
-    // α = 10%, window 24 h; G derived from the 20% weekend IM: cap = 0.5 × capNAV
-    let params = PoolParams { weekend_cap_window_secs: DAY as u32, weekend_lp_loss_bps: 1_000, ..neutral() };
-    // (G override, time, $600k of net allowed)
-    for (gap, t, ok) in [(0u32, FRIDAY_MORNING, false), (0, FRIDAY_MORNING - DAY, true), (1_000, FRIDAY_MORNING, true)] {
-        let mut base = base_with(PoolParams { weekend_gap_bps: gap, ..params }).await;
-        configure(&mut base, cme_config()).await.unwrap();
+async fn the_weekend_cap_is_always_on_and_follows_g() {
+    let params = PoolParams { weekend_cap_window_secs: DAY as u32, weekend_lp_loss_bps: 1_000, k_net_bps: 10_000, ..neutral() };
+    // (W, G override, one more long contract refused after the IM raise)
+    for (w, gap, refused) in [(DAY as u32, 0u32, true), (0, 0, false), (DAY as u32, 1_000, false)] {
+        let mut base = base_with(PoolParams { weekend_cap_window_secs: w, weekend_gap_bps: gap, ..params }).await;
         let alice = trader(&mut base, 200_000 * USDC).await;
-        set_time(&mut base, t).await;
-        let r = open(&mut base, &alice, 0, 8_000, 5).await;
-        if ok {
+        // $600k of net on Wednesday: within 1 × capNAV at G = 10%
+        open(&mut base, &alice, 0, 8_000, 5).await.unwrap();
+        configure(&mut base, cme_config()).await.unwrap();
+        let r = open(&mut base, &alice, 0, 1, 5).await.map(|_| ());
+        if !refused {
             r.unwrap();
-        } else {
-            assert_eq!(custom_error(r.map(|_| ())), perr(PerpsError::PoolWeekendExposureLimit));
-            open(&mut base, &alice, 0, 6_000, 5).await.unwrap(); // $450k fits
+            continue;
         }
+        // Wednesday, outside W: G = 20% now, cap $500k < $600k
+        assert_eq!(custom_error(r), perr(PerpsError::PoolWeekendExposureLimit));
+        // Lowering |net| is never capped: 6,000 contracts = $450k
+        open(&mut base, &alice, 1, 2_000, 5).await.unwrap();
+        // 6,600 ($495k) fits, 6,700 ($502.5k) does not, outside W and inside it
+        open(&mut base, &alice, 0, 600, 5).await.unwrap();
+        for t in [WEDNESDAY + HOUR, FRIDAY_MORNING] {
+            set_time(&mut base, t).await;
+            assert_eq!(custom_error(open(&mut base, &alice, 0, 100, 5).await.map(|_| ())), perr(PerpsError::PoolWeekendExposureLimit));
+        }
+        // And new params must respect the raised G: k_net 1× no longer validates
+        let admin = base.admin.insecure_clone();
+        let r = propose_pool_params(&mut base, &admin, params).await;
+        assert_eq!(custom_error(r), perr(PerpsError::InvalidPoolParams));
+        propose_pool_params(&mut base, &admin, PoolParams { k_net_bps: 5_000, ..params }).await.unwrap();
     }
 }
 
@@ -1115,14 +1133,17 @@ async fn drawdown_exposure_adl_stops_at_its_target() {
 /// force-reduced to that target; outside the window it is not.
 #[tokio::test]
 async fn weekend_force_reduce_stops_at_its_target() {
-    // α = 10%, G derived 20%: target 0.5 × B
-    let params = PoolParams { weekend_cap_window_secs: DAY as u32, weekend_lp_loss_bps: 1_000, ..neutral() };
+    // α = 10%, G derived 20% once the weekend IM is set: target 0.5 × B.
+    // The net is opened first, at G = IM = 10% (cap 1×), so it is carried
+    // over the weekend bound when the weekend IM raises G (D43: the
+    // always-on cap stops new net, the force-reduce cuts the old)
+    let params = PoolParams { weekend_cap_window_secs: DAY as u32, weekend_lp_loss_bps: 1_000, k_net_bps: 10_000, ..neutral() };
     let mut base = base_with(params).await;
-    configure(&mut base, cme_config()).await.unwrap();
-    freeze_funding(&mut base).await;
     let admin = base.admin.insecure_clone();
     let alice = trader(&mut base, 100_000 * USDC).await;
     let pa = open(&mut base, &alice, 0, 8_000, 10).await.unwrap(); // $600k on Wednesday
+    configure(&mut base, cme_config()).await.unwrap();
+    freeze_funding(&mut base).await;
     set_price(&mut base, 75.1).await;
     assert_eq!(custom_error(adl(&mut base, Some(&admin), &alice.key(), pa, 1, 0).await), perr(PerpsError::AdlNotRequired));
     set_time(&mut base, FRIDAY_MORNING).await;

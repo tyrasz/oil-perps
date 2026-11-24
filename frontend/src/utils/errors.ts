@@ -63,7 +63,7 @@ export const PERPS_ERRORS: [string, string][] = [
   ['PoolAdlPending', 'Pool has pending bad debt awaiting ADL'],
   ['PoolCashInsufficient', 'Pool cash cannot cover this payout yet'],
   ['PoolWithdrawalsBlocked', 'LP withdrawals are blocked by the pool drawdown'],
-  ['PoolCapWouldBreach', "Withdrawal would leave net exposure beyond the pool's hard line"],
+  ['PoolCapWouldBreach', "Withdrawal would leave net exposure beyond the pool's hard line or weekend bound"],
   ['PoolCashCapExceeded', "Deposit would exceed the pool's capital cap"],
   ['PoolInsolvent', 'Pool NAV is not positive'],
   ['PoolHasNoLps', 'Pool has no LP capital yet'],
@@ -178,9 +178,9 @@ export function explainProgramError(name: string, ctx: ErrorContext = {}): strin
         : "This trade would take the LP pool's net exposure past its cap. Try a smaller size; trades on the other side are not limited.";
     case 'PoolWeekendExposureLimit':
       return a === 'close'
-        ? "Closing this position would raise the LP pool's net exposure past its weekend cap, which applies before the weekly close. " +
-            'Exit by trading the opposite side on a venue (order book or market-maker quote), which leaves the pool net unchanged, or close after the reopen.'
-        : "This trade would take the LP pool's net exposure past its weekend cap, which applies before the weekly close. Try a smaller size, or the other side.";
+        ? "Closing this position would raise the LP pool's net exposure past its weekend cap, which applies at all times so the net carried into a weekly close stays within what a weekend gap may cost LPs. " +
+            'Exit by trading the opposite side on a venue (order book or market-maker quote), which leaves the pool net unchanged, and close both legs later; or wait for headroom.'
+        : "This trade would take the LP pool's net exposure past its weekend cap, which applies at all times so the net carried into a weekly close stays within what a weekend gap may cost LPs. Try a smaller size, or the other side.";
     case 'AccountExposureLimit':
       return 'Your notional traded against the pool is at its per-account cap. Close some positions, or trade on a venue.';
     case 'PoolAdlPending':
@@ -222,7 +222,10 @@ export function explainProgramError(name: string, ctx: ErrorContext = {}): strin
     case 'PoolWithdrawalsBlocked':
       return "LP withdrawals are blocked while the pool's drawdown is past its block line.";
     case 'PoolCapWouldBreach':
-      return "This withdrawal would leave the pool's net exposure beyond its hard line. Try a smaller amount, or wait until traders close or ADL reduces it.";
+      return (
+        "This withdrawal would leave the pool's net exposure beyond its hard line, or beyond its weekend bound (G·net ≤ α of the capital left), " +
+        'so the capital backing traders\' open net would leave. Try a smaller amount, or wait until traders close and the net shrinks.'
+      );
     case 'PoolCashCapExceeded':
       return 'The pool is at its capital cap; deposits are closed until it has room.';
     case 'PoolInsolvent':

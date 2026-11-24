@@ -353,7 +353,8 @@ async fn wider_gates_extend_a_stored_claim_window() {
 
 #[tokio::test]
 async fn pre_close_window_and_reopen_quiet_time_block_exits() {
-    let p = PoolParams { weekend_cap_window_secs: DAY as u32, lp_reopen_quiet_secs: 1_800, ..PoolParams::neutral() };
+    // k_net 1× validates at the start (G = IM = 10%) with the bound on (D43)
+    let p = PoolParams { weekend_cap_window_secs: DAY as u32, lp_reopen_quiet_secs: 1_800, k_net_bps: 10_000, ..PoolParams::neutral() };
     let mut base = base_with(p).await;
     configure(&mut base, cme_config()).await.unwrap();
     let l2 = deposited_lp(&mut base, 1_000 * USDC).await;
@@ -448,6 +449,48 @@ async fn hard_net_post_check_counts_other_pending_shares() {
     lp_request(&mut base, &l2, s2).await.unwrap();
     lp_withdraw(&mut base, &l2).await.unwrap();
     assert_eq!(custom_error(lp_withdraw(&mut base, &seed).await), perr(PerpsError::PoolCapWouldBreach));
+}
+
+/// D43: with the weekend bound on, `lp_withdraw` also needs
+/// `G·net_notional ≤ α·B'`, so the capital behind the net cannot leave
+/// below the weekend bound. Not checked with `W = 0` or once settled.
+#[tokio::test]
+async fn weekend_bound_keeps_the_capital_behind_the_net() {
+    // G = IM = 10% (no weekend IM on this market), α = 10%: net ≤ 1 × B'
+    for case in ["on", "window_off", "settled"] {
+        let p = PoolParams { k_net_bps: 10_000, weekend_cap_window_secs: DAY as u32, weekend_lp_loss_bps: 1_000, ..PoolParams::neutral() };
+        let mut base = base_with(p).await;
+        let l2 = deposited_lp(&mut base, 1_000_000 * USDC).await;
+        let s2 = lp_position(&mut base, &l2).await.shares;
+        // 16k contracts long at $75 (U = 0): $1.2M of net on B ≈ $2M
+        let n = 16_000 * CONTRACT;
+        patch_market(&mut base, |m| m.long_open_interest = n).await;
+        patch_pool(&mut base, |p| {
+            p.long_entry_sum = n as u128 * usd(75.0) as u128;
+            p.open_positions = 1;
+        })
+        .await;
+        lp_request(&mut base, &l2, s2).await.unwrap();
+        match case {
+            // B' ≈ $1M: G·$1.2M > α·$1M (the hard-net line is off)
+            "on" => {
+                assert_eq!(custom_error(lp_withdraw(&mut base, &l2).await), perr(PerpsError::PoolCapWouldBreach));
+                // Half the request fits: B' ≈ $1.5M ≥ $1.2M
+                lp_cancel(&mut base, &l2).await.unwrap();
+                lp_request(&mut base, &l2, s2 / 2).await.unwrap();
+                lp_withdraw(&mut base, &l2).await.unwrap();
+            }
+            "window_off" => {
+                patch_pool(&mut base, |p| p.params.weekend_cap_window_secs = 0).await;
+                lp_withdraw(&mut base, &l2).await.unwrap();
+            }
+            _ => {
+                settle(&mut base, usd(75.0)).await.unwrap();
+                lp_withdraw(&mut base, &l2).await.unwrap();
+            }
+        }
+        assert!(token_balance(&mut base, l2.tokens).await > 0, "{}", case);
+    }
 }
 
 #[tokio::test]
@@ -702,10 +745,13 @@ async fn pool_params_are_timelocked_once_lps_exist() {
     let admin = base.admin.insecure_clone();
     let stranger = funded_keypair(&mut base).await;
     let t0 = now(&mut base).await;
-    let p1 = PoolParams { withdrawal_delay_secs: 2 * DAY as u32, weekend_cap_window_secs: DAY as u32, ..PoolParams::neutral() };
+    // G = IM = 10% here, so the weekend bound (D43) allows k_net up to 1×
+    let p1 = PoolParams { withdrawal_delay_secs: 2 * DAY as u32, weekend_cap_window_secs: DAY as u32, k_net_bps: 10_000, ..PoolParams::neutral() };
 
     assert_eq!(custom_error(propose_pool_params(&mut base, &stranger, p1).await), perr(PerpsError::Unauthorized));
     let bad = PoolParams { k_net_bps: 100_001, ..PoolParams::neutral() };
+    assert_eq!(custom_error(propose_pool_params(&mut base, &admin, bad).await), perr(PerpsError::InvalidPoolParams));
+    let bad = PoolParams { k_net_bps: 10_001, ..p1 };
     assert_eq!(custom_error(propose_pool_params(&mut base, &admin, bad).await), perr(PerpsError::InvalidPoolParams));
     assert_eq!(custom_error(apply_pool_params(&mut base).await), perr(PerpsError::ParamsTimelocked));
     assert_eq!(custom_error(cancel_pool_params(&mut base, &admin).await), perr(PerpsError::NoPendingParams));

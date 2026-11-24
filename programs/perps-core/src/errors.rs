@@ -182,7 +182,7 @@ pub enum PerpsError {
     #[msg("LP withdrawals are blocked by the pool drawdown")]
     PoolWithdrawalsBlocked,
 
-    #[msg("Withdrawal would leave net exposure beyond the pool's hard line")]
+    #[msg("Withdrawal would leave net exposure beyond the pool's hard line or weekend bound")]
     PoolCapWouldBreach,
 
     #[msg("Deposit would exceed the pool's capital cap")]

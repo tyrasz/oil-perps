@@ -59,8 +59,8 @@ impl PoolParams {
             insurance_target: 250_000_000_000,
             insurance_claim_cap_per_window: 0,
             liq_min_remaining_notional: 100_000_000,
-            k_net_bps: 10_000,
-            hard_net_bps: 15_000,
+            k_net_bps: 5_000,
+            hard_net_bps: 7_500,
             per_account_cap_bps: 2_500,
             weekend_lp_loss_bps: 1_000,
             weekend_gap_bps: 0,
@@ -68,7 +68,7 @@ impl PoolParams {
             withdrawal_delay_secs: 345_600,
             withdrawal_claim_window_secs: 259_200,
             lp_reopen_quiet_secs: 1_800,
-            adl_net_target_bps: 5_000,
+            adl_net_target_bps: 2_500,
             adl_exposure_score_floor_bps: 0,
             dd_freeze_bps: 1_000,
             dd_adl_bps: 1_500,
@@ -135,6 +135,12 @@ impl PoolParams {
         let claim = p.withdrawal_claim_window_secs == 0
             || p.withdrawal_claim_window_secs as u64
                 >= pool_math::min_claim_window_secs(p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
+        // With the weekend bound on, the net cap alone keeps G·net within α
+        // of the capital at the G in force now (D43). G can rise later
+        // (update_market_config does not see the pool); the always-on
+        // weekend cap covers that
+        let weekend = !pool_math::weekend_bound_on(p.weekend_cap_window_secs)
+            || pool_math::k_net_within_weekend_bound(p.k_net_bps, self.g_bps(m), p.weekend_lp_loss_bps);
         let drawdown = bps(p.dd_freeze_bps)
             && bps(p.dd_adl_bps)
             && bps(p.dd_withdraw_block_bps)
@@ -152,7 +158,12 @@ impl PoolParams {
         let self_liq = p.backstop_threshold_bps >= 10_000
             || (p.liq_penalty_bps as u64) * (10_000 - p.liq_keeper_share_bps.min(10_000) as u64)
                 >= (p.max_impact_bps as u64 + m.taker_fee as u64) * 10_000;
-        ranges && claim && drawdown && fees && liq && penalty && self_liq
+        ranges && claim && weekend && drawdown && fees && liq && penalty && self_liq
+    }
+
+    /// Whether the weekend bound is on (D43, `weekend_cap_window_secs > 0`).
+    pub fn weekend_bound_on(&self) -> bool {
+        pool_math::weekend_bound_on(self.weekend_cap_window_secs)
     }
 
     /// `G_bps` (§3.1): the override, else `max(IM, weekend IM)`.
@@ -951,6 +962,38 @@ mod tests {
         assert_eq!(crate::pool_math::effective_claim_window_secs(0, 318_600, 1_800), 0);
     }
 
+    /// D43: with the weekend bound on (`W > 0`), `k_net·G ≤ α·10_000`.
+    /// Production (G 20%, α 10%) sits exactly on the edge at 0.5×.
+    #[test]
+    fn validate_holds_k_net_to_the_weekend_bound() {
+        let m = oil();
+        assert_eq!(PoolParams::production().g_bps(&m), 2_000);
+        let ok = |f: &dyn Fn(&mut PoolParams)| {
+            let mut p = PoolParams::production();
+            f(&mut p);
+            p.validate(&m)
+        };
+        assert!(ok(&|p| p.k_net_bps = 5_000));
+        assert!(!ok(&|p| p.k_net_bps = 5_001));
+        // Off with W = 0: the old 10× range applies
+        assert!(ok(&|p| { p.k_net_bps = 5_001; p.weekend_cap_window_secs = 0; }));
+        // α scales it: α 15% allows 0.75×
+        assert!(ok(&|p| { p.weekend_lp_loss_bps = 1_500; p.k_net_bps = 7_500; p.hard_net_bps = 11_250; }));
+        assert!(!ok(&|p| { p.weekend_lp_loss_bps = 1_500; p.k_net_bps = 7_501; p.hard_net_bps = 11_250; }));
+        // An overridden G replaces max(IM, weekend IM): G 10% allows 1×, G 25% only 0.4×
+        assert!(ok(&|p| { p.weekend_gap_bps = 1_000; p.k_net_bps = 10_000; p.hard_net_bps = 15_000; }));
+        assert!(!ok(&|p| { p.weekend_gap_bps = 1_000; p.k_net_bps = 10_001; p.hard_net_bps = 15_000; }));
+        assert!(ok(&|p| { p.weekend_gap_bps = 2_500; p.k_net_bps = 4_000; p.adl_net_target_bps = 2_500; }));
+        assert!(!ok(&|p| { p.weekend_gap_bps = 2_500; p.k_net_bps = 4_001; p.adl_net_target_bps = 2_500; }));
+        // A derived G follows the market: weekend IM 25% (not overridden) gives 0.4×
+        let m25 = Market { weekend_initial_margin_ratio: 2_500, ..oil() };
+        assert!(!PoolParams::production().validate(&m25));
+        assert!(PoolParams { k_net_bps: 4_000, ..PoolParams::production() }.validate(&m25));
+        // α = 0 with the bound on allows no net cap at all
+        assert!(ok(&|p| { p.weekend_lp_loss_bps = 0; p.k_net_bps = 0; p.adl_net_target_bps = 0; }));
+        assert!(!ok(&|p| { p.weekend_lp_loss_bps = 0; p.k_net_bps = 1; p.adl_net_target_bps = 0; }));
+    }
+
     #[test]
     fn validate_checks_every_bound() {
         let m = oil();
@@ -960,21 +1003,21 @@ mod tests {
             f(&mut p);
             p.validate(&m)
         };
-        // k_net ≤ 10×; hard_net 0 or ≥ k_net; adl target ≤ k_net
-        assert!(ok(&|p| { p.k_net_bps = 100_000; p.hard_net_bps = 0; }));
-        assert!(!ok(&|p| { p.k_net_bps = 100_001; p.hard_net_bps = 0; }));
-        assert!(ok(&|p| p.hard_net_bps = 10_000));
-        assert!(!ok(&|p| p.hard_net_bps = 9_999));
+        // k_net ≤ 10× (weekend bound off, D43); hard_net 0 or ≥ k_net; adl target ≤ k_net
+        assert!(ok(&|p| { p.k_net_bps = 100_000; p.hard_net_bps = 0; p.weekend_cap_window_secs = 0; }));
+        assert!(!ok(&|p| { p.k_net_bps = 100_001; p.hard_net_bps = 0; p.weekend_cap_window_secs = 0; }));
+        assert!(ok(&|p| p.hard_net_bps = 5_000));
+        assert!(!ok(&|p| p.hard_net_bps = 4_999));
         assert!(ok(&|p| p.hard_net_bps = 0));
-        assert!(ok(&|p| p.adl_net_target_bps = 10_000));
-        assert!(!ok(&|p| p.adl_net_target_bps = 10_001));
+        assert!(ok(&|p| p.adl_net_target_bps = 5_000));
+        assert!(!ok(&|p| p.adl_net_target_bps = 5_001));
         // bps fields ≤ 100%
         assert!(ok(&|p| p.per_account_cap_bps = 10_000));
         assert!(!ok(&|p| p.per_account_cap_bps = 10_001));
         assert!(ok(&|p| p.weekend_lp_loss_bps = 10_000));
         assert!(!ok(&|p| p.weekend_lp_loss_bps = 10_001));
-        assert!(ok(&|p| p.weekend_gap_bps = 10_000));
-        assert!(!ok(&|p| p.weekend_gap_bps = 10_001));
+        assert!(ok(&|p| { p.weekend_gap_bps = 10_000; p.weekend_cap_window_secs = 0; }));
+        assert!(!ok(&|p| { p.weekend_gap_bps = 10_001; p.weekend_cap_window_secs = 0; }));
         assert!(ok(&|p| p.redeem_loss_haircut_bps = 10_000));
         assert!(!ok(&|p| p.redeem_loss_haircut_bps = 10_001));
         // windows (claim window off so only the bound under test bites).

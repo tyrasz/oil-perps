@@ -109,4 +109,21 @@ describe('LpVault', () => {
     fireEvent.click(screen.getByText('Claim $3,900.00'));
     expect(withdraw).toHaveBeenCalled();
   });
+
+  it('explains a claim the weekend bound refuses (D43)', () => {
+    // The pool is short 6,600 contracts at $75 ($495k of net) on $1M, G = 20% (weekend IM):
+    // G·$495k ≤ α·B' needs B' ≥ $990k, so a $200k claim cannot leave (the 0.75× hard line would allow it)
+    const n = 6_600n * C6;
+    const m = { ...market, lastFundingTime: BigInt(WEDNESDAY - 60), longOpenInterest: n, weekendInitialMarginRatio: 2_000n };
+    const big = { ...pool, longEntrySum: n * 75n * C6, openPositions: 1n };
+    const req = { ...lpPosition, pendingShares: 200_000n * C6, requestedValue: 200_000n * C6, unlockAt: BigInt(WEDNESDAY - 60) };
+    const view = poolView(big, m, 75n * C6, WEDNESDAY);
+    state = { ...vaultAt(WEDNESDAY, m), pool: big, view, lpPosition: req, request: withdrawalRequest(m, big, req, view, WEDNESDAY) };
+    render(<LpVault />);
+    expect(screen.getByText(/below its weekend bound/)).toBeTruthy();
+    // Review finding: exposure ADL stops at the same line, so the notice must not promise it
+    expect(screen.getByText(/Exposure ADL does not make this room/)).toBeTruthy();
+    expect(screen.queryByText(/ADL reduces the net/)).toBeNull();
+    expect(screen.getByText('Weekend bound')).toBeTruthy();
+  });
 });

@@ -18,7 +18,6 @@ use crate::mirror::{
     ADL_MODE_DEFICIT, ADL_MODE_EXPOSURE,
 };
 use crate::pool_math::{self, PoolView};
-use crate::session;
 use crate::state::{LpPoolData, MarketData, PositionData, SIDE_LONG, SIDE_SHORT};
 use crate::KeeperConfig;
 use solana_client::rpc_client::RpcClient;
@@ -55,16 +54,18 @@ pub fn min_remainder_size(min_notional: u64, mark: u64) -> u64 {
 
 /// The largest slice on `side` that `check_close_caps` accepts (D14, D25):
 /// any slice that does not raise `|net|`, or one that leaves `|net'|` within
-/// the net cap and, inside `W`, the weekend cap, both against `B`.
-pub fn close_cap_room(m: &MarketData, pool: &LpPoolData, v: &PoolView, side: u8, mark: u64, now: i64) -> u64 {
+/// the net cap and, while the weekend bound is on (`W > 0`, D43, at any
+/// time), the weekend cap, both against `B` (the weekend cap's net of the
+/// slice's skew-premium shortfall at the mark, so searched).
+pub fn close_cap_room(m: &MarketData, pool: &LpPoolData, v: &PoolView, side: u8, mark: u64) -> u64 {
     if mark == 0 {
         return u64::MAX;
     }
     let p = &pool.params;
-    // nn ≤ floor(k·B/1e4) and, in W, nn ≤ floor(α·B/G): both exact
+    // nn ≤ floor(k·B/1e4) and, with the bound on, nn ≤ floor(α·B/G): both exact
     let mut nn_max = pool_math::bps_of(p.k_net_bps, v.b);
     let g = p.g_bps(m);
-    if g > 0 && session::in_pre_close_window(m.session_schedule, now, p.weekend_cap_window_secs) {
+    if g > 0 && pool_math::weekend_bound_on(p.weekend_cap_window_secs) {
         nn_max = nn_max.min(pool_math::weekend_target(p.weekend_lp_loss_bps, v.b, g));
     }
     // ceil(n·mark, 1e6) ≤ nn_max ⇔ n ≤ floor(nn_max·1e6 / mark)
@@ -74,16 +75,36 @@ pub fn close_cap_room(m: &MarketData, pool: &LpPoolData, v: &PoolView, side: u8,
     // Not raising |net|: up to −2·net when net < 0
     let shrink = if net < 0 { 2 * -net } else { 0 };
     let room = shrink.max(n_max.saturating_sub(net)).max(0);
-    u64::try_from(room).unwrap_or(u64::MAX)
+    let room = u64::try_from(room).unwrap_or(u64::MAX);
+    // The weekend cap counts the slice's premium shortfall (D43): below the
+    // closed form, the largest accepted slice by bisection (monotone in x
+    // past `shrink`, where |net| rises)
+    if p.skew_scale == 0 || !pool_math::weekend_bound_on(p.weekend_cap_window_secs) || room == u64::MAX {
+        return room;
+    }
+    let ok = |x: u64| mirror::check_close_caps(m, pool, v, side, x, mark, mark).is_ok();
+    if ok(room) {
+        return room;
+    }
+    let (mut lo, mut hi) = (u64::try_from(shrink).unwrap_or(u64::MAX).min(room), room);
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if ok(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
 }
 
 /// Sizes to try for a mode-0 ADL of `p`: the whole position (0) unless the
 /// close caps bound it, and a smaller slice that keeps the remainder at the
 /// minimum notional, so the program's full-close rule cannot round it up
 /// past the cap.
-pub fn deficit_sizes(m: &MarketData, pool: &LpPoolData, v: &PoolView, p: &PositionData, mark: u64, now: i64) -> Vec<u64> {
+pub fn deficit_sizes(m: &MarketData, pool: &LpPoolData, v: &PoolView, p: &PositionData, mark: u64) -> Vec<u64> {
     let q = p.size;
-    let want = if m.is_settled() { q } else { q.min(close_cap_room(m, pool, v, p.side, mark, now)) };
+    let want = if m.is_settled() { q } else { q.min(close_cap_room(m, pool, v, p.side, mark)) };
     if want == 0 {
         return vec![];
     }
@@ -115,7 +136,7 @@ pub fn pick_deficit_adl(m: &MarketData, pool: &LpPoolData, positions: &[(Pubkey,
         if pool.opposite_pending(p.side) == 0 {
             continue;
         }
-        for size in deficit_sizes(m, pool, &v, p, mark, now) {
+        for size in deficit_sizes(m, pool, &v, p, mark) {
             let Ok(plan) = adl_plan(m, pool, &v, p, ADL_MODE_DEFICIT, size, mark, now) else {
                 continue;
             };
@@ -330,6 +351,7 @@ mod tests {
     use super::*;
     use crate::mirror::{adl_plan, Reject};
     use crate::pool_math::{ADL_FLOOR_DECAY_SECS, TRIGGER_NET, TRIGGER_WEEKEND};
+    use crate::session;
     use crate::state::PoolParamsData;
     use crate::testkit::*;
 
@@ -371,13 +393,14 @@ mod tests {
             let net = (next() % 40_000_000_000) as i128 - 20_000_000_000;
             let b = (next() % 3_000_000_000_000) as u128;
             let mark = 1 + next() % 200_000_000;
-            let now = if i % 2 == 0 { WEDNESDAY } else { FRIDAY_CLOSE - 3_600 };
+            // The weekend bound is on (W > 0) or off: no time dependence (D43)
+            pool.params.weekend_cap_window_secs = if i % 2 == 0 { 0 } else { 86_400 };
             let v = PoolView { net, b, ..Default::default() };
             for side in [SIDE_LONG, SIDE_SHORT] {
-                let room = close_cap_room(&m, &pool, &v, side, mark, now);
+                let room = close_cap_room(&m, &pool, &v, side, mark);
                 if room < u64::MAX / 2 {
-                    assert!(mirror::check_close_caps(&m, &pool, &v, side, room, mark, now).is_ok(), "{} {} {} {}", net, b, mark, side);
-                    assert!(mirror::check_close_caps(&m, &pool, &v, side, room + 1, mark, now).is_err(), "{} {} {} {} {}", net, b, mark, side, room);
+                    assert!(mirror::check_close_caps(&m, &pool, &v, side, room, mark, mark).is_ok(), "{} {} {} {}", net, b, mark, side);
+                    assert!(mirror::check_close_caps(&m, &pool, &v, side, room + 1, mark, mark).is_err(), "{} {} {} {} {}", net, b, mark, side, room);
                 }
             }
         }
@@ -440,7 +463,7 @@ mod tests {
         assert_eq!(adl_plan(&m, &pool, &v, &short, 0, 0, mark, now), Err(Reject::PoolExposureLimit));
         let act = pick_deficit_adl(&m, &pool, &positions, mark, now).unwrap();
         // The largest slice whose net notional fits B
-        let room = close_cap_room(&m, &pool, &v, SIDE_SHORT, mark, now);
+        let room = close_cap_room(&m, &pool, &v, SIDE_SHORT, mark);
         assert_eq!((act.size, act.plan.x), (room, room));
         assert!(room > 10_000 * C6 && room < 20_000 * C6);
         assert_eq!(adl_plan(&m, &pool, &v, &short, 0, room + 1, mark, now), Err(Reject::PoolExposureLimit));
@@ -465,7 +488,7 @@ mod tests {
         pool.pending_since_long = 1;
         let (mark, now) = (75 * C6, 1 + ADL_FLOOR_DECAY_SECS);
         let v = pool_view(&pool, &m, mark, now).unwrap();
-        let room = close_cap_room(&m, &pool, &v, SIDE_SHORT, mark, now);
+        let room = close_cap_room(&m, &pool, &v, SIDE_SHORT, mark);
         assert!(room < 14 * C6 && 14 * C6 - room < min_remainder_size(100 * C6, mark), "room {}", room);
         // Asking for the room: the remainder rule closes it all, over the cap
         assert_eq!(adl_plan(&m, &pool, &v, &short, 0, room, mark, now), Err(Reject::PoolExposureLimit));

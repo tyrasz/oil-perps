@@ -247,6 +247,10 @@ impl Sim {
             }
         }
 
+        // Invariant 15's step tracker sees the tick's price move (D43)
+        if let Some(o) = self.bound_obs(&st) {
+            self.bound_observe("tick", o);
+        }
         self.weekly_close_record(&st).await;
 
         // Hourly sample
@@ -289,6 +293,22 @@ impl Sim {
             let g = model::g_bps(&st.m, p) as f64;
             let b = v.b as f64;
             let alpha_cap = p.weekend_lp_loss_bps as f64 / g * b;
+            // §17.4 (D43): net carried into the close over α·B/G must be
+            // explained by a documented exception (§3.1) seen since the
+            // bound last held; anything else is a cap the chain let past
+            let excess = pm::weekend_bound_on(p.weekend_cap_window_secs)
+                && st.m.settlement_price == 0
+                && !pm::weekend_cap_ok(v.net_notional, model::g_bps(&st.m, p), p.weekend_lp_loss_bps, v.b);
+            if excess {
+                // Every worsening since the bound last held must be covered,
+                // by size, by the documented exceptions: one uncovered step
+                // fails the close however many documented ones there were
+                let (tick, reasons, other) = (self.tick, self.pool_stats.bound.reasons.clone(), self.pool_stats.bound.other.clone());
+                self.checks.check(tick, now, crate::checks::WEEKEND, !reasons.is_empty() && other.is_empty(), || {
+                    format!("weekly close with net notional {} over α·B/G = {:.0}: worsening not covered by a documented exception since the bound last held \
+                        (uncovered, G·nn − α·B units: {:?}; documented: {:?})", v.net_notional, alpha_cap, other, reasons)
+                });
+            }
             // The week to this close: what happened since the last one (or the start)
             let ps = &self.pool_stats;
             let adl = |mode: &str| ps.adl_by_kind.iter().filter(|(k, _)| k.starts_with(mode)).map(|(_, n)| *n).sum::<u64>();
@@ -311,6 +331,8 @@ impl Sim {
                 "close_time": now, "in_unwind": self.unwinding, "g": g / 1e4, "net_contracts": v.net as f64 / 1e6, "net_notional_at_close_usdc": v.net_notional as f64 / 1e6,
                 "b_at_close_usdc": b / 1e6, "g_net_over_b": g / 1e4 * v.net_notional as f64 / b.max(1.0),
                 "carried_excess_usdc": ((v.net_notional as f64 - alpha_cap) / 1e6).max(0.0), "nps_at_close": v.nps,
+                "excess_explained_by": excess.then(|| json!(self.pool_stats.bound.reasons.clone())),
+                "excess_unexplained_steps": excess.then(|| json!(self.pool_stats.bound.other.clone())),
                 "pending_bad_debt_at_close_usdc": (st.pool.pending_bad_debt_long + st.pool.pending_bad_debt_short) as f64 / 1e6,
                 "insurance_at_close_usdc": st.m.insurance_fund as f64 / 1e6,
                 "deficit_beyond_insurance_before_usdc": self.pool_stats.deficit_beyond_insurance as f64 / 1e6,
@@ -351,6 +373,68 @@ impl Sim {
                 });
             }
         }
+    }
+
+    /// The weekend bound of `st` at the current price (the settlement price
+    /// once settled): `G·net_notional ≤ α·B` (D43).
+    pub fn bound_obs(&self, st: &model::St) -> Option<crate::metrics::BoundObs> {
+        let settled = st.m.settlement_price > 0;
+        let mark = if settled { st.m.settlement_price } else { self.px };
+        let v = model::view(&st.pool, &st.m, mark, self.now).ok()?;
+        // The same valuation with every trader loss counted (h = 100%)
+        let mut full = st.pool.clone();
+        full.params.redeem_loss_haircut_bps = 10_000;
+        let vf = model::view(&full, &st.m, mark, self.now).ok()?;
+        let p = &st.pool.params;
+        let g = model::g_bps(&st.m, p);
+        let on = pm::weekend_bound_on(p.weekend_cap_window_secs);
+        Some(crate::metrics::BoundObs {
+            px: mark, net_abs: v.net.unsigned_abs(), nn: v.net_notional, b: v.b, g, alpha: p.weekend_lp_loss_bps,
+            bad_debt_cum: st.pool.bad_debt_cum, settled, on,
+            holds: !on || settled || pm::weekend_cap_ok(v.net_notional, g, p.weekend_lp_loss_bps, v.b),
+            cash: st.pool.cash, nav_full: vf.nav_redeem, hc: vf.nav_redeem - v.nav_redeem,
+        })
+    }
+
+    /// Invariant 15 step by step (D43). `pre` (the state the transaction
+    /// started from: its price move is a "tick" step) and `post` (after it):
+    /// - a net-raising house open, close or deficit-mode ADL keeps
+    ///   `G·net_notional_after ≤ α·B_before` (the always-on cap; capNAV ≤ B),
+    ///   and an LP withdrawal keeps `G·net_notional ≤ α·B'`, fatal;
+    /// - a step that breaks the bound, or worsens it while broken, is put
+    ///   down to the documented exception(s) it shows (§3.1), or to "other".
+    pub fn bound_step(&mut self, label: &str, pre: Option<&model::St>, post: &model::St) {
+        let pre = pre.and_then(|s| self.bound_obs(s));
+        let Some(cur) = self.bound_obs(post) else { return };
+        if let Some(pre) = pre {
+            self.bound_observe("tick", pre);
+            let exempt = label.starts_with("liquidate") || label.starts_with("close_settled") || label == "update_market_config" || label == "settle_market";
+            if cur.on && !cur.settled && !exempt && cur.g == pre.g {
+                let (tick, now) = (self.tick, self.now);
+                if cur.net_abs > pre.net_abs {
+                    // Against B before and, after it, B plus only what the
+                    // redeem haircut took on a payout while traders are net
+                    // losing (§3.1) and rounding: the skew-premium shortfall
+                    // is in the cap, so nothing else may push it over
+                    let after = cur.b + (cur.hc - pre.hc).max(0) as u128 + crate::metrics::BOUND_ROUNDING;
+                    let ok = pm::weekend_cap_ok(cur.nn, cur.g, cur.alpha, pre.b.min(after));
+                    self.checks.check(tick, now, crate::checks::WEEKEND, ok, || {
+                        format!("{} raised the net notional to {} past α·B/G (B before {}, after {}, G {}, α {})", label, cur.nn, pre.b, cur.b, cur.g, cur.alpha)
+                    });
+                }
+                if label.starts_with("lp_withdraw") && cur.b < pre.b {
+                    self.checks.check(tick, now, crate::checks::WEEKEND, cur.holds, || {
+                        format!("{} left the net notional {} over α·B'/G (B' {}, G {}, α {})", label, cur.nn, cur.b, cur.g, cur.alpha)
+                    });
+                }
+            }
+        }
+        self.bound_observe(label, cur);
+    }
+
+    /// One step of invariant 15's tracker (`BoundTracker::observe`).
+    pub fn bound_observe(&mut self, label: &str, cur: crate::metrics::BoundObs) {
+        self.pool_stats.bound.observe(label, cur);
     }
 
     async fn sample(&mut self, m: &perps_core::state::Market, vault: i128, free: i128, owed: i128, surplus: i128) {
