@@ -412,7 +412,9 @@ pub fn weekend_bound_on(weekend_cap_window_secs: u32) -> bool {
 
 /// `validate` with the weekend bound on (D43): `k_net·G ≤ α·10_000`, so the
 /// net cap alone keeps `net_notional·G ≤ α·capital` at the `G` in force when
-/// the params are applied (0.5× with G 20% and α 10%).
+/// the params are applied (at most 0.5× with G 20% and α 10%). Production's
+/// 0.4× sits below that edge, leaving LPs a `1 − k_net·G/α` = 20% exit
+/// buffer with traders at the net cap (D45).
 pub fn k_net_within_weekend_bound(k_net_bps: u32, g_bps: u64, alpha_bps: u32) -> bool {
     k_net_bps as u128 * g_bps as u128 <= alpha_bps as u128 * BPS
 }

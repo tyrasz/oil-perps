@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useVault } from '../hooks/useVault';
 import { useMarketStore } from '../stores/marketStore';
-import { adlRequired, drawdownNow, fromUnits, isSettled, toUnits, depositShares, withdrawRefusal } from '../utils/pool';
+import { adlRequired, drawdownNow, fromUnits, isSettled, toUnits, depositShares, withdrawRefusal, withdrawRoom, exitBufferBps } from '../utils/pool';
 import { redeemValue, unvested } from '../utils/poolMath';
 import { explainProgramError, type ErrorContext } from '../utils/errors';
 import { formatDuration } from '../utils/session';
@@ -93,13 +93,31 @@ export function LpVault() {
   // lp_withdraw's post-checks on the payout (§9.4 step 8): the cash, the
   // hard-net line and, with the weekend bound on, G·net ≤ α·B' (D43)
   const refusal = request && request.state === 'claimable' && view ? withdrawRefusal(market, pool, view, request.payout) : null;
+  // What can leave now: with traders at the net cap, the exit buffer (D45)
+  const room = view && !isSettled(market) && view.netNotional > 0n ? withdrawRoom(market, pool, view) : null;
+  // The buffer between the net cap and the weekend line at the market's
+  // current G (D45): 20% at production params, 0 or less at k_net = α/G or
+  // after G was raised, so the notice states it from the live params
+  const buffer = exitBufferBps(market, pool);
+  const delayText = formatDuration(Number(p.withdrawalDelaySecs));
+  const bufferText =
+    buffer === null
+      ? ''
+      : buffer > 0n
+      ? `This market's net cap sits ${bps(buffer)} of capital below this line, so with traders at the cap, a steady price ` +
+        'and nothing pending LPs keep about that much exit room; a price move, liquidations or pool losses can shrink it or use it up. '
+      : `This market's net cap ${buffer === 0n ? 'reaches' : 'is past'} this line, so with traders at the cap there is no exit room. `;
   const refusalText =
     refusal?.line === 'weekend'
-      ? "Claiming now would leave the pool's capital below its weekend bound: a weekend gap of G on the traders' open net must cost " +
-        `LPs at most ${bps(p.weekendLpLossBps)} of the capital that stays, so capital backing that net cannot leave. ` +
-        'Claim part of it (cancel and request fewer shares), or wait until traders close and the net shrinks. ' +
-        'Exposure ADL does not make this room: it stops at this same line, so with the net held at the cap a claim stays refused ' +
-        '(an open owner decision, docs/lp-pool.md §18).'
+      ? "Claiming all of it now would leave the pool's capital below its weekend bound: a weekend gap of G on the traders' open net " +
+        `must cost LPs at most ${bps(p.weekendLpLossBps)} of the capital that stays, so capital backing that net cannot leave. ` +
+        bufferText +
+        (room !== null && room > 0n
+          ? `Up to ${usd(room)} could leave now. That room is shared by every LP's matured claim, first come first served, ` +
+            `and is not reserved for you: a smaller request (cancel and request fewer shares) waits the full withdrawal delay ` +
+            `(${delayText}) again, and the room may be gone by then. The rest waits until traders close and the net shrinks. `
+          : 'Nothing can leave now: exits wait until traders close or the price moves back. ') +
+        'Exposure ADL is not run for LP exits: it acts only when the net passes the hard line, or in a drawdown.'
       : refusal?.line === 'hard_net'
       ? explainProgramError('PoolCapWouldBreach', { action: 'lpWithdraw' })
       : refusal
@@ -315,11 +333,19 @@ export function LpVault() {
           <span>{p.weekendCapWindowSecs > 0n ? formatDuration(Number(p.weekendCapWindowSecs)) : 'off'}</span>
         </div>
         <div className="info-item">
-          <span title="With the weekend bound on, the pool's net is held to α/G of its capital at all times, and LP capital backing it cannot be withdrawn (D43)">
+          <span title="With the weekend bound on, LP capital backing the net cannot leave below α/G of the net (D43). Traders' net is capped lower (k_net), and the gap is the LPs' exit buffer at the cap (D45)">
             Weekend bound
           </span>
           <span>{p.weekendCapWindowSecs > 0n ? `gap loss ≤ ${bps(p.weekendLpLossBps)} of capital` : 'off'}</span>
         </div>
+        {room !== null && (
+          <div className="info-item">
+            <span title="The most a claim could take out now before lp_withdraw's post-checks refuse it (cash, the hard-net line, the weekend bound). With traders at the net cap this is the exit buffer (D45)">
+              LP exit room now
+            </span>
+            <span>{usd(room)}</span>
+          </div>
+        )}
         <div className="info-item">
           <span title="No LP deposits or withdrawals this long after each session open (Q)">Reopen quiet</span>
           <span>{quietSecs > 0 ? formatDuration(quietSecs) : 'off'}</span>

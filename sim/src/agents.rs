@@ -910,12 +910,27 @@ impl Sim {
         let s = self.agents[i].s.clone();
         let (leverage, _) = self.leverage_for(s.leverage_x).await;
         let free = self.user_of(i).await.collateral_balance;
-        let size = self.contracts_for(free, s.fraction, leverage);
+        let mut size = self.contracts_for(free, s.fraction, leverage);
+        let house = self.agents[i].name.ends_with('1');
+        if house {
+            // Against the pool it sizes to its per-account headroom, as the
+            // order entry shows it (D45 lowered the cap to 0.1 × capNAV, under
+            // the margin a 20x gapper can post)
+            let st = self.st().await;
+            let u = self.user_of(i).await;
+            let p = st.pool.params;
+            if let (Ok(v), true) = (model::view(&st.pool, &st.m, self.px, self.now), p.per_account_cap_bps > 0) {
+                let cap = v.cap_nav * p.per_account_cap_bps as u128 * p.k_net_bps as u128 / 100_000_000;
+                let room = cap.saturating_sub(u.house_entry_notional as u128) * 97 / 100;
+                let max = (room * 1_000_000 / (self.px as u128 * 101 / 100)) as u64 / 1_000 * 1_000;
+                size = size.min(max);
+            }
+        }
         if size < CONTRACT {
             return;
         }
         let side = if self.rng.gen_bool(0.5) { Side::Long } else { Side::Short };
-        let opened = if self.agents[i].name.ends_with('1') {
+        let opened = if house {
             self.open_house(i, side, size, leverage, "open_position").await
         } else {
             self.take_quote(i, side, size, leverage, "fill_quote").await

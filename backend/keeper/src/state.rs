@@ -171,8 +171,8 @@ impl PoolParamsData {
             insurance_target: 250_000_000_000,
             insurance_claim_cap_per_window: 0,
             liq_min_remaining_notional: 100_000_000,
-            k_net_bps: 5_000,
-            hard_net_bps: 7_500,
+            k_net_bps: 4_000,
+            hard_net_bps: 6_000,
             per_account_cap_bps: 2_500,
             weekend_lp_loss_bps: 1_000,
             weekend_gap_bps: 0,
@@ -180,7 +180,7 @@ impl PoolParamsData {
             withdrawal_delay_secs: 345_600,
             withdrawal_claim_window_secs: 259_200,
             lp_reopen_quiet_secs: 1_800,
-            adl_net_target_bps: 2_500,
+            adl_net_target_bps: 2_000,
             adl_exposure_score_floor_bps: 0,
             dd_freeze_bps: 1_000,
             dd_adl_bps: 1_500,
@@ -220,6 +220,8 @@ impl PoolParamsData {
             withdrawal_claim_window_secs: 0,
             lp_reopen_quiet_secs: 0,
             profit_close_quiet_secs: 0,
+            // Kept at its D43 value: D45 left neutral unchanged
+            adl_net_target_bps: 2_500,
             ..Self::production()
         }
     }

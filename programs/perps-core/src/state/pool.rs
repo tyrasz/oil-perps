@@ -59,8 +59,8 @@ impl PoolParams {
             insurance_target: 250_000_000_000,
             insurance_claim_cap_per_window: 0,
             liq_min_remaining_notional: 100_000_000,
-            k_net_bps: 5_000,
-            hard_net_bps: 7_500,
+            k_net_bps: 4_000,
+            hard_net_bps: 6_000,
             per_account_cap_bps: 2_500,
             weekend_lp_loss_bps: 1_000,
             weekend_gap_bps: 0,
@@ -68,7 +68,7 @@ impl PoolParams {
             withdrawal_delay_secs: 345_600,
             withdrawal_claim_window_secs: 259_200,
             lp_reopen_quiet_secs: 1_800,
-            adl_net_target_bps: 2_500,
+            adl_net_target_bps: 2_000,
             adl_exposure_score_floor_bps: 0,
             dd_freeze_bps: 1_000,
             dd_adl_bps: 1_500,
@@ -108,6 +108,9 @@ impl PoolParams {
             withdrawal_claim_window_secs: 0,
             lp_reopen_quiet_secs: 0,
             profit_close_quiet_secs: 0,
+            // Kept at its D43 value: D45 lowered production's to 2_000 with
+            // k_net, and neutral stays as it was
+            adl_net_target_bps: 2_500,
             ..Self::production()
         }
     }
@@ -904,7 +907,8 @@ mod tests {
         assert_eq!(n.redeem_loss_haircut_bps, p.redeem_loss_haircut_bps);
         assert_eq!(n.liq_keeper_share_bps, p.liq_keeper_share_bps);
         assert_eq!(n.min_liq_slice_bps, p.min_liq_slice_bps);
-        assert_eq!(n.adl_net_target_bps, p.adl_net_target_bps);
+        // Pinned at its D43 value, so D45 left neutral unchanged
+        assert_eq!((n.adl_net_target_bps, p.adl_net_target_bps), (2_500, 2_000));
         assert_eq!(n.weekend_lp_loss_bps, p.weekend_lp_loss_bps);
         assert_eq!(n.liq_min_remaining_notional, p.liq_min_remaining_notional);
         // §5: the default timelock is 10 days
@@ -963,7 +967,8 @@ mod tests {
     }
 
     /// D43: with the weekend bound on (`W > 0`), `k_net·G ≤ α·10_000`.
-    /// Production (G 20%, α 10%) sits exactly on the edge at 0.5×.
+    /// The edge at G 20%, α 10% is 0.5×; production (D45) sits at 0.4×,
+    /// a 20% exit buffer below it.
     #[test]
     fn validate_holds_k_net_to_the_weekend_bound() {
         let m = oil();
@@ -973,8 +978,12 @@ mod tests {
             f(&mut p);
             p.validate(&m)
         };
+        // The edge (no exit buffer) is still valid; one past it is not
         assert!(ok(&|p| p.k_net_bps = 5_000));
         assert!(!ok(&|p| p.k_net_bps = 5_001));
+        let p = PoolParams::production();
+        // Production's exit buffer, 1 − k_net·G/α (§15.1, D45): 20%
+        assert_eq!(10_000 - p.k_net_bps as u64 * p.g_bps(&m) / p.weekend_lp_loss_bps as u64, 2_000);
         // Off with W = 0: the old 10× range applies
         assert!(ok(&|p| { p.k_net_bps = 5_001; p.weekend_cap_window_secs = 0; }));
         // α scales it: α 15% allows 0.75×
@@ -985,10 +994,14 @@ mod tests {
         assert!(!ok(&|p| { p.weekend_gap_bps = 1_000; p.k_net_bps = 10_001; p.hard_net_bps = 15_000; }));
         assert!(ok(&|p| { p.weekend_gap_bps = 2_500; p.k_net_bps = 4_000; p.adl_net_target_bps = 2_500; }));
         assert!(!ok(&|p| { p.weekend_gap_bps = 2_500; p.k_net_bps = 4_001; p.adl_net_target_bps = 2_500; }));
-        // A derived G follows the market: weekend IM 25% (not overridden) gives 0.4×
+        // A derived G follows the market: weekend IM 25% (not overridden)
+        // gives 0.4×, production's k_net with no buffer left; 30% gives 0.333×
         let m25 = Market { weekend_initial_margin_ratio: 2_500, ..oil() };
-        assert!(!PoolParams::production().validate(&m25));
-        assert!(PoolParams { k_net_bps: 4_000, ..PoolParams::production() }.validate(&m25));
+        assert!(PoolParams::production().validate(&m25));
+        assert!(!PoolParams { k_net_bps: 4_001, ..PoolParams::production() }.validate(&m25));
+        let m30 = Market { weekend_initial_margin_ratio: 3_000, ..oil() };
+        assert!(!PoolParams::production().validate(&m30));
+        assert!(PoolParams { k_net_bps: 3_333, adl_net_target_bps: 1_666, ..PoolParams::production() }.validate(&m30));
         // α = 0 with the bound on allows no net cap at all
         assert!(ok(&|p| { p.weekend_lp_loss_bps = 0; p.k_net_bps = 0; p.adl_net_target_bps = 0; }));
         assert!(!ok(&|p| { p.weekend_lp_loss_bps = 0; p.k_net_bps = 1; p.adl_net_target_bps = 0; }));
@@ -1006,11 +1019,11 @@ mod tests {
         // k_net ≤ 10× (weekend bound off, D43); hard_net 0 or ≥ k_net; adl target ≤ k_net
         assert!(ok(&|p| { p.k_net_bps = 100_000; p.hard_net_bps = 0; p.weekend_cap_window_secs = 0; }));
         assert!(!ok(&|p| { p.k_net_bps = 100_001; p.hard_net_bps = 0; p.weekend_cap_window_secs = 0; }));
-        assert!(ok(&|p| p.hard_net_bps = 5_000));
-        assert!(!ok(&|p| p.hard_net_bps = 4_999));
+        assert!(ok(&|p| p.hard_net_bps = 4_000));
+        assert!(!ok(&|p| p.hard_net_bps = 3_999));
         assert!(ok(&|p| p.hard_net_bps = 0));
-        assert!(ok(&|p| p.adl_net_target_bps = 5_000));
-        assert!(!ok(&|p| p.adl_net_target_bps = 5_001));
+        assert!(ok(&|p| p.adl_net_target_bps = 4_000));
+        assert!(!ok(&|p| p.adl_net_target_bps = 4_001));
         // bps fields ≤ 100%
         assert!(ok(&|p| p.per_account_cap_bps = 10_000));
         assert!(!ok(&|p| p.per_account_cap_bps = 10_001));

@@ -28,6 +28,8 @@ import {
   withdrawalRequest,
   withdrawPostChecks,
   withdrawRefusal,
+  withdrawRoom,
+  exitBufferBps,
   type LpPoolAccount,
   type MarketState,
 } from './pool';
@@ -105,14 +107,18 @@ describe('PoolParams::validate', () => {
 
   it('holds k_net to the weekend bound while W > 0 (D43)', () => {
     const p = productionPoolParams();
-    // G = 20%, α = 10%: k_net ≤ 0.5×, exactly production
+    // G = 20%, α = 10%: k_net ≤ 0.5×; production's 0.4× keeps a 20% exit
+    // buffer below it (D45), and the edge itself still validates
+    expect(validatePoolParams({ ...p, kNetBps: 5_000n }, oil)).toEqual([]);
     expect(validatePoolParams({ ...p, kNetBps: 5_001n }, oil).length).toBeGreaterThan(0);
     expect(validatePoolParams({ ...p, kNetBps: 5_001n, weekendCapWindowSecs: 0n }, oil)).toEqual([]);
     // An overridden G of 10% allows 1×
     expect(validatePoolParams({ ...p, weekendGapBps: 1_000n, kNetBps: 10_000n, hardNetBps: 15_000n }, oil)).toEqual([]);
     expect(validatePoolParams({ ...p, weekendGapBps: 1_000n, kNetBps: 10_001n, hardNetBps: 15_000n }, oil).length).toBeGreaterThan(0);
-    // A higher weekend IM tightens a derived G
-    expect(validatePoolParams(p, { ...oil, weekendInitialMarginRatio: 2_500n }).length).toBeGreaterThan(0);
+    // A higher weekend IM tightens a derived G: 25% uses up the buffer
+    // (0.4× is the edge), 30% refuses production's 0.4×
+    expect(validatePoolParams(p, { ...oil, weekendInitialMarginRatio: 2_500n })).toEqual([]);
+    expect(validatePoolParams(p, { ...oil, weekendInitialMarginRatio: 3_000n }).length).toBeGreaterThan(0);
   });
 });
 
@@ -169,7 +175,8 @@ describe('house quote', () => {
 });
 
 describe('caps and headroom', () => {
-  // $1M pool, production caps: net 0.5x capNAV (= α/G), per account 25% of that
+  // $1M pool, production caps: net 0.4x capNAV (20% under α/G = 0.5x, D45),
+  // per account 25% of that
   const p = pool(1_000_000n * C6);
   const oracle = 75n * C6;
   const v = poolView(p, oil, oracle, WEDNESDAY)!;
@@ -180,34 +187,38 @@ describe('caps and headroom', () => {
     expect(h.long).toBe(h.short);
     expect(checkOpenCaps(oil, p, v, true, h.long, oracle, 0n, 0n, WEDNESDAY)).toBeNull();
     expect(checkOpenCaps(oil, p, v, true, h.long + 1n, oracle, 0n, 0n, WEDNESDAY)).toBe('PoolExposureLimit');
-    expect(h.account).toBe(v.capNav / 8n);
+    expect(h.account).toBe(v.capNav / 10n);
     expect(checkOpenCaps(oil, p, v, true, C6, oracle, 0n, h.account!, WEDNESDAY)).toBeNull();
     expect(checkOpenCaps(oil, p, v, true, C6, oracle, 0n, h.account! + 1n, WEDNESDAY)).toBe('AccountExposureLimit');
   });
 
   it('use the weekend cap at any time while W > 0 (D43), and only for net-raising opens', () => {
-    // Production k_net = α/G: the two caps coincide and the net cap is reported
+    // Production k_net 0.4× is under α/G = 0.5× (D45): the net cap is the tighter
     expect(openHeadroom(oil, p, v, 0n, oracle, FRIDAY_CLOSE - 3_600).netCap).toBe('net');
-    // A weekend IM raised to 25% after the params: G·net ≤ α·capNAV binds at 0.4×, on a Wednesday
-    const raised = { ...oil, weekendInitialMarginRatio: 2_500n };
+    // A weekend IM raised to 30% after the params: G·net ≤ α·capNAV binds at
+    // 0.333×, under the 0.4× net cap, on a Wednesday
+    const raised = { ...oil, weekendInitialMarginRatio: 3_000n };
     for (const t of [WEDNESDAY, FRIDAY_CLOSE - 3_600]) {
       const h = openHeadroom(raised, p, v, 0n, oracle, t);
       expect(h.netCap).toBe('weekend');
       expect(checkOpenCaps(raised, p, v, false, h.short, oracle, 0n, 0n, t)).toBeNull();
       expect(checkOpenCaps(raised, p, v, false, h.short + 1n, oracle, 0n, 0n, t)).toBe('PoolWeekendExposureLimit');
     }
-    // W = 0 turns it off: the 0.5× net cap again
+    // W = 0 turns it off: the 0.4× net cap again. A $375k net-raising close
+    // fits the net cap but not the weekend cap at G 30%
     const off = pool(1_000_000n * C6, { ...productionPoolParams(), weekendCapWindowSecs: 0n });
     expect(openHeadroom(raised, off, v, 0n, oracle, WEDNESDAY).netCap).toBe('net');
-    expect(checkCloseCaps(raised, p, v, true, 5_400n * C6, oracle, WEDNESDAY)).toBe('PoolWeekendExposureLimit');
-    expect(checkCloseCaps(raised, off, v, true, 5_400n * C6, oracle, WEDNESDAY)).toBeNull();
+    expect(checkCloseCaps(raised, p, v, true, 5_000n * C6, oracle, WEDNESDAY)).toBe('PoolWeekendExposureLimit');
+    expect(checkCloseCaps(raised, off, v, true, 5_000n * C6, oracle, WEDNESDAY)).toBeNull();
   });
 
   it('count the skew-premium shortfall of an open across the clamp (D43)', () => {
     // +25k venue contracts long at $75, B ≈ $12.75M: a long to the closed-form
-    // weekend edge crosses the 1% clamp and would leave $9,375 of B short
+    // weekend edge crosses the 1% clamp and would leave $9,375 of B short.
+    // k_net at the α/G edge (0.5×, no exit buffer; production's 0.4× would
+    // answer first, D45), so only the shortfall makes the weekend cap tighter
     const n0 = 25_000n * C6;
-    const big = { ...pool(12_760_000n * C6), longEntrySum: n0 * oracle, openPositions: 1n };
+    const big = { ...pool(12_760_000n * C6, { ...productionPoolParams(), kNetBps: 5_000n }), longEntrySum: n0 * oracle, openPositions: 1n };
     const m = { ...oil, longOpenInterest: n0 };
     const vb = poolView(big, m, oracle, WEDNESDAY)!;
     const h = openHeadroom(m, big, vb, 0n, oracle, WEDNESDAY);
@@ -236,8 +247,8 @@ describe('caps and headroom', () => {
     const tiny = pool(1_000n * C6);
     const vt = poolView(tiny, oil, oracle, WEDNESDAY)!;
     expect(checkCloseCaps(oil, tiny, vt, true, 100n * C6, oracle, WEDNESDAY)).toBe('PoolExposureLimit');
-    expect(checkCloseCaps(oil, tiny, vt, true, 6n * C6, oracle, WEDNESDAY)).toBeNull(); // $450 ≤ 0.5 × $1,000
-    expect(checkCloseCaps(oil, tiny, vt, true, 7n * C6, oracle, WEDNESDAY)).toBe('PoolExposureLimit');
+    expect(checkCloseCaps(oil, tiny, vt, true, 5n * C6, oracle, WEDNESDAY)).toBeNull(); // $375 ≤ 0.4 × $1,000
+    expect(checkCloseCaps(oil, tiny, vt, true, 6n * C6, oracle, WEDNESDAY)).toBe('PoolExposureLimit');
     expect(checkCloseCaps({ ...oil, settlementPrice: oracle }, tiny, vt, true, 100n * C6, oracle, WEDNESDAY)).toBeNull();
   });
 });
@@ -348,7 +359,7 @@ describe('LP flows', () => {
     const m = { ...current, longOpenInterest: n };
     const big = { ...pool(1_000_000n * C6), longEntrySum: n * 75n * C6, openPositions: 1n };
     const v = poolView(big, m, 75n * C6, now)!;
-    // $200k out: G·$450k = $90k > α·$800k; the 0.75× hard line ($600k) still holds
+    // $200k out: G·$450k = $90k > α·$800k; the 0.6× hard line (B' ≥ $750k) still holds
     expect(withdrawRefusal(m, big, v, 200_000n * C6)).toEqual({ error: 'PoolCapWouldBreach', line: 'weekend' });
     expect(withdrawPostChecks(m, big, v, 200_000n * C6)).toBe('PoolCapWouldBreach');
     expect(withdrawPostChecks(m, big, v, 50_000n * C6)).toBeNull();
@@ -356,6 +367,69 @@ describe('LP flows', () => {
     expect(withdrawPostChecks({ ...m, settlementPrice: 75n * C6 }, big, v, 200_000n * C6)).toBeNull();
     // Past the hard line it reports that one
     expect(withdrawRefusal(m, big, v, 500_000n * C6)?.line).toBe('hard_net');
+  });
+
+  it('leaves LPs the 20% exit buffer with traders at the 0.4× net cap (D45)', () => {
+    // $1M pool, no skew premium owed (skew 0 here), net filled to the
+    // production cap: 5,333.33 contracts long at $75 = $399,999.75
+    const params = { ...productionPoolParams(), skewScale: 0n };
+    const n = 5_333_330_000n;
+    const m = { ...current, longOpenInterest: n };
+    const full = { ...pool(1_000_000n * C6, params), longEntrySum: n * 75n * C6, openPositions: 1n };
+    const v = poolView(full, m, 75n * C6, now)!;
+    expect(checkOpenCaps(m, full, v, true, 10_000n, 75n * C6, 0n, 0n, now)).toBe('PoolExposureLimit');
+    // B' ≥ G·net/α = 2·net: the room is B − $799,999.50 ≈ 20% of B, and it is exact
+    const room = withdrawRoom(m, full, v);
+    expect(room).toBe(v.navRedeem - 799_999_500_000n);
+    expect((room * 10_000n) / v.navRedeem).toBe(2_000n);
+    expect(withdrawRefusal(m, full, v, room)).toBeNull();
+    expect(withdrawRefusal(m, full, v, room + 1n)).toEqual({ error: 'PoolCapWouldBreach', line: 'weekend' });
+    // The hard line alone (0.6×) would leave a third of B
+    const noWeekend = { ...full, params: { ...params, weekendCapWindowSecs: 0n } };
+    expect((withdrawRoom(m, noWeekend, v) * 10_000n) / v.navRedeem).toBe(3_333n);
+    // A 10% price rise (pool short) leaves about 8% of B, (0.2 − 1.2·0.1)·B
+    // (§3.1): net_notional $440k needs B' ≥ $880k, and B falls by the
+    // traders' $40k gain to ≈ $960k, so ≈ $80k of room, 60% of the buffer gone
+    const up = poolView(full, m, 82_500_000n, now)!;
+    expect(up.navRedeem < v.navRedeem - 39_999n * C6).toBe(true);
+    expect((withdrawRoom(m, full, up) * 10_000n) / up.navRedeem).toBeLessThan(900n);
+    // The buffer the vault states comes from the live params: 20% at
+    // production, 0 at the α/G edge or with the weekend IM raised to 25%,
+    // negative past it, none with the weekend bound off
+    expect(exitBufferBps(m, full)).toBe(2_000n);
+    expect(exitBufferBps(m, { ...full, params: { ...params, kNetBps: 5_000n } })).toBe(0n);
+    expect(exitBufferBps({ ...m, weekendInitialMarginRatio: 2_500n }, full)).toBe(0n);
+    expect(exitBufferBps({ ...m, weekendInitialMarginRatio: 3_000n }, full)).toBe(-2_000n);
+    expect(exitBufferBps(m, noWeekend)).toBeNull();
+    // Settled or flat: only the cash bounds it
+    expect(withdrawRoom({ ...m, settlementPrice: 75n * C6 }, full, v)).toBe(full.cash);
+  });
+
+  it('shares the exit room first come first served, pre-fill requests included (D45 review)', () => {
+    // B = $2.5M; LP E requested $500k before any net, so capNAV = $2M, and
+    // traders filled the net to 0.4·capNAV = $800k (10,666.66 contracts at $75)
+    const params = { ...productionPoolParams(), skewScale: 0n };
+    const n = 10_666_660_000n;
+    const m = { ...current, longOpenInterest: n };
+    const base = pool(2_500_000n * C6, params);
+    const filled = { ...base, pendingWithdrawShares: 500_000n * C6, longEntrySum: n * 75n * C6, openPositions: 1n };
+    const v = poolView(filled, m, 75n * C6, now)!;
+    expect(v.capNav > 1_999_999n * C6 && v.capNav <= 2_000_000n * C6).toBe(true);
+    expect(checkOpenCaps(m, filled, v, true, 10_000n, 75n * C6, 0n, 0n, now)).toBe('PoolExposureLimit');
+    // The room is (0.2 + 0.8p)·B = $900k, pool-wide: B' must stay ≥ 2·net_notional
+    const room = withdrawRoom(m, filled, v);
+    expect(room).toBe(v.navRedeem - 1_599_999_000_000n);
+    // E's $500k fits now, and so does a $450k claim by LP L who requested
+    // after the fill (more than the 20% of the $2M that stays)
+    expect(withdrawRefusal(m, filled, v, 500_000n * C6)).toBeNull();
+    expect(withdrawRefusal(m, filled, v, 450_000n * C6)).toBeNull();
+    // L claims first: $450k and its shares leave, E's request is still pending
+    const afterL = { ...filled, cash: filled.cash - 450_000n * C6, lpShares: filled.lpShares - 450_000n * C6 };
+    const vl = poolView(afterL, m, 75n * C6, now)!;
+    expect(withdrawRoom(m, afterL, vl)).toBe(vl.navRedeem - 1_599_999_000_000n);
+    // capNAV kept traders off E's capital, but not the other LP: E's claim,
+    // requested before the fill, is now refused on the weekend line
+    expect(withdrawRefusal(m, afterL, vl, 500_000n * C6)).toEqual({ error: 'PoolCapWouldBreach', line: 'weekend' });
   });
 
   it('mints deposit shares at NAV_mint, the first deposit locking the dead shares', () => {

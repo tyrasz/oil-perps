@@ -493,6 +493,100 @@ async fn weekend_bound_keeps_the_capital_behind_the_net() {
     }
 }
 
+/// D45 (§3.1 exit-liveness cost, §18 #15): production params keep a 20%
+/// exit buffer between the trading net cap (`k_net` 0.4×) and the weekend
+/// withdraw line (`α/G` = 0.5× at G 20%). With traders filled to the net
+/// cap by real house opens, at a constant price:
+/// - a request made before the fill is claimed in full (`capNAV` left its
+///   shares out, so the net was sized on the capital that stays);
+/// - an LP who requests after the fill can take out exactly
+///   `B − G·net_notional/α` (≈ 20% of `B`), and one share more is refused
+///   with `PoolCapWouldBreach`. The hard-net line (0.6×) would allow a third
+///   of `B`, so the weekend line is the one that binds.
+#[tokio::test]
+async fn production_exit_buffer_at_the_net_cap() {
+    let prod = PoolParams::production();
+    let mut base = base_with(prod).await;
+    // G = max(IM 10%, weekend IM 20%) = 20%; no funding falls due (exact numbers)
+    configure(&mut base, cme_config()).await.unwrap();
+    patch_market(&mut base, |m| m.funding_interval = 1 << 40).await;
+    let m = market(&mut base).await;
+    assert_eq!(prod.g_bps(&m), 2_000);
+    let seed = seed_lp(&base);
+    let l2 = deposited_lp(&mut base, 1_000_000 * USDC).await;
+    let early = deposited_lp(&mut base, 500_000 * USDC).await;
+
+    // The early LP asks for all of its shares before any net is on
+    let early_shares = lp_position(&mut base, &early).await.shares;
+    lp_request(&mut base, &early, early_shares).await.unwrap();
+    let early_value = lp_position(&mut base, &early).await.requested_value;
+
+    // Traders fill the net to k_net·capNAV (capNAV ≈ $2M, B ≈ $2.5M). The
+    // per-account cap is 25% of the net cap, so five accounts share it.
+    let mark = usd(OIL_PRICE);
+    let mut traders = Vec::new();
+    for _ in 0..5 {
+        traders.push(trader(&mut base, 60_000 * USDC).await);
+    }
+    for t in &traders[..4] {
+        open(&mut base, t, 0, 2_100, 5).await.unwrap();
+    }
+    let v = pool_view_at(&mut base, mark).await;
+    let cap = v.cap_nav * prod.k_net_bps as u128 / 10_000;
+    let n_max = (cap * 1_000_000 / mark as u128) as u64;
+    let last = n_max - v.net as u64;
+    let (ix, _) = open_ix(&mut base, &traders[4].key(), 0, last + 1, 5_000).await;
+    assert_eq!(custom_error(send(&mut base.ctx, &[ix], &[&traders[4].kp]).await), perr(PerpsError::PoolExposureLimit));
+    let (ix, _) = open_ix(&mut base, &traders[4].key(), 0, last, 5_000).await;
+    send(&mut base.ctx, &[ix], &[&traders[4].kp]).await.unwrap();
+    assert_eq!(custom_error(open(&mut base, &traders[0], 0, 1, 5).await.map(|_| ())), perr(PerpsError::PoolExposureLimit));
+    let v = pool_view_at(&mut base, mark).await;
+    assert_eq!(v.net as u64, n_max);
+    // At the cap the weekend line still has room: G·net < α·capNAV
+    assert!(v.net_notional * 2_000 < v.cap_nav * 1_000);
+
+    // A week later (past the 4 d delay, outside W, inside the claim window)
+    set_time(&mut base, WEDNESDAY + 7 * DAY).await;
+    let before = token_balance(&mut base, early.tokens).await;
+    lp_withdraw(&mut base, &early).await.unwrap();
+    // In full, short only of its share of the per-position rounding slack
+    // (2 units per open position, §2.2) NAV_redeem took since the request
+    let paid = token_balance(&mut base, early.tokens).await - before;
+    assert!(paid <= early_value && paid + 11 >= early_value, "paid {} of {}", paid, early_value);
+
+    // The exit room after the fill: B' ≥ G·net_notional/α = 2·net_notional
+    let v = pool_view_at(&mut base, mark).await;
+    let nav = v.nav_redeem as u128;
+    let room = nav - 2 * v.net_notional;
+    let room_bps = room * 10_000 / nav;
+    println!("exit room at the net cap: {} of B {} ({} bps); net_notional {} (USDC units)", room, nav, room_bps, v.net_notional);
+    assert!((1_990..=2_010).contains(&room_bps), "room {} bps", room_bps);
+    // The hard-net line alone would allow B − net/0.6 ≈ a third of B
+    let hard_room = nav - (v.net_notional * 10_000 + 5_999) / 6_000;
+    assert!(hard_room * 10_000 / nav >= 3_300 && hard_room > room);
+
+    // Shares worth the room: the largest s with floor(s·nav/lp_shares) ≤ room
+    let lp_shares = pool(&mut base).await.lp_shares as u128;
+    let s_max = (((room + 1) * lp_shares - 1) / nav) as u64;
+    assert!(s_max < lp_position(&mut base, &seed).await.shares && s_max < lp_position(&mut base, &l2).await.shares);
+    // Both requested after the net reached the cap: l2 one share more than the room
+    lp_request(&mut base, &l2, s_max + 1).await.unwrap();
+    lp_request(&mut base, &seed, s_max).await.unwrap();
+    set_time(&mut base, WEDNESDAY + 14 * DAY).await;
+    assert_eq!(custom_error(lp_withdraw(&mut base, &l2).await), perr(PerpsError::PoolCapWouldBreach));
+    let before = token_balance(&mut base, seed.tokens).await;
+    lp_withdraw(&mut base, &seed).await.unwrap();
+    let paid = (token_balance(&mut base, seed.tokens).await - before) as u128;
+    assert!(paid <= room && paid + 2 >= room, "paid {} room {}", paid, room);
+    // The buffer is used up: the pool sits on the weekend line, and further
+    // exits wait for traders to close
+    let v = pool_view_at(&mut base, mark).await;
+    assert!(v.net_notional * 2_000 <= v.nav_redeem as u128 * 1_000);
+    assert!((v.net_notional * 2_000 + 3_000) > v.nav_redeem as u128 * 1_000);
+    assert_eq!(custom_error(lp_withdraw(&mut base, &l2).await), perr(PerpsError::PoolCapWouldBreach));
+    assert_buckets(&mut base).await;
+}
+
 #[tokio::test]
 async fn drawdown_block_stops_withdrawals_when_enabled() {
     let mut base = base_with(PoolParams { dd_withdraw_block_bps: 1_000, ..PoolParams::neutral() }).await;

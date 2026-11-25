@@ -164,8 +164,10 @@ function productionPoolParams() {
     insuranceTarget: new anchor.BN('250000000000'),
     insuranceClaimCapPerWindow: new anchor.BN(0),
     liqMinRemainingNotional: new anchor.BN(100_000_000),
-    kNetBps: 5_000, // 0.5× = α/G with G 20%: the hard weekend bound (D43)
-    hardNetBps: 7_500,
+    // 0.4×: 20% below α/G = 0.5× (G 20%), the weekend bound's edge (D43), so
+    // LPs keep a 20% exit buffer with traders at the net cap (D45)
+    kNetBps: 4_000,
+    hardNetBps: 6_000,
     perAccountCapBps: 2_500,
     weekendLpLossBps: 1_000,
     weekendGapBps: 0,
@@ -173,7 +175,7 @@ function productionPoolParams() {
     withdrawalDelaySecs: 345_600,
     withdrawalClaimWindowSecs: 259_200,
     lpReopenQuietSecs: 1_800,
-    adlNetTargetBps: 2_500,
+    adlNetTargetBps: 2_000,
     adlExposureScoreFloorBps: 0,
     ddFreezeBps: 1_000,
     ddAdlBps: 1_500,
@@ -191,19 +193,28 @@ function productionPoolParams() {
   };
 }
 
+// The LP exit buffer every market keeps at the net cap (D45): k_net·G ≤
+// (1 − buffer)·α, so with traders at the cap LPs can still withdraw about
+// this share of B (at constant price and B) before the weekend withdraw line
+// G·net ≤ α·B' binds. Production OIL: 1 − 4_000·2_000/(1_000·10_000) = 20%.
+const EXIT_BUFFER_BPS = 2_000;
+
 /**
  * Production params for one commodity. With the weekend bound on, validate
  * needs `k_net·G ≤ α·10_000` (D43), G = max(IM, weekend IM): the pool is
  * created before applyRiskConfig sets the weekend IM, and the always-on
- * weekend cap would then bind below k_net anyway, so a market whose weekend
- * IM exceeds 20% gets k_net = floor(α·10_000/G), with hard_net and the
- * drawdown-ADL target kept at 1.5× and 0.5× of it as in production.
+ * weekend cap would then bind below k_net anyway. Every market keeps the same
+ * 20% exit buffer below that edge (D45): k_net = floor((1 − buffer)·α·10_000/G),
+ * capped at production's (OIL and GOLD, G 20%, get exactly
+ * PoolParams::production()), with hard_net and the drawdown-ADL target kept
+ * at 1.5× and 0.5× of it as in production. Flooring keeps k_net·G below the
+ * edge, and adl ≤ k_net ≤ hard_net.
  */
 function poolParamsFor(commodity: string) {
   const p = productionPoolParams();
   const g = Math.max(MARKET_CONFIGS[commodity]?.initialMarginRatio ?? 0, RISK_CONFIGS[commodity]?.weekendInitialMarginRatio ?? 0);
   if (g > 0) {
-    const kNet = Math.min(p.kNetBps, Math.floor((p.weekendLpLossBps * 10_000) / g));
+    const kNet = Math.min(p.kNetBps, Math.floor((p.weekendLpLossBps * (10_000 - EXIT_BUFFER_BPS)) / g));
     if (kNet < p.kNetBps) {
       p.kNetBps = kNet;
       p.hardNetBps = Math.floor((kNet * 3) / 2);

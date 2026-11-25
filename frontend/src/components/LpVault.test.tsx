@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, render, screen, fireEvent } from '@testing-library/react';
-import { decodeLpPool, decodeMarket, lpGates, poolView, productionPoolParams, withdrawalRequest } from '../utils/pool';
+import { decodeLpPool, decodeMarket, lpGates, poolView, productionPoolParams, withdrawalRequest, withdrawRoom } from '../utils/pool';
 import { EMPTY_POOL_STATE, navPerShare, redeemValue } from '../utils/poolMath';
 
 const C6 = 1_000_000n;
@@ -110,20 +110,71 @@ describe('LpVault', () => {
     expect(withdraw).toHaveBeenCalled();
   });
 
-  it('explains a claim the weekend bound refuses (D43)', () => {
-    // The pool is short 6,600 contracts at $75 ($495k of net) on $1M, G = 20% (weekend IM):
-    // G·$495k ≤ α·B' needs B' ≥ $990k, so a $200k claim cannot leave (the 0.75× hard line would allow it)
-    const n = 6_600n * C6;
+  it('explains a claim the weekend bound refuses, with the exit buffer left (D43, D45)', () => {
+    // Traders hold the pool short at the production 0.4x cap: 5,333 contracts
+    // at $75 ($399,975 of net) on $1M, G = 20% (weekend IM). G·net <= α·B'
+    // needs B' >= $799,950, so about $200k (20%) can still leave; a $250k
+    // claim cannot (the 0.6x hard line would allow it)
+    const n = 5_333n * C6;
     const m = { ...market, lastFundingTime: BigInt(WEDNESDAY - 60), longOpenInterest: n, weekendInitialMarginRatio: 2_000n };
     const big = { ...pool, longEntrySum: n * 75n * C6, openPositions: 1n };
-    const req = { ...lpPosition, pendingShares: 200_000n * C6, requestedValue: 200_000n * C6, unlockAt: BigInt(WEDNESDAY - 60) };
-    const view = poolView(big, m, 75n * C6, WEDNESDAY);
+    const req = { ...lpPosition, pendingShares: 250_000n * C6, requestedValue: 250_000n * C6, unlockAt: BigInt(WEDNESDAY - 60) };
+    const view = poolView(big, m, 75n * C6, WEDNESDAY)!;
+    const room = withdrawRoom(m, big, view);
+    expect(room).toBe(view.navRedeem - 799_950n * C6);
+    // ≈ 20% of B: B is $1M less the ≈ $427 unwind premium this net is owed
+    // (D39; the entry sum here carries no premium paid)
+    expect(room > 199_500n * C6 && room < 200_100n * C6).toBe(true);
     state = { ...vaultAt(WEDNESDAY, m), pool: big, view, lpPosition: req, request: withdrawalRequest(m, big, req, view, WEDNESDAY) };
     render(<LpVault />);
     expect(screen.getByText(/below its weekend bound/)).toBeTruthy();
-    // Review finding: exposure ADL stops at the same line, so the notice must not promise it
-    expect(screen.getByText(/Exposure ADL does not make this room/)).toBeTruthy();
+    // The notice no longer implies LPs are locked out at the cap: it gives the room left
+    const roomUsd = (Number(room) / 1e6).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    expect(screen.getByText((t) => t.includes(`Up to $${roomUsd} could leave now`))).toBeTruthy();
+    expect(screen.getByText(/The rest waits until traders close/)).toBeTruthy();
+    // The buffer comes from the live params (1 − k_net·G/α = 20% here), and
+    // the notice says the room is shared and a smaller re-request waits the
+    // delay again (review finding)
+    expect(screen.getByText(/net cap sits 20\.00% of capital below this line/)).toBeTruthy();
+    expect(screen.getByText(/first come first served/)).toBeTruthy();
+    expect(screen.getByText(/waits the full withdrawal delay \(96h 0m\)/)).toBeTruthy();
+    expect(screen.getByText('LP exit room now')).toBeTruthy();
+    // Review finding: exposure ADL does not run for LP exits, so the notice must not promise it
+    expect(screen.getByText(/Exposure ADL is not run for LP exits/)).toBeTruthy();
     expect(screen.queryByText(/ADL reduces the net/)).toBeNull();
     expect(screen.getByText('Weekend bound')).toBeTruthy();
+  });
+
+  it('does not offer exit room that is not there (D45 review)', () => {
+    // Pool short at the 0.4x cap, then the price rises 20%: net_notional
+    // $480k needs B' >= $960k, but B fell by the traders' $80k gain, so the
+    // room is 0 and no smaller claim fits now
+    const n = 5_333n * C6;
+    const m = { ...market, lastFundingTime: BigInt(WEDNESDAY - 60), longOpenInterest: n, weekendInitialMarginRatio: 2_000n };
+    const big = { ...pool, longEntrySum: n * 75n * C6, openPositions: 1n };
+    const req = { ...lpPosition, pendingShares: 50_000n * C6, requestedValue: 50_000n * C6, unlockAt: BigInt(WEDNESDAY - 60) };
+    const view = poolView(big, m, 90n * C6, WEDNESDAY)!;
+    expect(withdrawRoom(m, big, view)).toBe(0n);
+    state = { ...vaultAt(WEDNESDAY, m), pool: big, view, lpPosition: req, request: withdrawalRequest(m, big, req, view, WEDNESDAY) };
+    render(<LpVault />);
+    expect(screen.getByText(/below its weekend bound/)).toBeTruthy();
+    expect(screen.getByText(/Nothing can leave now: exits wait until traders close or the price moves back/)).toBeTruthy();
+    expect(screen.queryByText(/could leave now/)).toBeNull();
+    expect(screen.queryByText(/request fewer shares/)).toBeNull();
+  });
+
+  it('states no exit buffer when the weekend IM was raised to alpha/k_net (D45 review)', () => {
+    // OIL at production params with the weekend IM raised to 25%: k_net·G = α,
+    // so the net cap reaches the weekend line and the 20% headline is gone
+    const n = 5_333n * C6;
+    const m = { ...market, lastFundingTime: BigInt(WEDNESDAY - 60), longOpenInterest: n, weekendInitialMarginRatio: 2_500n };
+    const big = { ...pool, longEntrySum: n * 75n * C6, openPositions: 1n };
+    const req = { ...lpPosition, pendingShares: 250_000n * C6, requestedValue: 250_000n * C6, unlockAt: BigInt(WEDNESDAY - 60) };
+    const view = poolView(big, m, 75n * C6, WEDNESDAY)!;
+    state = { ...vaultAt(WEDNESDAY, m), pool: big, view, lpPosition: req, request: withdrawalRequest(m, big, req, view, WEDNESDAY) };
+    render(<LpVault />);
+    expect(screen.getByText(/below its weekend bound/)).toBeTruthy();
+    expect(screen.getByText(/net cap reaches this line, so with traders at the cap there is no exit room/)).toBeTruthy();
+    expect(screen.queryByText(/about 20%/)).toBeNull();
   });
 });

@@ -239,6 +239,8 @@ impl Sim {
             lps.push(("lp-probe", 50_000 * USDC, crate::agents::LpPersona::Sandwich));
             // Holds a matured request for the weekend-bound withdrawal probe (D43)
             lps.push(("lp-bound", 200_000 * USDC, crate::agents::LpPersona::Sandwich));
+            // Holds a matured request claimed inside the exit buffer at the net cap (D45)
+            lps.push(("lp-buffer", 50_000 * USDC, crate::agents::LpPersona::Sandwich));
         }
         for (name, usdc, persona) in lps {
             let w = lp(sim.chain.base(), usdc).await;

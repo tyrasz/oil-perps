@@ -129,8 +129,8 @@ export function productionPoolParams(): PoolParams {
     insuranceTarget: 250_000_000_000n,
     insuranceClaimCapPerWindow: 0n,
     liqMinRemainingNotional: 100_000_000n,
-    kNetBps: 5_000n,
-    hardNetBps: 7_500n,
+    kNetBps: 4_000n, // 0.4×: a 20% exit buffer below the α/G = 0.5× weekend line (D45)
+    hardNetBps: 6_000n,
     perAccountCapBps: 2_500n,
     weekendLpLossBps: 1_000n,
     weekendGapBps: 0n,
@@ -138,7 +138,7 @@ export function productionPoolParams(): PoolParams {
     withdrawalDelaySecs: 345_600n,
     withdrawalClaimWindowSecs: 259_200n,
     lpReopenQuietSecs: 1_800n,
-    adlNetTargetBps: 2_500n,
+    adlNetTargetBps: 2_000n,
     adlExposureScoreFloorBps: 0n,
     ddFreezeBps: 1_000n,
     ddAdlBps: 1_500n,
@@ -178,6 +178,7 @@ export function neutralPoolParams(): PoolParams {
     withdrawalClaimWindowSecs: 0n,
     lpReopenQuietSecs: 0n,
     profitCloseQuietSecs: 0n,
+    adlNetTargetBps: 2_500n, // kept at its D43 value: D45 left neutral unchanged
   };
 }
 
@@ -766,6 +767,49 @@ export function withdrawRefusal(m: MarketState, pool: LpPoolAccount, v: pm.PoolV
     }
   }
   return null;
+}
+
+/**
+ * The largest payout `lp_withdraw`'s post-checks let leave now
+ * (`withdrawRefusal(m, pool, v, x)` is null for every `x ≤` it): the cash,
+ * then `B' ≥ ⌈net_notional·10_000/hard_net⌉` and, with the weekend bound on,
+ * `B' ≥ ⌈net_notional·G/α⌉`. With traders at the production 0.4× net cap this
+ * is the 20% exit buffer under the 0.5× weekend line (D45); a price rise or a
+ * fall in B eats it, and past it exits wait for traders to close.
+ */
+export function withdrawRoom(m: MarketState, pool: LpPoolAccount, v: pm.PoolView): bigint {
+  let room = pool.cash;
+  if (isSettled(m) || v.netNotional === 0n) return room;
+  const p = pool.params;
+  const nav = v.navRedeem;
+  const ceil = (a: bigint, b: bigint) => (a + b - 1n) / b;
+  const keep = (need: bigint) => {
+    const r = nav - need;
+    room = r < room ? (r > 0n ? r : 0n) : room;
+  };
+  if (p.hardNetBps > 0n) keep(ceil(v.netNotional * BPS, p.hardNetBps));
+  const g = pm.gBps(p.weekendGapBps, m.initialMarginRatio, m.weekendInitialMarginRatio);
+  if (pm.weekendBoundOn(p.weekendCapWindowSecs) && g > 0n) {
+    if (p.weekendLpLossBps === 0n) return 0n;
+    keep(ceil(v.netNotional * g, p.weekendLpLossBps));
+  }
+  return room;
+}
+
+/**
+ * The exit buffer `1 − k_net·G/α` at the market's current `G`, in bps (D45):
+ * the share of `B` LPs keep as exit room with traders at the net cap, at a
+ * steady price and `B` with nothing pending. 2_000 for production at G 20%;
+ * 0 or below when `k_net = α/G` (still valid) or after `G` was raised past
+ * `α/k_net`. `null` with the weekend bound off or α = 0 (no weekend line).
+ */
+export function exitBufferBps(m: MarketState, pool: LpPoolAccount): bigint | null {
+  const p = pool.params;
+  if (!pm.weekendBoundOn(p.weekendCapWindowSecs) || p.weekendLpLossBps === 0n) return null;
+  const g = pm.gBps(p.weekendGapBps, m.initialMarginRatio, m.weekendInitialMarginRatio);
+  if (g === 0n) return null;
+  // ceiling, so the buffer shown is never larger than the real one
+  return BPS - (p.kNetBps * g + p.weekendLpLossBps - 1n) / p.weekendLpLossBps;
 }
 
 /** Shares `lp_deposit` mints to the depositor for `amount` (the first deposit locks `LP_DEAD_SHARES`). */
