@@ -1,4 +1,5 @@
-"""Reference CME Globex session vectors from the IANA America/New_York zone.
+"""Reference CME Globex session vectors from the IANA America/New_York zone,
+and vectors for the localnet-only SCHEDULE_TEST_HOURLY (docs/localnet.md).
 
 Regenerate after changing the schedule logic:
   python3 scripts/gen-session-vectors.py rust > programs/perps-core/src/session_vectors.rs
@@ -59,6 +60,31 @@ for year in range(2024, 2041):
                 offset_ts |= {t - 1, t}
 offsets = [(t, offset(t)) for t in sorted(offset_ts)]
 
+# SCHEDULE_TEST_HOURLY: a one-hour "week" on Unix time, open [0, 3000) minus
+# the breaks [750, 810), [1500, 1560), [2250, 2310). Written as explicit
+# open segments, independently of the program's arithmetic. Its own RNG, so
+# the CME vectors above are unchanged.
+TEST_WEEK = 3600
+TEST_SEGMENTS = [(0, 750), (810, 1500), (1560, 2250), (2310, 3000)]
+TEST_WEEK_OPEN = sum(b - a for a, b in TEST_SEGMENTS)
+
+def test_point(t):
+    week, c = divmod(t, TEST_WEEK)  # Python divmod floors, like div_euclid
+    seg = next((a for a, b in TEST_SEGMENTS if a <= c < b), None)
+    open_until = week * TEST_WEEK_OPEN + sum(max(0, min(c, b) - a) for a, b in TEST_SEGMENTS)
+    if seg is None:
+        return (t, False, -1, -1, open_until)
+    return (t, True, week * TEST_WEEK + 3000 - t, c - seg, open_until)
+
+test_rng = random.Random(20261125)
+test_ts = set()
+for week in (-2, -1, 0, 1, 498_000, 498_001, 500_000):
+    for edge in (0, 750, 810, 1500, 1560, 2250, 2310, 3000, 3599):
+        t = week * TEST_WEEK + edge
+        test_ts |= {t - 1, t, t + 1}
+test_ts |= {test_rng.randrange(lo, hi) for _ in range(300)}
+test_sessions = [test_point(t) for t in sorted(test_ts)]
+
 fmt = sys.argv[1]
 if fmt == "rust":
     print("// Generated from the IANA America/New_York zone by session_vectors.py; do not edit.")
@@ -69,5 +95,10 @@ if fmt == "rust":
     print("const OFFSET_VECTORS: &[(i64, i64)] = &[")
     for t, o in offsets: print(f"    ({t}, {o}),")
     print("];")
+    print("\n// SCHEDULE_TEST_HOURLY (localnet only): (unix_ts, is_open,")
+    print("// seconds_until_weekly_close or -1, seconds_since_open or -1, open seconds since Unix 0)")
+    print("const TEST_SESSION_VECTORS: &[(i64, bool, i64, i64, i64)] = &[")
+    for t, o, c, so, ou in test_sessions: print(f"    ({t}, {str(o).lower()}, {c}, {so}, {ou}),")
+    print("];")
 else:
-    json.dump({"sessions": sessions, "offsets": offsets}, sys.stdout)
+    json.dump({"sessions": sessions, "offsets": offsets, "testSessions": test_sessions}, sys.stdout)

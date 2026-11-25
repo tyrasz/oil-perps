@@ -9,6 +9,7 @@ import {
   inPreCloseWindow,
   isOpen,
   openSecondsBetween,
+  SCHEDULE_TEST_HOURLY,
   secondsSinceOpen,
   timeAfterOpenSeconds,
 } from './session';
@@ -729,7 +730,7 @@ export function withdrawalRequest(m: MarketState, pool: LpPoolAccount, pos: LpPo
   let lapsed = false;
   if (!isSettled(m) && pos.claimWindowSecs > 0n) {
     const p = pool.params;
-    const window = Number(pm.effectiveClaimWindowSecs(pos.claimWindowSecs, p.weekendCapWindowSecs, p.lpReopenQuietSecs));
+    const window = Number(pm.effectiveClaimWindowSecs(m.sessionSchedule, pos.claimWindowSecs, p.weekendCapWindowSecs, p.lpReopenQuietSecs));
     // The request lapses once more than `window` open seconds have passed
     // since unlock; the deadline is the last in-session second within it.
     claimDeadline = timeAfterOpenSeconds(m.sessionSchedule, unlockAt, window);
@@ -821,9 +822,13 @@ export function depositShares(pool: LpPoolAccount, v: pm.PoolView, amount: bigin
 /** `PoolParams::validate` (state/pool.rs): false means `InvalidPoolParams`. */
 export function validatePoolParams(
   p: PoolParams,
-  m: Pick<MarketState, 'maintenanceMarginRatio' | 'takerFee' | 'initialMarginRatio' | 'weekendInitialMarginRatio'>
+  m: Pick<MarketState, 'maintenanceMarginRatio' | 'takerFee' | 'initialMarginRatio' | 'weekendInitialMarginRatio'> & {
+    sessionSchedule?: number;
+  }
 ): string[] {
   const bad: string[] = [];
+  // The D38 rule is the CME one on every schedule but the localnet test one (D46)
+  const schedule = m.sessionSchedule ?? 0;
   const bps = (x: bigint) => x <= 10_000n;
   const need = (ok: boolean, why: string) => {
     if (!ok) bad.push(why);
@@ -840,12 +845,17 @@ export function validatePoolParams(
   need(p.lpReopenQuietSecs <= 86_400n, 'lp_reopen_quiet_secs ≤ 1 day');
   need(p.profitCloseQuietSecs <= 3_600n, 'profit_close_quiet_secs ≤ 3,600');
   need(
-    pm.lpGatedSecsPerWeek(p.weekendCapWindowSecs, p.lpReopenQuietSecs) + pm.LP_UNGATED_SECS <= pm.WEEK_OPEN_SECS,
-    'W + 5·Q + 1 day ≤ 115 h (a day of ungated LP exits each week)'
+    pm.lpGatesLeaveExitTime(schedule, p.weekendCapWindowSecs, p.lpReopenQuietSecs),
+    schedule === SCHEDULE_TEST_HOURLY
+      ? 'W + 4·Q + 600 ≤ 2,820 (ungated LP exits each test week)'
+      : 'W + 5·Q + 1 day ≤ 115 h (a day of ungated LP exits each week)'
   );
   need(
-    p.withdrawalClaimWindowSecs === 0n || p.withdrawalClaimWindowSecs >= pm.minClaimWindowSecs(p.weekendCapWindowSecs, p.lpReopenQuietSecs),
-    'withdrawal_claim_window_secs is 0 or ≥ W + 5·Q + 1 day'
+    p.withdrawalClaimWindowSecs === 0n ||
+      p.withdrawalClaimWindowSecs >= pm.minClaimWindowSecs(schedule, p.weekendCapWindowSecs, p.lpReopenQuietSecs),
+    schedule === SCHEDULE_TEST_HOURLY
+      ? 'withdrawal_claim_window_secs is 0 or ≥ W + 4·Q + 600'
+      : 'withdrawal_claim_window_secs is 0 or ≥ W + 5·Q + 1 day'
   );
   need(
     !pm.weekendBoundOn(p.weekendCapWindowSecs) ||

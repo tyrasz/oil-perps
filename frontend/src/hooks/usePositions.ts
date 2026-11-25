@@ -2,6 +2,7 @@ import { useEffect, useCallback } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useMarketStore } from '../stores/marketStore';
 import { useOnChainPositions } from './useOnChainPositions';
+import { ORACLE_SOURCE } from '../config/program';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3003';
 
@@ -34,7 +35,8 @@ export function usePositions() {
 
   // Fetch orders from API (no on-chain order book yet)
   const fetchOrders = useCallback(async () => {
-    if (!publicKey) return;
+    // No backend on localnet (ORACLE_SOURCE 'chain'): no API orders to show
+    if (!publicKey || ORACLE_SOURCE === 'chain') return;
 
     try {
       const res = await fetch(`${API_URL}/api/orders/${publicKey.toString()}`);

@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+  # Manual runs add the live localnet smoke job (docs/localnet.md#ci)
+  workflow_dispatch:
 
 jobs:
   programs:
@@ -16,7 +18,10 @@ jobs:
         with:
           toolchain: "1.97.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p perps-core -p prop-amm -p vamm -p mm-registry -p orderbook
+      # mock-pyth: the localnet-only test oracle (docs/localnet.md), never deployed
+      - run: cargo test -p perps-core -p prop-amm -p vamm -p mm-registry -p orderbook -p mock-pyth
+      # The localnet build's test schedule (D46): accepted only with the feature
+      - run: cargo test -p perps-core --features localnet test_schedule
       # The simulation's own model and schedule against the spec and the IANA session vectors
       - run: cargo test -p sim
 
@@ -60,8 +65,51 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # The live localnet harness (scripts/localnet, docs/localnet.md) type-checks
+      # against the IDL-independent mirrors it imports from the frontend
+      - run: npx tsc -p scripts/localnet/tsconfig.json
+      # ... and its pure decisions (reopen print, checker coverage, gaps, bad debt, gapper sizing)
+      - run: npx ts-node -P scripts/localnet/tsconfig.json --transpile-only scripts/localnet/src/selftest.ts
       - run: solana-keygen new --no-bip39-passphrase --silent -o ~/.config/solana/id.json
       - run: scripts/test-ts.sh
+
+  # Live localnet smoke run (docs/localnet.md#ci): the localnet SBF build on
+  # solana-test-validator with the keeper binary, bots and the invariant checker
+  # for DURATION_SECS of wall clock; fails on any checker violation. Manual only:
+  # it costs 15-30 min (keeper build, up to 12 min of setup waiting for the LP
+  # deposit window when it starts in a test weekend) and what it covers depends
+  # on where in the hour it starts.
+  localnet-smoke:
+    name: Localnet smoke (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            backend/keeper
+      - name: Install Solana 1.18 tools
+        run: |
+          curl -sSfL https://github.com/anza-xyz/agave/releases/download/v1.18.26/solana-release-x86_64-unknown-linux-gnu.tar.bz2 | tar xj -C "$HOME"
+          echo "$HOME/solana-release/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: solana-keygen new --no-bip39-passphrase --silent -o ~/.config/solana/id.json
+      - run: DURATION_SECS=300 REPORT_DIR=$PWD/localnet-report scripts/localnet/run.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: localnet-report
+          path: localnet-report
 
   keeper:
     name: Keeper

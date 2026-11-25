@@ -12,7 +12,7 @@
 //! - `write_off_bad_debt` once a side's pending is `ADL_WRITE_OFF_SECS` old.
 
 use crate::ix::{self, KeeperResult};
-use crate::liquidator::{fetch_lp_pool, fetch_open_positions, fetch_oracle_price, for_each_market, unix_now};
+use crate::liquidator::{chain_now, fetch_lp_pool, fetch_open_positions, fetch_oracle_price, for_each_market};
 use crate::mirror::{
     self, adl_plan, exposure_triggers, in_profit_close_quiet, net_after_close, pool_view, quote_profit, AdlPlan,
     ADL_MODE_DEFICIT, ADL_MODE_EXPOSURE,
@@ -228,8 +228,10 @@ pub fn may_sign_exposure(signer: &Pubkey, pool: &LpPoolData, admin: Option<&Pubk
 // ---------------------------------------------------------------------------
 
 pub async fn run_adl_keeper(client: Arc<RpcClient>, config: Arc<KeeperConfig>) {
-    info!("ADL keeper started (every {} s)", ADL_CHECK_INTERVAL_SECS);
-    let mut tick = interval(Duration::from_secs(ADL_CHECK_INTERVAL_SECS));
+    let every = crate::env_secs("KEEPER_ADL_CHECK_SECS", ADL_CHECK_INTERVAL_SECS);
+    let backoff = crate::env_secs("KEEPER_ERROR_BACKOFF_SECS", 60);
+    info!("ADL keeper started (every {} s)", every);
+    let mut tick = interval(Duration::from_secs(every));
     let mut consecutive_errors = 0;
     loop {
         tick.tick().await;
@@ -246,7 +248,7 @@ pub async fn run_adl_keeper(client: Arc<RpcClient>, config: Arc<KeeperConfig>) {
                 error!("ADL check error (attempt {}): {}", consecutive_errors, e);
                 if consecutive_errors >= 5 {
                     warn!("Too many consecutive errors, backing off...");
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
                     consecutive_errors = 0;
                 }
             }
@@ -288,7 +290,7 @@ fn adl_market(client: &RpcClient, config: &KeeperConfig, commodity: &str, market
             debug!("{} has no LP pool", commodity);
             break;
         };
-        let now = unix_now();
+        let now = chain_now(client)?;
 
         // Write-off first: it does not need a price
         if pool.adl_required() && mirror::write_off_amount(&market, &pool, now) > 0 {

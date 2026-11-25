@@ -366,7 +366,7 @@ pub fn lp_withdraw(ctx: Context<LpWithdraw>) -> Result<()> {
     require!(now >= pos.unlock_at, PerpsError::WithdrawalDelayNotElapsed);
     if !settled && pos.claim_window_secs > 0 {
         let p = &ctx.accounts.lp_pool.params;
-        let window = pool_math::effective_claim_window_secs(pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
+        let window = pool_math::effective_claim_window_secs(m.session_schedule, pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
         let open = session::open_seconds_between(m.session_schedule, pos.unlock_at, now);
         require!(open as u64 <= window, PerpsError::WithdrawalExpired);
     }

@@ -10,10 +10,12 @@ use tracing::{info, error, warn, debug};
 const FUNDING_CHECK_INTERVAL_SECS: u64 = 60; // Check every minute
 
 pub async fn run_funding_keeper(client: Arc<RpcClient>, config: Arc<KeeperConfig>) {
+    let every = crate::env_secs("KEEPER_FUNDING_CHECK_SECS", FUNDING_CHECK_INTERVAL_SECS);
+    let backoff = crate::env_secs("KEEPER_ERROR_BACKOFF_SECS", 300);
     info!("Funding keeper started");
-    info!("Checking for funding updates every {} seconds", FUNDING_CHECK_INTERVAL_SECS);
+    info!("Checking for funding updates every {} seconds", every);
 
-    let mut check_interval = interval(Duration::from_secs(FUNDING_CHECK_INTERVAL_SECS));
+    let mut check_interval = interval(Duration::from_secs(every));
     let mut consecutive_errors = 0;
 
     loop {
@@ -32,7 +34,7 @@ pub async fn run_funding_keeper(client: Arc<RpcClient>, config: Arc<KeeperConfig
 
                 if consecutive_errors >= 5 {
                     warn!("Too many consecutive errors, backing off...");
-                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
                     consecutive_errors = 0;
                 }
             }
@@ -72,8 +74,10 @@ async fn update_market_funding(
     // Pausing only stops new positions; the program still accepts liquidations
     // and funding updates, and skipping them would let bad debt build up.
 
-    let now = crate::liquidator::unix_now();
-    if market_data.is_settled() || !market_data.is_in_session(now) {
+    // Chain time, and not in the last seconds before a close: the crank lands
+    // a slot later and the program would refuse it there
+    let now = crate::liquidator::chain_now(client)?;
+    if market_data.is_settled() || !market_data.is_in_session_for(now, crate::SESSION_EDGE_GUARD_SECS) {
         debug!("Market is settled or outside trading hours, skipping funding update");
         return Ok(false);
     }
@@ -100,9 +104,16 @@ async fn update_market_funding(
     );
 
     // Execute funding update
-    execute_funding_update(client, config, &market_pda, &market_data).await?;
-
-    Ok(true)
+    match execute_funding_update(client, config, &market_pda, &market_data).await {
+        Ok(()) => Ok(true),
+        // Anyone may crank (LP flows crank first when the accumulator is
+        // stale): one that landed since the read leaves nothing due
+        Err(e) if ix::has_program_error(&e.to_string(), ix::ERR_FUNDING_NOT_DUE) => {
+            info!("{} funding was cranked by someone else first", commodity);
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn execute_funding_update(

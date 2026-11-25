@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { Fragment, useState, useMemo } from 'react';
 import { usePositions } from '../hooks/usePositions';
 import { useMarketStore } from '../stores/marketStore';
 import { useTrading } from '../hooks/useTrading';
@@ -141,8 +141,8 @@ export function PositionTable() {
             const isExpanded = expandedPositionId === position.address;
 
             return (
-              <>
-                <tr key={position.address} className={isExpanded ? 'expanded' : ''}>
+              <Fragment key={position.address}>
+                <tr className={isExpanded ? 'expanded' : ''}>
                   <td className={position.side === 'long' ? 'long' : 'short'}>
                     {position.side.toUpperCase()} <span className="position-commodity">{position.commodity}</span>
                   </td>
@@ -233,7 +233,7 @@ export function PositionTable() {
                     </td>
                   </tr>
                 )}
-              </>
+              </Fragment>
             );
           })}
         </tbody>

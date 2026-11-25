@@ -22,3 +22,8 @@ dotenvy = "0.15"
 shellexpand = "3.1"
 borsh = "0.10"
 bs58 = "0.5"
+
+# The #[path]-included perps-core session.rs gates the localnet test schedule
+# on perps-core's `localnet` feature (D46); this crate never sets it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("localnet"))'] }

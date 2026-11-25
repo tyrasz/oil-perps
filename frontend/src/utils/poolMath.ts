@@ -505,24 +505,48 @@ export function paramsTimelockSecs(curDelay: bigint, newDelay: bigint, curWindow
   return max(max(curDelay, newDelay) + max(curWindow, newWindow) + PARAMS_TIMELOCK_MARGIN_SECS, MIN_POOL_TIMELOCK_SECS);
 }
 
-/** Open seconds in one CME week (115 h). */
+/** Open seconds in one CME week (115 h): every schedule but the test one (D38, D46). */
 export const WEEK_OPEN_SECS = 414_000n;
 /** One day of open time every week and claim window must leave ungated for `lp_withdraw` (D38). */
 export const LP_UNGATED_SECS = 86_400n;
+/** Session opens per CME week the reopen quiet gates. */
+export const SESSION_OPENS_PER_WEEK = 5n;
+/** `SCHEDULE_TEST_HOURLY` (localnet only, D46): its week's open time, ungated exit time and opens. */
+const SCHEDULE_TEST_HOURLY = 2;
+export const TEST_WEEK_OPEN_SECS = 2_820n;
+export const TEST_LP_UNGATED_SECS = 600n;
+export const TEST_SESSION_OPENS_PER_WEEK = 4n;
 
-/** Upper bound on the open seconds per week the LP gates close `lp_withdraw`: `W + 5·Q` (D38). */
-export function lpGatedSecsPerWeek(window: bigint, quiet: bigint): bigint {
-  return window + 5n * quiet;
+export function weekOpenSecs(schedule: number): bigint {
+  return schedule === SCHEDULE_TEST_HOURLY ? TEST_WEEK_OPEN_SECS : WEEK_OPEN_SECS;
 }
 
-/** Shortest claim window that always holds a day of ungated `lp_withdraw` time: `W + 5·Q + 1 day`. */
-export function minClaimWindowSecs(window: bigint, quiet: bigint): bigint {
-  return lpGatedSecsPerWeek(window, quiet) + LP_UNGATED_SECS;
+export function lpUngatedSecs(schedule: number): bigint {
+  return schedule === SCHEDULE_TEST_HOURLY ? TEST_LP_UNGATED_SECS : LP_UNGATED_SECS;
+}
+
+export function sessionOpensPerWeek(schedule: number): bigint {
+  return schedule === SCHEDULE_TEST_HOURLY ? TEST_SESSION_OPENS_PER_WEEK : SESSION_OPENS_PER_WEEK;
+}
+
+/** Upper bound on the open seconds per week the LP gates close `lp_withdraw`: `W + 5·Q` on CME (D38). */
+export function lpGatedSecsPerWeek(schedule: number, window: bigint, quiet: bigint): bigint {
+  return window + sessionOpensPerWeek(schedule) * quiet;
+}
+
+/** `validate`'s D38 rule: `W + 5·Q + 1 day ≤ 115 h` on CME, the compressed week on the test schedule. */
+export function lpGatesLeaveExitTime(schedule: number, window: bigint, quiet: bigint): boolean {
+  return lpGatedSecsPerWeek(schedule, window, quiet) + lpUngatedSecs(schedule) <= weekOpenSecs(schedule);
+}
+
+/** Shortest claim window that always holds the ungated `lp_withdraw` time: `W + 5·Q + 1 day` on CME. */
+export function minClaimWindowSecs(schedule: number, window: bigint, quiet: bigint): bigint {
+  return lpGatedSecsPerWeek(schedule, window, quiet) + lpUngatedSecs(schedule);
 }
 
 /** The claim window a request is held to (D38); `0` (never lapses) stays 0. */
-export function effectiveClaimWindowSecs(stored: bigint, window: bigint, quiet: bigint): bigint {
-  return stored === 0n ? 0n : max(stored, minClaimWindowSecs(window, quiet));
+export function effectiveClaimWindowSecs(schedule: number, stored: bigint, window: bigint, quiet: bigint): bigint {
+  return stored === 0n ? 0n : max(stored, minClaimWindowSecs(schedule, window, quiet));
 }
 
 /**

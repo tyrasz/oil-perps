@@ -90,6 +90,14 @@ impl MarketData {
         session::is_open(self.session_schedule, now)
     }
 
+    /// Open at `now` and still open `guard` seconds later. A transaction
+    /// decided at the chain's `now` lands a slot or more later, so the
+    /// keeper's non-urgent sends (settle, funding) skip the last seconds
+    /// before a close instead of failing `MarketClosed` there.
+    pub fn is_in_session_for(&self, now: i64, guard: i64) -> bool {
+        self.is_in_session(now) && self.is_in_session(now.saturating_add(guard))
+    }
+
     /// `(initial, maintenance)` ratios in force at `now` (Market::margin_ratios).
     pub fn margin_ratios(&self, now: i64) -> (u32, u32) {
         if session::in_pre_close_window(self.session_schedule, now, self.pre_close_window_secs) {

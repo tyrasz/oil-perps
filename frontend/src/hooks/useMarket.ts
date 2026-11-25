@@ -1,5 +1,10 @@
 import { useEffect, useCallback, useRef } from 'react';
+import { useConnection } from '@solana/wallet-adapter-react';
+import { PublicKey, type Connection } from '@solana/web3.js';
 import { useMarketStore, COMMODITIES, DEFAULT_COMMODITY } from '../stores/marketStore';
+import { ORACLE_SOURCE } from '../config/program';
+import { getCommodityMarket } from '../utils/pda';
+import { decodeMarketOpenInterest, decodeOraclePrice, MARKET_PYTH_PRICE_FEED_OFFSET } from '../utils/oracleAccount';
 import type { CommodityConfig } from '../config/commodities';
 import type { Trade } from '../types';
 
@@ -17,7 +22,43 @@ async function fetchJson(url: string) {
  * Owns the market data feed: REST polling plus one WebSocket connection.
  * Mount it exactly once (in App); components read the data via useMarket().
  */
+/**
+ * One commodity's price and open interest straight from the chain: the
+ * market account and its oracle (ORACLE_SOURCE 'chain', the localnet
+ * default). Null if the market does not exist on this cluster.
+ */
+async function fetchChainMarket(connection: Connection, commodity: CommodityConfig, firstPrice: Map<string, number>) {
+  const address = getCommodityMarket(commodity.id);
+  const info = await connection.getAccountInfo(address);
+  if (!info || info.data.length < MARKET_PYTH_PRICE_FEED_OFFSET + 32) return null;
+  const feed = new PublicKey(info.data.subarray(MARKET_PYTH_PRICE_FEED_OFFSET, MARKET_PYTH_PRICE_FEED_OFFSET + 32));
+  const feedInfo = await connection.getAccountInfo(feed);
+  const oracle = feedInfo ? decodeOraclePrice(feedInfo.data) : null;
+  if (!oracle) return null;
+  const first = firstPrice.get(commodity.id) ?? oracle.price;
+  firstPrice.set(commodity.id, first);
+  // Open interest from the market account (contracts), in USD at the oracle
+  const oi = decodeMarketOpenInterest(info.data) ?? { long: 0, short: 0 };
+  return {
+    address: address.toBase58(),
+    commodity: commodity.id,
+    price: oracle.price,
+    // Since this page started watching (no 24 h history without the API)
+    priceChange24h: first > 0 ? ((oracle.price - first) / first) * 100 : 0,
+    // No volume history on chain without the API: shown as unavailable
+    volume24h: Number.NaN,
+    openInterest: (oi.long + oi.short) * oracle.price,
+    longOpenInterest: oi.long * oracle.price,
+    shortOpenInterest: oi.short * oracle.price,
+    fundingRate: 0,
+    maxLeverage: commodity.maxLeverage,
+    isPaused: false,
+  };
+}
+
 export function useMarketFeed() {
+  const { connection } = useConnection();
+  const firstPrice = useRef(new Map<string, number>());
   const selectedCommodity = useMarketStore((s) => s.selectedCommodity);
   const setMarket = useMarketStore((s) => s.setMarket);
   const setOrderBook = useMarketStore((s) => s.setOrderBook);
@@ -28,6 +69,15 @@ export function useMarketFeed() {
 
   // Fetch market data for a specific commodity
   const fetchMarket = useCallback(async (commodity: CommodityConfig) => {
+    if (ORACLE_SOURCE === 'chain') {
+      try {
+        const m = await fetchChainMarket(connection, commodity, firstPrice.current);
+        if (m) setMarket(commodity.id, m);
+      } catch (error) {
+        console.error(`Failed to read ${commodity.id} from the chain:`, error);
+      }
+      return;
+    }
     try {
       const [marketRes, statsRes] = await Promise.all([
         fetch(`${API_URL}/api/market/${commodity.id}`),
@@ -81,10 +131,12 @@ export function useMarketFeed() {
         isPaused: false,
       });
     }
-  }, [setMarket]);
+  }, [setMarket, connection]);
 
   // Fetch order book for a specific commodity
   const fetchOrderBook = useCallback(async (commodity: CommodityConfig) => {
+    // No backend book on the chain source (venue quotes live on mm-registry)
+    if (ORACLE_SOURCE === 'chain') return;
     try {
       const res = await fetch(`${API_URL}/api/orderbook/${commodity.id}`);
 
@@ -152,6 +204,8 @@ export function useMarketFeed() {
   // WebSocket connection for real-time updates. Opened once; handlers read the
   // latest store state so price updates don't tear down the connection.
   useEffect(() => {
+    // The chain source has no backend to stream from
+    if (ORACLE_SOURCE === 'chain') return;
     let reconnectTimeout: ReturnType<typeof setTimeout> | undefined;
     let disposed = false;
 
@@ -230,7 +284,7 @@ export function useMarketFeed() {
     refresh();
     subscribeToCommodity(selectedCommodity);
 
-    const interval = setInterval(refresh, 5000);
+    const interval = setInterval(refresh, ORACLE_SOURCE === 'chain' ? 2000 : 5000);
     return () => clearInterval(interval);
   }, [selectedCommodity, fetchMarket, fetchOrderBook, subscribeToCommodity]);
 

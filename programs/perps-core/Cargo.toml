@@ -14,6 +14,11 @@ no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
 default = []
+# TEST ONLY: accept session::SCHEDULE_TEST_HOURLY, the one-hour "week" of a
+# live localnet run (docs/localnet.md, D46). Never enabled by a production
+# build: scripts/build-sbf.sh enables it only with --localnet, into
+# target/deploy-localnet.
+localnet = []
 
 [profile.release]
 overflow-checks = true

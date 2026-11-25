@@ -755,7 +755,7 @@ impl Sim {
             weekend_cap_window_secs: w,
             lp_reopen_quiet_secs: q,
             // Long enough that only the weekly bound can fail
-            withdrawal_claim_window_secs: cur.withdrawal_claim_window_secs.max((pm::min_claim_window_secs(w, q)).min(u32::MAX as u64) as u32),
+            withdrawal_claim_window_secs: cur.withdrawal_claim_window_secs.max((pm::min_claim_window_secs(crate::session::SCHEDULE_CME_GLOBEX, w, q)).min(u32::MAX as u64) as u32),
             ..cur
         };
         let propose = |s: &Sim, params: PoolParams| {
@@ -1327,7 +1327,7 @@ impl Sim {
             return false;
         }
         let p = crate::chain::pool_params();
-        let window = pm::effective_claim_window_secs(pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
+        let window = pm::effective_claim_window_secs(crate::session::SCHEDULE_CME_GLOBEX, pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
         let live = window == 0 || open_secs_between(pos.unlock_at, self.now) as u64 <= window;
         live && schedule::is_open(self.now) && !self.within_open(p.lp_reopen_quiet_secs as i64)
     }
@@ -1776,7 +1776,7 @@ impl Sim {
             return;
         }
         let p = crate::chain::pool_params();
-        let window = pm::effective_claim_window_secs(pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
+        let window = pm::effective_claim_window_secs(crate::session::SCHEDULE_CME_GLOBEX, pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
         if self.now < pos.unlock_at || (window > 0 && open_secs_between(pos.unlock_at, self.now) as u64 > window) || !schedule::is_open(self.now) {
             return;
         }

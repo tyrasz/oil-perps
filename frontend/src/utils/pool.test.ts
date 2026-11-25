@@ -93,6 +93,24 @@ describe('PoolParams::validate', () => {
     expect(validatePoolParams(neutralPoolParams(), oil)).toEqual([]);
   });
 
+  it('scales the LP gate rule to the localnet test schedule (D46)', () => {
+    const test = { ...oil, sessionSchedule: 2 };
+    const local = {
+      ...productionPoolParams(),
+      weekendCapWindowSecs: 300n,
+      lpReopenQuietSecs: 120n,
+      withdrawalClaimWindowSecs: 1_380n,
+      withdrawalDelaySecs: 900n,
+      profitCloseQuietSecs: 60n,
+    };
+    expect(validatePoolParams(local, test)).toEqual([]);
+    expect(validatePoolParams({ ...local, withdrawalClaimWindowSecs: 1_379n }, test).length).toBe(1);
+    expect(validatePoolParams({ ...local, weekendCapWindowSecs: 1_741n, withdrawalClaimWindowSecs: 0n }, test).length).toBe(1);
+    // Production's CME windows do not fit a 2_820 s week; CME is unchanged
+    expect(validatePoolParams(productionPoolParams(), test).length).toBeGreaterThan(0);
+    expect(validatePoolParams(productionPoolParams(), { ...oil, sessionSchedule: 1 })).toEqual([]);
+  });
+
   it('rejects what the program rejects', () => {
     const p = productionPoolParams();
     // W = 4 d with Q = 1 d shuts LP exits for weeks (D38)

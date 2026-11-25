@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   SCHEDULE_ALWAYS_OPEN,
   SCHEDULE_CME_GLOBEX,
+  SCHEDULE_TEST_HOURLY,
+  TEST_WEEK_OPEN,
   easternOffset,
   isOpen,
   marketSession,
@@ -207,5 +209,52 @@ describe('next funding time', () => {
       expect(isOpen(CME, t), `from ${from} need ${need}`).toBe(true);
       expect(t === from || !isOpen(CME, t - 1) || openSecondsBetween(CME, from, t - 1) < need).toBe(true);
     }
+  });
+});
+
+// SCHEDULE_TEST_HOURLY (localnet only, docs/localnet.md)
+describe('test schedule', () => {
+  const TEST = SCHEDULE_TEST_HOURLY;
+  const W0 = 1_794_607_200; // a test week start (ts ≡ 0 mod 3600)
+
+  it('matches the reference vectors shared with the program', () => {
+    const rows = vectors.testSessions as [number, boolean, number, number, number][];
+    expect(rows.length).toBeGreaterThan(400);
+    for (const [ts, open, untilClose, sinceOpen, openUntil] of rows) {
+      expect(isOpen(TEST, ts), `isOpen ${ts}`).toBe(open);
+      expect(secondsUntilWeeklyClose(TEST, ts), `untilClose ${ts}`).toBe(untilClose >= 0 ? untilClose : null);
+      expect(secondsSinceOpen(TEST, ts), `sinceOpen ${ts}`).toBe(sinceOpen >= 0 ? sinceOpen : null);
+      expect(openSecondsBetween(TEST, 0, ts) - openSecondsBetween(TEST, ts, 0), `open ${ts}`).toBe(openUntil);
+    }
+  });
+
+  it('agrees with isOpen second by second over two weeks', () => {
+    let acc = 0;
+    for (let t = W0; t < W0 + 2 * 3_600; t++) {
+      expect(openSecondsBetween(TEST, W0, t)).toBe(acc);
+      if (isOpen(TEST, t)) acc++;
+      // timeAfterOpenSeconds inverts openSecondsBetween onto in-session times
+      const need = (t * 7919) % 3_000;
+      const at = timeAfterOpenSeconds(TEST, t, need);
+      expect(isOpen(TEST, at), `at ${t} + ${need}`).toBe(true);
+      expect(openSecondsBetween(TEST, t, at)).toBe(need);
+      expect(at === t || openSecondsBetween(TEST, t, at - 1) < need || !isOpen(TEST, at - 1)).toBe(true);
+    }
+    expect(acc).toBe(2 * TEST_WEEK_OPEN);
+  });
+
+  it('closes for breaks and the weekend', () => {
+    const test = { sessionSchedule: TEST, preCloseWindowSecs: 300, settlementPrice: 0 };
+    expect(marketSession(test, W0 + 2_699).state).toBe('open');
+    expect(marketSession(test, W0 + 2_700).state).toBe('pre-close');
+    expect(marketSession(test, W0 + 3_000)).toEqual({ state: 'closed', secondsUntilClose: null, reopens: 'in 10m 0s (test weekend)' });
+    expect(marketSession(test, W0 + 760)).toEqual({ state: 'closed', secondsUntilClose: null, reopens: 'in 0m 50s (test break)' });
+    expect(inPreCloseWindow(TEST, W0 + 2_999, 300)).toBe(true);
+    // Funding: 60 s interval cranked 30 s before the close is due 30 s after the reopen
+    expect(nextFundingTime(TEST, W0 + 2_970, 0, 60)).toBe(W0 + 3_630);
+    expect(fundingCurrent(TEST, false, W0 + 2_970, 0, 60, W0 + 3_629)).toBe(true);
+    expect(fundingCurrent(TEST, false, W0 + 2_970, 0, 60, W0 + 3_630)).toBe(false);
+    // Completing exactly at a break: the next open
+    expect(timeAfterOpenSeconds(TEST, W0 + 700, 50)).toBe(W0 + 810);
   });
 });

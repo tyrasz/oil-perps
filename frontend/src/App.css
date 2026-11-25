@@ -1094,6 +1094,75 @@
   text-align: center;
 }
 
+/* The pending LP withdrawal (LpVault): label / value rows and its actions */
+.withdrawal-request {
+  margin-top: 16px;
+  padding: 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.withdrawal-request.claimable {
+  border-color: var(--green);
+}
+
+.withdrawal-request.lapsed {
+  border-color: var(--yellow);
+}
+
+.withdrawal-request h4 {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+
+.withdrawal-request .info-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 12px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+}
+
+.withdrawal-request .info-item span:first-child {
+  color: var(--text-secondary);
+}
+
+.withdrawal-request .request-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.withdrawal-request .request-actions .submit-btn {
+  flex: 1;
+}
+
+.withdrawal-request .request-btn {
+  padding: 10px 16px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.withdrawal-request .request-btn:hover:not(:disabled) {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.withdrawal-request .request-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .vault-info {
   margin-top: 24px;
   display: grid;
@@ -1215,7 +1284,8 @@
   color: var(--red);
 }
 
-.mm-stat .stat-sub {
+.mm-stat .stat-sub,
+.vault-stat .stat-sub {
   display: block;
   font-size: 12px;
   color: var(--text-secondary);
@@ -2277,6 +2347,17 @@
 
 .action-btn.close-btn:hover {
   background: var(--red-bg);
+}
+
+/* Closed market, a close in flight or a profit-close quiet time: say so (the title has the reason) */
+.action-btn:disabled,
+.action-btn.close-btn:disabled,
+.action-btn.close-btn:disabled:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--border-color);
+  color: var(--text-secondary);
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .expanded-row td {

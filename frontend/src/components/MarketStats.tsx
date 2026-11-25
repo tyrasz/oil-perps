@@ -61,7 +61,7 @@ export function MarketStats() {
 
       <div className="stat">
         <span className="label">24h Volume</span>
-        <span className="value">${(market.volume24h / 1_000_000).toFixed(2)}M</span>
+        <span className="value">{Number.isFinite(market.volume24h) ? `$${(market.volume24h / 1_000_000).toFixed(2)}M` : '—'}</span>
       </div>
 
       <div className="stat">

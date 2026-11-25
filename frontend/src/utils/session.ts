@@ -4,6 +4,14 @@
 
 export const SCHEDULE_ALWAYS_OPEN = 0;
 export const SCHEDULE_CME_GLOBEX = 1;
+/**
+ * TEST ONLY (docs/localnet.md): a CME-like week compressed into one hour of
+ * Unix time. Within each hour `c = ts mod 3600` the market is open for
+ * [0, 3000) except 60 s daily breaks at 750, 1500 and 2250, and closed for
+ * the 600 s weekend [3000, 3600). Only a `localnet` build of perps-core
+ * accepts it.
+ */
+export const SCHEDULE_TEST_HOURLY = 2;
 
 const HOUR = 3_600;
 const DAY = 86_400;
@@ -59,12 +67,43 @@ function cmeNextWeeklyClose(ts: number): number {
   return easternOffset(est) === -5 * HOUR ? est : closeLocal + 4 * HOUR;
 }
 
+// SCHEDULE_TEST_HOURLY, as in session.rs
+export const TEST_WEEK_SECS = 3_600;
+export const TEST_WEEKLY_CLOSE = 3_000;
+export const TEST_BREAK_SECS = 60;
+export const TEST_BREAKS = [750, 1_500, 2_250] as const;
+/** Open seconds per test week: 3000 − 3 × 60. */
+export const TEST_WEEK_OPEN = 2_820;
+/** Open segments of a test week: [start, end) offsets within the hour. */
+const TEST_SEGMENTS: [number, number][] = [
+  [0, 750],
+  [810, 1_500],
+  [1_560, 2_250],
+  [2_310, 3_000],
+];
+
+function testIsOpen(ts: number): boolean {
+  const c = mod(ts, TEST_WEEK_SECS);
+  return c < TEST_WEEKLY_CLOSE && !TEST_BREAKS.some((b) => c >= b && c < b + TEST_BREAK_SECS);
+}
+
+/** Cumulative test-schedule open seconds up to `ts` (from Unix 0). */
+function testOpenSecondsUntil(ts: number): number {
+  const c = mod(ts, TEST_WEEK_SECS);
+  let open = Math.min(c, TEST_WEEKLY_CLOSE);
+  for (const b of TEST_BREAKS) open -= Math.min(Math.max(c - b, 0), TEST_BREAK_SECS);
+  return Math.floor(ts / TEST_WEEK_SECS) * TEST_WEEK_OPEN + open;
+}
+
 export function isOpen(schedule: number, ts: number): boolean {
-  return schedule === SCHEDULE_CME_GLOBEX ? cmeIsOpen(ts) : true;
+  if (schedule === SCHEDULE_CME_GLOBEX) return cmeIsOpen(ts);
+  if (schedule === SCHEDULE_TEST_HOURLY) return testIsOpen(ts);
+  return true;
 }
 
 /** Seconds until the weekly close, or null when closed or never closing. */
 export function secondsUntilWeeklyClose(schedule: number, ts: number): number | null {
+  if (schedule === SCHEDULE_TEST_HOURLY) return testIsOpen(ts) ? TEST_WEEKLY_CLOSE - mod(ts, TEST_WEEK_SECS) : null;
   if (schedule !== SCHEDULE_CME_GLOBEX || !cmeIsOpen(ts)) return null;
   return cmeNextWeeklyClose(ts) - ts;
 }
@@ -106,14 +145,22 @@ function cmeOpenSecondsUntil(ts: number): number {
 /** Open seconds in `[a, b)`; `0` when `b <= a`. */
 export function openSecondsBetween(schedule: number, a: number, b: number): number {
   if (b <= a) return 0;
+  if (schedule === SCHEDULE_TEST_HOURLY) return testOpenSecondsUntil(b) - testOpenSecondsUntil(a);
   return schedule === SCHEDULE_CME_GLOBEX ? cmeOpenSecondsUntil(b) - cmeOpenSecondsUntil(a) : b - a;
 }
 
 /**
  * Seconds since the current session opened (Sunday 18:00 or the daily 18:00
- * reopen), or null if the market is closed or never closes.
+ * reopen; on the test schedule the week start or a break's end), or null if
+ * the market is closed or never closes.
  */
 export function secondsSinceOpen(schedule: number, ts: number): number | null {
+  if (schedule === SCHEDULE_TEST_HOURLY) {
+    if (!testIsOpen(ts)) return null;
+    const c = mod(ts, TEST_WEEK_SECS);
+    const seg = TEST_SEGMENTS.find(([a, b]) => c >= a && c < b)!;
+    return c - seg[0];
+  }
   if (schedule !== SCHEDULE_CME_GLOBEX || !cmeIsOpen(ts)) return null;
   const local = ts + easternOffset(ts);
   const s = mod(local, DAY);
@@ -151,6 +198,7 @@ function fromEastern(local: number): number {
  */
 export function timeAfterOpenSeconds(schedule: number, from: number, secs: number): number {
   const need = Math.max(0, secs);
+  if (schedule === SCHEDULE_TEST_HOURLY) return testTimeAfterOpenSeconds(from, need);
   if (schedule !== SCHEDULE_CME_GLOBEX) return from + need;
   const target = cmeOpenSecondsUntil(from) + need;
   const week = Math.floor(target / WEEK_OPEN);
@@ -170,6 +218,23 @@ export function timeAfterOpenSeconds(schedule: number, from: number, secs: numbe
   }
   const t = fromEastern(local);
   return Math.max(t, from);
+}
+
+/** `timeAfterOpenSeconds` on the test schedule. */
+function testTimeAfterOpenSeconds(from: number, need: number): number {
+  const target = testOpenSecondsUntil(from) + need;
+  const week = Math.floor(target / TEST_WEEK_OPEN);
+  let within = target - week * TEST_WEEK_OPEN;
+  let local = 0;
+  for (const [a, b] of TEST_SEGMENTS) {
+    // Completing exactly at a segment's end: the next segment's open
+    if (within < b - a) {
+      local = a + within;
+      break;
+    }
+    within -= b - a;
+  }
+  return Math.max(week * TEST_WEEK_SECS + local, from);
 }
 
 /**
@@ -207,6 +272,13 @@ export interface MarketSession {
 export function marketSession(market: MarketSessionParams | null | undefined, ts: number): MarketSession {
   if (!market) return { state: 'open', secondsUntilClose: null, reopens: null };
   if (market.settlementPrice > 0) return { state: 'settled', secondsUntilClose: null, reopens: null };
+
+  if (market.sessionSchedule === SCHEDULE_TEST_HOURLY && !isOpen(market.sessionSchedule, ts)) {
+    const c = mod(ts, TEST_WEEK_SECS);
+    const left = timeAfterOpenSeconds(SCHEDULE_TEST_HOURLY, ts, 0) - ts;
+    const kind = c >= TEST_WEEKLY_CLOSE ? 'test weekend' : 'test break';
+    return { state: 'closed', secondsUntilClose: null, reopens: `in ${Math.floor(left / 60)}m ${left % 60}s (${kind})` };
+  }
 
   if (!isOpen(market.sessionSchedule, ts)) {
     const local = ts + easternOffset(ts);

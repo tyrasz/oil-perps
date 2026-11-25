@@ -16,18 +16,37 @@ use tracing::{info, error, warn, debug};
 
 const LIQUIDATION_CHECK_INTERVAL_SECS: u64 = 10;
 
-pub fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+/// Liquidations sent in one pass at most (the rest wait for the next pass).
+pub const MAX_LIQUIDATIONS_PER_PASS: usize = 64;
+/// How long a pass waits for its batch of liquidations to confirm.
+const LIQUIDATION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `Clock::unix_timestamp` at the client's commitment: the time every session,
+/// margin and funding decision on-chain uses. It trails the wall clock (by
+/// ~1–1.3 s on a local validator), so deciding by wall time sends
+/// `settle_position_pnl` into `MarketClosed` and `update_funding` into
+/// `FundingNotDue` around session edges.
+pub fn chain_now(client: &RpcClient) -> KeeperResult<i64> {
+    let account = client
+        .get_account_with_commitment(&solana_sdk::sysvar::clock::id(), client.commitment())?
+        .value
+        .ok_or("clock sysvar missing")?;
+    clock_unix_timestamp(&account.data).ok_or_else(|| "clock sysvar too short".into())
+}
+
+/// `unix_timestamp` from the Clock sysvar's bincode layout (slot,
+/// epoch_start_timestamp, epoch, leader_schedule_epoch, unix_timestamp).
+pub fn clock_unix_timestamp(data: &[u8]) -> Option<i64> {
+    Some(i64::from_le_bytes(data.get(32..40)?.try_into().ok()?))
 }
 
 pub async fn run_liquidation_keeper(client: Arc<RpcClient>, config: Arc<KeeperConfig>) {
+    let every = crate::env_secs("KEEPER_LIQUIDATION_CHECK_SECS", LIQUIDATION_CHECK_INTERVAL_SECS);
+    let backoff = crate::env_secs("KEEPER_ERROR_BACKOFF_SECS", 60);
     info!("Liquidation keeper started");
-    info!("Checking for liquidatable positions every {} seconds", LIQUIDATION_CHECK_INTERVAL_SECS);
+    info!("Checking for liquidatable positions every {} seconds", every);
 
-    let mut check_interval = interval(Duration::from_secs(LIQUIDATION_CHECK_INTERVAL_SECS));
+    let mut check_interval = interval(Duration::from_secs(every));
     let mut consecutive_errors = 0;
 
     loop {
@@ -46,7 +65,7 @@ pub async fn run_liquidation_keeper(client: Arc<RpcClient>, config: Arc<KeeperCo
 
                 if consecutive_errors >= 5 {
                     warn!("Too many consecutive errors, backing off...");
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
                     consecutive_errors = 0;
                 }
             }
@@ -142,7 +161,7 @@ async fn check_market(
     // Pausing only stops new positions; the program still accepts liquidations
     // and funding updates, and skipping them would let bad debt build up.
 
-    let now = unix_now();
+    let now = chain_now(client)?;
     if market_data.is_settled() {
         debug!("Market is settled, no liquidations");
         return Ok(0);
@@ -159,32 +178,62 @@ async fn check_market(
     let open_positions = fetch_open_positions(client, &config.perps_program_id, &market_pda)?;
     debug!("Found {} open positions", open_positions.len());
 
-    let mut liquidated_count = 0;
-
-    for (position_address, position) in liquidatable(&market_data, &open_positions, oracle_price, now) {
-        let mmr = market_data.maintenance_margin_ratio_at(now);
+    // Worst first, all sent at once and confirmed together: after a reopen gap
+    // owners race the keeper to close bankrupt positions
+    let mut candidates = liquidatable(&market_data, &open_positions, oracle_price, now);
+    if candidates.len() > MAX_LIQUIDATIONS_PER_PASS {
+        warn!("{} liquidatable positions; sending the worst {} this pass", candidates.len(), MAX_LIQUIDATIONS_PER_PASS);
+        candidates.truncate(MAX_LIQUIDATIONS_PER_PASS);
+    }
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let mmr = market_data.maintenance_margin_ratio_at(now);
+    let liquidator_token_account = get_associated_token_address(&config.keypair.pubkey(), &market_data.collateral_mint);
+    let mut ixs = Vec::with_capacity(candidates.len());
+    for (position_address, position) in &candidates {
         info!(
             "Found liquidatable position: {} (mark margin: {}%, entry margin: {}%, required: {}%)",
             position_address,
-            mark_margin_ratio(&position, oracle_price, market_data.cumulative_funding) as f64 / 100.0,
-            calculate_margin_ratio(&position, oracle_price, market_data.cumulative_funding) as f64 / 100.0,
+            mark_margin_ratio(position, oracle_price, market_data.cumulative_funding) as f64 / 100.0,
+            calculate_margin_ratio(position, oracle_price, market_data.cumulative_funding) as f64 / 100.0,
             mmr as f64 / 100.0
         );
+        ixs.push(ix::liquidate(
+            &config.perps_program_id,
+            &config.keypair.pubkey(),
+            &position.owner,
+            &market_pda,
+            position_address,
+            &liquidator_token_account,
+            &market_data.pyth_price_feed,
+        ));
+    }
 
-        match execute_liquidation(client, config, &market_pda, &market_data, &position_address, &position).await {
-            Ok(_) => {
+    let mut liquidated_count = 0;
+    for ((position_address, _), result) in candidates.iter().zip(ix::send_batch(client, &config.keypair, ixs, LIQUIDATION_CONFIRM_TIMEOUT)) {
+        match result {
+            // After a stage-1 slice the position stays Open with a smaller
+            // size; the next pass re-checks it (§16.4)
+            Ok(sig) => {
                 liquidated_count += 1;
-                // After a stage-1 slice the position stays Open with a
-                // smaller size; the next pass re-checks it (§16.4)
-                info!("Liquidation successful for position {}", position_address);
+                info!("Liquidation successful for position {}: {}", position_address, sig);
             }
-            Err(e) => {
-                error!("Failed to liquidate position {}: {}", position_address, e);
+            Err(e) if is_liquidation_race(&e.to_string()) => {
+                info!("Position {} was closed or recovered before its liquidation landed; skipped", position_address);
             }
+            Err(e) => error!("Failed to liquidate position {}: {}", position_address, e),
         }
     }
 
     Ok(liquidated_count)
+}
+
+/// A refusal that only means someone got there first: the owner (or another
+/// liquidator) closed the position, or a price move or margin top-up since
+/// the scan lifted it back over maintenance.
+pub fn is_liquidation_race(err: &str) -> bool {
+    ix::has_program_error(err, ix::ERR_POSITION_ALREADY_CLOSED) || ix::has_program_error(err, ix::ERR_NOT_LIQUIDATABLE)
 }
 
 /// The positions `liquidate` accepts at `mark` and `now` (§6.1): equity on
@@ -196,11 +245,20 @@ pub fn liquidatable(market: &MarketData, positions: &[(Pubkey, PositionData)], m
     }
     let m = mirror::project_funding(market, mark, now);
     let mmr = m.maintenance_margin_ratio_at(now);
-    positions
+    let mut out: Vec<(Pubkey, PositionData)> = positions
         .iter()
         .filter(|(_, p)| p.is_liquidatable(mark, p.accrued_funding(m.cumulative_funding), mmr))
         .cloned()
-        .collect()
+        .collect();
+    // Worst first: most negative equity (the largest deficit if an owner's
+    // close or a further move gets there first), then the larger notional
+    out.sort_by(|(ka, a), (kb, b)| {
+        a.equity(mark, m.cumulative_funding)
+            .cmp(&b.equity(mark, m.cumulative_funding))
+            .then(b.mark_notional(mark).cmp(&a.mark_notional(mark)))
+            .then(ka.cmp(kb))
+    });
+    out
 }
 
 /// Equity over mark notional, bps (`Position::margin_ratio_mark`, display).
@@ -317,29 +375,6 @@ fn calculate_margin_ratio(position: &PositionData, current_price: u64, cumulativ
     }
 
     ((equity * 10000) / notional).min(u32::MAX as i128) as u32
-}
-
-async fn execute_liquidation(
-    client: &RpcClient,
-    config: &KeeperConfig,
-    market_pda: &Pubkey,
-    market_data: &MarketData,
-    position_address: &Pubkey,
-    position: &PositionData,
-) -> KeeperResult<()> {
-    let liquidator_token_account = get_associated_token_address(&config.keypair.pubkey(), &market_data.collateral_mint);
-    let instruction = ix::liquidate(
-        &config.perps_program_id,
-        &config.keypair.pubkey(),
-        &position.owner,
-        market_pda,
-        position_address,
-        &liquidator_token_account,
-        &market_data.pyth_price_feed,
-    );
-    let signature = ix::send(client, &config.keypair, instruction)?;
-    info!("Liquidation tx: {}", signature);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -472,6 +507,59 @@ mod tests {
         // Below the $5 floor, and negative prices, are rejected
         assert!(validated_price(499_000_000, 0, -8, &market).is_err());
         assert!(validated_price(-3_763_000_000, 0, -8, &market).is_err());
+    }
+
+    /// After a reopen gap the keeper sends the worst positions first (it used
+    /// to go in RPC/pubkey order and lose the bankrupt ones to their owners).
+    #[test]
+    fn liquidatable_is_worst_first() {
+        let m = MarketData { maintenance_margin_ratio: 500, funding_interval: 3_600, last_funding_time: 1_000, ..Default::default() };
+        let long = |size: u64, collateral: u64| PositionData { side: 0, size, collateral, entry_price: 75_000_000, opened_price: 75_000_000, ..Default::default() };
+        // At $70 each 100 contracts lose $500: equity +$100, −$300, −$100,
+        // and 200 contracts with $900: −$100 on twice the notional
+        let a = (Pubkey::new_from_array([1; 32]), long(100_000_000, 600_000_000));
+        let b = (Pubkey::new_from_array([2; 32]), long(100_000_000, 200_000_000));
+        let c = (Pubkey::new_from_array([3; 32]), long(100_000_000, 400_000_000));
+        let d = (Pubkey::new_from_array([4; 32]), long(200_000_000, 900_000_000));
+        let healthy = (Pubkey::new_from_array([5; 32]), long(100_000_000, 5_000_000_000));
+        let order: Vec<Pubkey> = liquidatable(&m, &[a.clone(), b.clone(), c.clone(), d.clone(), healthy], 70_000_000, 1_000).into_iter().map(|x| x.0).collect();
+        // −$300 first; the two −$100 ones larger notional first; +$100 last
+        assert_eq!(order, vec![b.0, d.0, c.0, a.0]);
+    }
+
+    #[test]
+    fn liquidation_races_are_not_errors() {
+        assert!(is_liquidation_race("RPC response error -32002: Transaction simulation failed: Error processing Instruction 0: custom program error: 0x177c; 5 log messages"));
+        assert!(is_liquidation_race("5Kx..: Error processing Instruction 0: custom program error: 0x1777"));
+        // MarketClosed (0x178b), StaleOraclePrice (0x1779) and transport errors are real failures
+        assert!(!is_liquidation_race("Error processing Instruction 0: custom program error: 0x178b"));
+        assert!(!is_liquidation_race("Error processing Instruction 0: custom program error: 0x1779"));
+        assert!(!is_liquidation_race("error sending request for url (http://127.0.0.1:8899/)"));
+    }
+
+    #[test]
+    fn reads_the_clock_sysvar_timestamp() {
+        let clock = solana_sdk::clock::Clock { slot: 9, epoch_start_timestamp: 1, epoch: 2, leader_schedule_epoch: 3, unix_timestamp: 1_795_606_965 };
+        let data = solana_sdk::account::create_account_for_test(&clock).data;
+        assert_eq!(clock_unix_timestamp(&data), Some(1_795_606_965));
+        assert_eq!(clock_unix_timestamp(&data[..39]), None);
+    }
+
+    /// Settles and funding cranks skip the seconds before a close (they
+    /// land a slot later and would fail MarketClosed there).
+    #[test]
+    fn session_guard_skips_the_seconds_before_a_close() {
+        let m = MarketData { session_schedule: session::SCHEDULE_TEST_HOURLY, ..Default::default() };
+        let week = 1_795_604_400; // a multiple of 3_600: c = 0
+        assert!(m.is_in_session_for(week + 747, 2));
+        assert!(!m.is_in_session_for(week + 748, 2)); // the 750 s daily break
+        assert!(!m.is_in_session_for(week + 2_999, 2)); // the weekend at 3_000
+        assert!(m.is_in_session_for(week + 810, 2)); // the break is over
+        assert!(!m.is_in_session_for(week + 809, 2));
+        let cme = MarketData { session_schedule: session::SCHEDULE_CME_GLOBEX, ..Default::default() };
+        let friday_close = 1_794_607_200;
+        assert!(cme.is_in_session_for(friday_close - 3, 2));
+        assert!(!cme.is_in_session_for(friday_close - 1, 2));
     }
 
     #[test]

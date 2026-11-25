@@ -132,12 +132,11 @@ impl PoolParams {
             && p.profit_close_quiet_secs <= 3_600
             // Every week keeps a day of open time with lp_withdraw ungated
             // (D38): W and Q together cannot shut LP exits for good
-            && pool_math::lp_gated_secs_per_week(p.weekend_cap_window_secs, p.lp_reopen_quiet_secs)
-                + pool_math::LP_UNGATED_SECS
-                <= pool_math::WEEK_OPEN_SECS;
+            // (D38), measured on the market's schedule (D46)
+            && pool_math::lp_gates_leave_exit_time(m.session_schedule, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
         let claim = p.withdrawal_claim_window_secs == 0
             || p.withdrawal_claim_window_secs as u64
-                >= pool_math::min_claim_window_secs(p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
+                >= pool_math::min_claim_window_secs(m.session_schedule, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
         // With the weekend bound on, the net cap alone keeps G·net within α
         // of the capital at the G in force now (D43). G can rise later
         // (update_market_config does not see the pool); the always-on
@@ -940,7 +939,7 @@ mod tests {
                 open[i + 1] = open[i] + o as i64 * 60;
                 free[i + 1] = free[i] + (o && !gated) as i64 * 60;
             }
-            let c = crate::pool_math::min_claim_window_secs(w, q) as i64;
+            let c = crate::pool_math::min_claim_window_secs(CME, w, q) as i64;
             let mut j = 0;
             for i in 0..n {
                 while j < n && open[j] - open[i] < c {
@@ -961,9 +960,134 @@ mod tests {
         }
         // A request stored under the production gates is held to the wider
         // gates a later apply brings in, never to less than it stored
-        assert_eq!(crate::pool_math::effective_claim_window_secs(259_200, 86_400, 1_800), 259_200);
-        assert_eq!(crate::pool_math::effective_claim_window_secs(181_800, 318_600, 1_800), 414_000);
-        assert_eq!(crate::pool_math::effective_claim_window_secs(0, 318_600, 1_800), 0);
+        assert_eq!(crate::pool_math::effective_claim_window_secs(CME, 259_200, 86_400, 1_800), 259_200);
+        assert_eq!(crate::pool_math::effective_claim_window_secs(CME, 181_800, 318_600, 1_800), 414_000);
+        assert_eq!(crate::pool_math::effective_claim_window_secs(CME, 0, 318_600, 1_800), 0);
+    }
+
+    /// D46: the D38 rule on `SCHEDULE_ALWAYS_OPEN` and `SCHEDULE_CME_GLOBEX`
+    /// is exactly the old fixed one (`W + 5·Q + 86_400 ≤ 414_000`, claim
+    /// floor `W + 5·Q + 86_400`), and `validate` gives the same answers on
+    /// both. Only the localnet test schedule uses its compressed week.
+    #[test]
+    fn lp_gate_rule_is_unchanged_on_production_schedules() {
+        use crate::pool_math as pm;
+        use crate::session::{SCHEDULE_ALWAYS_OPEN as ALWAYS, SCHEDULE_CME_GLOBEX as CME, SCHEDULE_TEST_HOURLY as TEST};
+        assert_eq!(TEST, 2); // pool_math's private copy of the id
+        assert_eq!(pm::TEST_WEEK_OPEN_SECS as i64, crate::session::TEST_WEEK_OPEN);
+        assert_eq!(crate::session::open_seconds_between(TEST, 0, 3_600) as u64, pm::week_open_secs(TEST));
+        let start = 1_794_783_600 - 7 * 86_400; // Sun 2026-11-08 18:00 ET
+        assert_eq!(crate::session::open_seconds_between(CME, start, start + 7 * 86_400) as u64, pm::week_open_secs(CME));
+        for s in [ALWAYS, CME, 3, u8::MAX] {
+            assert_eq!((pm::week_open_secs(s), pm::lp_ungated_secs(s), pm::session_opens_per_week(s)), (414_000, 86_400, 5));
+        }
+        let mut x = 0x5eed_0f_d46u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let cme = Market { session_schedule: CME, ..oil() };
+        for i in 0..20_000 {
+            let (w, q, c) = if i % 2 == 0 {
+                ((next() % 440_000) as u32, (next() % 90_000) as u32, (next() % 500_000) as u32)
+            } else {
+                // Near the edges
+                let q = (next() % 70_000) as u32;
+                let w = (414_000u64 - 86_400).saturating_sub(5 * q as u64) as u32 + (next() % 5) as u32;
+                (w.saturating_sub(2), q, (w as u64 + 5 * q as u64 + 86_400) as u32 - 2 + (next() % 5) as u32)
+            };
+            let old_gates = w as u64 + 5 * q as u64 + 86_400 <= 414_000;
+            let old_floor = w as u64 + 5 * q as u64 + 86_400;
+            for s in [ALWAYS, CME] {
+                assert_eq!(pm::lp_gates_leave_exit_time(s, w, q), old_gates, "W={} Q={}", w, q);
+                assert_eq!(pm::min_claim_window_secs(s, w, q), old_floor);
+                assert_eq!(pm::effective_claim_window_secs(s, c, w, q), if c == 0 { 0 } else { (c as u64).max(old_floor) });
+            }
+            let p = PoolParams { weekend_cap_window_secs: w, lp_reopen_quiet_secs: q, withdrawal_claim_window_secs: c, ..PoolParams::production() };
+            assert_eq!(p.validate(&oil()), p.validate(&cme), "W={} Q={} C={}", w, q, c);
+        }
+    }
+
+    /// Pool params scaled to the test schedule's 2_820 s week (the localnet
+    /// values, docs/localnet.md): `W + 4·Q + 600 ≤ 2_820`, claim floor
+    /// `W + 4·Q + 600`. Production's CME windows do not fit that week.
+    #[test]
+    fn test_schedule_scales_the_lp_gate_rule() {
+        use crate::pool_math as pm;
+        use crate::session::SCHEDULE_TEST_HOURLY as TEST;
+        let m = Market { session_schedule: TEST, pre_close_window_secs: 300, ..oil() };
+        let local = |w: u32, q: u32, c: u32| PoolParams {
+            weekend_cap_window_secs: w,
+            lp_reopen_quiet_secs: q,
+            withdrawal_claim_window_secs: c,
+            withdrawal_delay_secs: 900,
+            profit_close_quiet_secs: 60,
+            ..PoolParams::production()
+        };
+        assert_eq!(pm::min_claim_window_secs(TEST, 300, 120), 300 + 4 * 120 + 600);
+        assert!(local(300, 120, 1_380).validate(&m));
+        assert!(!local(300, 120, 1_379).validate(&m));
+        assert!(local(300, 120, 0).validate(&m));
+        // W + 4·Q + 600 ≤ 2_820
+        assert!(local(1_740, 120, 0).validate(&m));
+        assert!(!local(1_741, 120, 0).validate(&m));
+        assert!(local(300, 480, 0).validate(&m));
+        assert!(!local(300, 481, 0).validate(&m));
+        // Production's CME windows shut LP exits for a whole test week
+        assert!(PoolParams::production().validate(&oil()));
+        assert!(!PoolParams::production().validate(&m));
+        // A stored window is held to the gates in force now
+        assert_eq!(pm::effective_claim_window_secs(TEST, 1_500, 300, 120), 1_500);
+        assert_eq!(pm::effective_claim_window_secs(TEST, 1_000, 300, 120), 1_380);
+        assert_eq!(pm::effective_claim_window_secs(TEST, 0, 300, 120), 0);
+    }
+
+    /// D38 on the test schedule, second by second over four test weeks: for
+    /// parameters that validate, every claim window of the minimum length
+    /// holds at least `TEST_LP_UNGATED_SECS` of open time with `lp_withdraw`
+    /// ungated, and so does every week.
+    #[test]
+    fn valid_test_schedule_gates_always_leave_exit_time() {
+        use crate::pool_math as pm;
+        use crate::session::{in_pre_close_window, is_open, seconds_since_open, SCHEDULE_TEST_HOURLY as TEST};
+        let m = Market { session_schedule: TEST, ..oil() };
+        let start = 1_794_607_200i64; // a test week start
+        let n = 4 * 3_600usize;
+        for (w, q) in [(300u32, 120u32), (1_740, 120), (300, 480), (0, 555), (2_220, 0), (1_000, 300), (600, 690)] {
+            let p = PoolParams { weekend_cap_window_secs: w, lp_reopen_quiet_secs: q, withdrawal_claim_window_secs: 0, ..PoolParams::production() };
+            let valid = p.validate(&m);
+            assert_eq!(valid, pm::lp_gates_leave_exit_time(TEST, w, q), "W={} Q={}", w, q);
+            if !valid {
+                assert!((w, q) == (600, 690), "W={} Q={}", w, q);
+                continue;
+            }
+            let mut open = vec![0i64; n + 1];
+            let mut free = vec![0i64; n + 1];
+            for i in 0..n {
+                let t = start + i as i64;
+                let o = is_open(TEST, t);
+                let gated = in_pre_close_window(TEST, t, w) || seconds_since_open(TEST, t).map_or(false, |s| s < q as i64);
+                open[i + 1] = open[i] + o as i64;
+                free[i + 1] = free[i] + (o && !gated) as i64;
+            }
+            let c = pm::min_claim_window_secs(TEST, w, q) as i64;
+            let u = pm::lp_ungated_secs(TEST) as i64;
+            let mut j = 0;
+            for i in 0..n {
+                while j < n && open[j] - open[i] < c {
+                    j += 1;
+                }
+                if open[j] - open[i] < c {
+                    break;
+                }
+                assert!(free[j] - free[i] >= u, "W={} Q={} start {} has {}", w, q, i, free[j] - free[i]);
+            }
+            for wk in 0..4 {
+                assert!(free[(wk + 1) * 3_600] - free[wk * 3_600] >= u, "W={} Q={} week {}", w, q, wk);
+            }
+        }
     }
 
     /// D43: with the weekend bound on (`W > 0`), `k_net·G ≤ α·10_000`.

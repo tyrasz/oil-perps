@@ -2,6 +2,14 @@
 # Build perps-core, prop-amm, mm-registry and orderbook to SBF shared objects
 # (target/deploy/*.so).
 #
+#   scripts/build-sbf.sh --localnet
+# instead builds the binaries of a live local run (docs/localnet.md) into
+# target/deploy-localnet (never target/deploy): perps-core with the
+# `localnet` feature (it then accepts session::SCHEDULE_TEST_HOURLY), the
+# other three as above, plus vamm and the test-only mock-pyth oracle. Neither
+# is part of the default build, and nothing in target/deploy-localnet may be
+# deployed to a public cluster.
+#
 # Needs the Solana 1.18 CLI tools on PATH (cargo-build-sbf, platform-tools
 # v1.41 = Rust 1.75) and a recent host cargo (>= 1.84) for MSRV-aware
 # resolution. Each program is built from a standalone copy without its
@@ -20,14 +28,29 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-OUT=${SBF_OUT_DIR:-$ROOT/target/deploy}
+LOCALNET=0
+for arg in "$@"; do
+  case "$arg" in
+    --localnet) LOCALNET=1 ;;
+    *) echo "usage: $0 [--localnet]" >&2; exit 2 ;;
+  esac
+done
+PROGRAMS="perps-core prop-amm mm-registry orderbook"
+if [ "$LOCALNET" = 1 ]; then
+  # SBF_OUT_DIR is not honoured here: the localnet binaries must never land
+  # in target/deploy, where the default build and its tests look
+  OUT=$ROOT/target/deploy-localnet
+  PROGRAMS="$PROGRAMS vamm mock-pyth"
+else
+  OUT=${SBF_OUT_DIR:-$ROOT/target/deploy}
+fi
 WORK=${SBF_WORK_DIR:-$ROOT/target/sbf-build}
 mkdir -p "$OUT" "$WORK"
 
 # perps-core first: prop-amm include!s ../../perps-core/src/price.rs, and in
 # $WORK mm-registry's and orderbook's `path = "../perps-core"` resolves to the
 # stripped copy built here.
-for prog in perps-core prop-amm mm-registry orderbook; do
+for prog in $PROGRAMS; do
   dst="$WORK/$prog"
   rm -rf "$dst/src"
   mkdir -p "$dst"
@@ -51,12 +74,25 @@ PY
     CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo generate-lockfile
     # ... and pin the ones that don't declare it (blake3 >= 1.6 needs edition 2024 crates)
     cargo update -p blake3 --precise 1.5.0
-    # ahash 0.8.13 / 0.7.9 (Nov 2026) pull getrandom 0.4 (edition 2024) and declare no rust-version
-    cargo update -p ahash@0.8.13 --precise 0.8.12 2>/dev/null || true
-    cargo update -p ahash@0.7.9 --precise 0.7.8 2>/dev/null || true
+    # ahash 0.8.13+ / 0.7.9+ (from Nov 2026: 0.8.13, then 0.8.14) pull getrandom 0.4
+    # (edition 2024) and declare no rust-version: pin every newer one, whatever
+    # the index resolves today
+    for v in $(grep -A1 '^name = "ahash"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p'); do
+      case "$v" in
+        0.8.12 | 0.7.8 | 0.[0-6].* | 0.7.[0-7] | 0.8.[0-9] | 0.8.1[01]) ;;
+        0.8.*) cargo update -p "ahash@$v" --precise 0.8.12 ;;
+        0.7.*) cargo update -p "ahash@$v" --precise 0.7.8 ;;
+      esac
+    done
     # platform-tools' cargo 1.75 reads lockfile v3, not v4
     python3 -c "import pathlib; p = pathlib.Path('Cargo.lock'); p.write_text(p.read_text().replace('\nversion = 4\n', '\nversion = 3\n', 1))"
-    cargo-build-sbf --sbf-out-dir "$OUT" 2>&1 | tee build.log
+    # No array here: bash < 4.4 (macOS /bin/bash 3.2) treats an empty "${a[@]}"
+    # as unset under set -u
+    if [ "$LOCALNET" = 1 ] && [ "$prog" = perps-core ]; then
+      cargo-build-sbf --sbf-out-dir "$OUT" --features localnet 2>&1 | tee build.log
+    else
+      cargo-build-sbf --sbf-out-dir "$OUT" 2>&1 | tee build.log
+    fi
   )
   # Not `! grep`: set -e ignores a negated command's status
   if grep "Stack offset" "$dst/build.log" | grep -qv "solana_frozen_abi..abi_example..AbiEnumVisitor"; then

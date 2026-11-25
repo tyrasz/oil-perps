@@ -863,7 +863,7 @@ impl Sim {
             if now < pos.unlock_at {
                 broken.push("before the delay".into());
             }
-            let window = crate::pool_math::effective_claim_window_secs(pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
+            let window = crate::pool_math::effective_claim_window_secs(crate::session::SCHEDULE_CME_GLOBEX, pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs);
             if !settled && window > 0 && open_secs_between(pos.unlock_at, now) as u64 > window {
                 broken.push("after the claim window".into());
             }

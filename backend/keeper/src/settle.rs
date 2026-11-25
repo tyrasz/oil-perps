@@ -10,7 +10,7 @@
 //!   market is settled with no open positions (§10.1).
 
 use crate::ix::{self, KeeperResult, ERR_POOL_CASH_INSUFFICIENT};
-use crate::liquidator::{fetch_lp_pool, fetch_open_positions, for_each_market, unix_now};
+use crate::liquidator::{chain_now, fetch_lp_pool, fetch_open_positions, for_each_market};
 use crate::mirror::{in_profit_close_quiet, sweep_amount};
 use crate::state::{LpPoolData, MarketData, PositionData};
 use crate::KeeperConfig;
@@ -105,13 +105,16 @@ pub fn settled_close_order(m: &MarketData, pool: &LpPoolData, positions: &[(Pubk
 // ---------------------------------------------------------------------------
 
 pub async fn run_pool_keeper(client: Arc<RpcClient>, config: Arc<KeeperConfig>) {
-    info!("Pool keeper started (every {} s)", POOL_CHECK_INTERVAL_SECS);
-    let mut tick = interval(Duration::from_secs(POOL_CHECK_INTERVAL_SECS));
+    let every = crate::env_secs("KEEPER_POOL_CHECK_SECS", POOL_CHECK_INTERVAL_SECS);
+    let backoff = crate::env_secs("KEEPER_ERROR_BACKOFF_SECS", 60);
+    let settle_period = crate::env_secs("KEEPER_SETTLE_PERIOD_SECS", SETTLE_PERIOD_SECS as u64) as i64;
+    info!("Pool keeper started (every {} s, periodic settle every {} s)", every, settle_period);
+    let mut tick = interval(Duration::from_secs(every));
     let last_settle: Mutex<HashMap<Pubkey, i64>> = Mutex::new(HashMap::new());
     let mut consecutive_errors = 0;
     loop {
         tick.tick().await;
-        let result = for_each_market(&client, &config, |commodity, pda, market| pool_market(&client, &config, &last_settle, commodity, pda, market));
+        let result = for_each_market(&client, &config, |commodity, pda, market| pool_market(&client, &config, &last_settle, settle_period, commodity, pda, market));
         match result {
             Ok(n) => {
                 consecutive_errors = 0;
@@ -124,7 +127,7 @@ pub async fn run_pool_keeper(client: Arc<RpcClient>, config: Arc<KeeperConfig>) 
                 error!("Pool check error (attempt {}): {}", consecutive_errors, e);
                 if consecutive_errors >= 5 {
                     warn!("Too many consecutive errors, backing off...");
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
                     consecutive_errors = 0;
                 }
             }
@@ -136,6 +139,7 @@ fn pool_market(
     client: &RpcClient,
     config: &KeeperConfig,
     last_settle: &Mutex<HashMap<Pubkey, i64>>,
+    settle_period: i64,
     commodity: &str,
     market_pda: Pubkey,
     market: MarketData,
@@ -146,7 +150,7 @@ fn pool_market(
         debug!("{} has no LP pool", commodity);
         return Ok(0);
     };
-    let now = unix_now();
+    let now = chain_now(client)?;
     let mut sent = 0u32;
 
     if market.is_settled() {
@@ -172,12 +176,12 @@ fn pool_market(
                 }
             }
         }
-    } else if market.is_in_session(now) {
+    } else if market.is_in_session_for(now, crate::SESSION_EDGE_GUARD_SECS) {
         let mark = crate::liquidator::fetch_oracle_price(client, &market, now)?;
         let positions = fetch_open_positions(client, &program, &market_pda)?;
         let periodic = {
             let map = last_settle.lock().unwrap();
-            map.get(&market_pda).is_none_or(|t| now - t >= SETTLE_PERIOD_SECS)
+            map.get(&market_pda).is_none_or(|t| now - t >= settle_period)
         };
         let n = settle_losers(client, config, commodity, market_pda, &market, &pool, &positions, mark, periodic);
         if periodic {
@@ -225,6 +229,9 @@ fn settle_losers(
             Ok(sig) => {
                 info!("{} settle_position_pnl {} (loss {}): {}", commodity, position, loss, sig);
                 sent += 1;
+            }
+            Err(e) if ix::is_settle_race(&e.to_string()) => {
+                info!("{} settle_position_pnl {} skipped: the position changed since the scan", commodity, position)
             }
             Err(e) => error!("{} settle_position_pnl {} failed: {}", commodity, position, e),
         }

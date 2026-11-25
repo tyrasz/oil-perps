@@ -1071,6 +1071,41 @@ async fn max_open_interest_is_editable_and_zero_keeps_it() {
     assert_eq!(custom_error(env.open("OIL", 0, 1, 5).await.map(|_| ())), code(PerpsError::OpenInterestCapExceeded));
 }
 
+/// The localnet-only test schedule (D46, docs/localnet.md): a default build
+/// (what CI, scripts/build-sbf.sh and any production deploy produce) rejects
+/// it with `InvalidMarketConfig` like any unknown schedule; a build with the
+/// `localnet` feature accepts it. Run against SBF binaries, the test crate's
+/// feature must match the binary's: `target/deploy` with the default
+/// features, `target/deploy-localnet` with `--features localnet`.
+#[tokio::test]
+async fn test_schedule_needs_a_localnet_build() {
+    use perps_core::session::SCHEDULE_TEST_HOURLY;
+    let mut env = Env::new().await.funded("OIL", 1_000 * USDC).await;
+    let test = MarketConfigParams { session_schedule: SCHEDULE_TEST_HOURLY, pre_close_window_secs: 300, ..weekend_config() };
+    let result = env.configure("OIL", test).await;
+    if !cfg!(feature = "localnet") {
+        assert_eq!(custom_error(result), code(PerpsError::InvalidMarketConfig));
+        assert_eq!(env.market("OIL").await.session_schedule, 0);
+        // The production schedules are unaffected
+        env.configure("OIL", weekend_config()).await.unwrap();
+        assert_eq!(env.market("OIL").await.session_schedule, SCHEDULE_CME_GLOBEX);
+        return;
+    }
+    result.unwrap();
+    assert_eq!(env.market("OIL").await.session_schedule, SCHEDULE_TEST_HOURLY);
+    // A test week starts at ts ≡ 0 (mod 3_600): open, daily break, weekend
+    let week = 1_794_607_200 + 3_600;
+    env.set_time(week + 100).await;
+    let position = env.open("OIL", 0, 10, 5).await.unwrap();
+    env.set_time(week + 760).await; // daily break [750, 810)
+    assert_eq!(custom_error(env.open("OIL", 0, 10, 5).await.map(|_| ())), code(PerpsError::MarketClosed));
+    env.set_time(week + 3_100).await; // weekend [3_000, 3_600)
+    assert_eq!(custom_error(env.close("OIL", position).await), code(PerpsError::MarketClosed));
+    assert_eq!(custom_error(env.update_funding("OIL").await), code(PerpsError::MarketClosed));
+    env.set_time(week + 3_600 + 5).await; // reopened
+    env.close("OIL", position).await.unwrap();
+}
+
 #[tokio::test]
 async fn trading_needs_the_market_pool() {
     // docs/lp-pool.md §17.2 #1: every collateral and trading instruction

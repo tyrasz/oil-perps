@@ -209,7 +209,7 @@ impl Sim {
             return;
         }
         let p = crate::chain::pool_params();
-        let window = pool_math::effective_claim_window_secs(pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs) as i64;
+        let window = pool_math::effective_claim_window_secs(crate::session::SCHEDULE_CME_GLOBEX, pos.claim_window_secs, p.weekend_cap_window_secs, p.lp_reopen_quiet_secs) as i64;
         let unlock = pos.unlock_at;
         if window == 0 || !self.warp_until(20_000, |s| actions::open_secs_between(unlock, s.now) > window).await {
             self.probe_skip("lp_withdraw_expired", "the claim window did not end");

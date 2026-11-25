@@ -115,6 +115,15 @@ mod tests {
         assert!(!MarketConfigParams { session_schedule: 7, ..oil_weekend() }.validate(&market()));
     }
 
+    /// D46: the localnet test schedule only validates in a `localnet` build;
+    /// the default build rejects it like an unknown schedule.
+    #[test]
+    fn test_schedule_needs_the_localnet_feature() {
+        let p = MarketConfigParams { session_schedule: session::SCHEDULE_TEST_HOURLY, pre_close_window_secs: 300, ..oil_weekend() };
+        assert_eq!(p.validate(&market()), cfg!(feature = "localnet"));
+        assert!(MarketConfigParams { session_schedule: session::SCHEDULE_ALWAYS_OPEN, ..oil_weekend() }.validate(&market()));
+    }
+
     #[test]
     fn rejects_weekend_maintenance_at_or_above_initial() {
         let p = MarketConfigParams { weekend_maintenance_margin_ratio: 2_000, ..oil_weekend() };

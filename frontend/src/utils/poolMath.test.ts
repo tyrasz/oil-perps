@@ -28,6 +28,7 @@ import {
   leMul,
   lpWindowCap,
   minClaimWindowSecs,
+  lpGatesLeaveExitTime,
   mulDivFloor,
   nTrig,
   netCapOk,
@@ -509,10 +510,21 @@ describe('LP share math', () => {
     expect(paramsTimelockSecs(0n, 345_600n, 0n, 86_400n)).toBe(10n * 86_400n);
     expect(paramsTimelockSecs(0n, 0n, 0n, 0n)).toBe(PARAMS_TIMELOCK_MARGIN_SECS);
     // Production W = 1 d, Q = 30 min: W + 5·Q + 1 d
-    expect(minClaimWindowSecs(86_400n, 1_800n)).toBe(181_800n);
-    expect(effectiveClaimWindowSecs(259_200n, 86_400n, 1_800n)).toBe(259_200n);
-    expect(effectiveClaimWindowSecs(100n, 86_400n, 1_800n)).toBe(181_800n);
-    expect(effectiveClaimWindowSecs(0n, 86_400n, 1_800n)).toBe(0n);
+    for (const s of [0, 1]) {
+      expect(minClaimWindowSecs(s, 86_400n, 1_800n)).toBe(181_800n);
+      expect(effectiveClaimWindowSecs(s, 259_200n, 86_400n, 1_800n)).toBe(259_200n);
+      expect(effectiveClaimWindowSecs(s, 100n, 86_400n, 1_800n)).toBe(181_800n);
+      expect(effectiveClaimWindowSecs(s, 0n, 86_400n, 1_800n)).toBe(0n);
+      // W + 5·Q + 1 day ≤ 414_000 (D38), unchanged by D46
+      expect(lpGatesLeaveExitTime(s, 318_600n, 1_800n)).toBe(true);
+      expect(lpGatesLeaveExitTime(s, 318_601n, 1_800n)).toBe(false);
+    }
+    // The localnet test schedule (D46): W + 4·Q + 600 ≤ 2_820
+    expect(minClaimWindowSecs(2, 300n, 120n)).toBe(1_380n);
+    expect(effectiveClaimWindowSecs(2, 1_000n, 300n, 120n)).toBe(1_380n);
+    expect(lpGatesLeaveExitTime(2, 1_740n, 120n)).toBe(true);
+    expect(lpGatesLeaveExitTime(2, 1_741n, 120n)).toBe(false);
+    expect(lpGatesLeaveExitTime(2, 86_400n, 1_800n)).toBe(false);
   });
 
   it('holds settled withdrawals for the longer quiet time (pool_math settled_withdraw_quiet)', () => {

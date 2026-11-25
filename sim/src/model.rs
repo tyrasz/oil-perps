@@ -1643,7 +1643,7 @@ pub fn lp_withdraw(st: &mut St, lp: &mut LpPosition, o: &OracleView, now: i64) -
     }
     let params = st.pool.params;
     if !is_settled && lp.claim_window_secs > 0 {
-        let window = pm::effective_claim_window_secs(lp.claim_window_secs, params.weekend_cap_window_secs, params.lp_reopen_quiet_secs);
+        let window = pm::effective_claim_window_secs(st.m.session_schedule, lp.claim_window_secs, params.weekend_cap_window_secs, params.lp_reopen_quiet_secs);
         let open = ses::open_seconds_between(st.m.session_schedule, lp.unlock_at, now);
         if open as u64 > window {
             return Err(core("WithdrawalExpired"));

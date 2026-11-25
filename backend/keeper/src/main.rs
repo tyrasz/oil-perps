@@ -41,6 +41,22 @@ pub struct KeeperConfig {
 
 pub const DEFAULT_MARKETS: &str = "OIL,GOLD,SILVER,NATGAS,COPPER";
 
+/// Seconds before a session close in which the keeper sends no settle or
+/// funding crank: decided at the chain's clock, the transaction lands a slot
+/// (or a few) later, after the close (`MarketClosed`).
+pub const SESSION_EDGE_GUARD_SECS: i64 = 2;
+
+/// A positive number of seconds from env var `name`, else `default`. The poll
+/// intervals and back-offs are tuned for CME hours; a localnet run on the
+/// one-hour test week (docs/localnet.md) sets them shorter.
+pub fn env_secs(name: &str, default: u64) -> u64 {
+    parse_secs(std::env::var(name).ok().as_deref(), default)
+}
+
+pub fn parse_secs(value: Option<&str>, default: u64) -> u64 {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(default)
+}
+
 pub fn parse_markets(s: &str) -> Vec<String> {
     s.split(',')
         .map(|c| c.trim().to_ascii_uppercase())
@@ -233,6 +249,14 @@ mod tests {
             get_user_account_pda(&program, &owner, &oil).0.to_string(),
             "4NBuxBaDE8SpGFiytjqTmkYqkyc628SAsGxrc51jkHso"
         );
+    }
+
+    #[test]
+    fn parses_interval_overrides() {
+        assert_eq!(parse_secs(None, 60), 60);
+        assert_eq!(parse_secs(Some(" 5 "), 60), 5);
+        assert_eq!(parse_secs(Some("0"), 60), 60);
+        assert_eq!(parse_secs(Some("soon"), 60), 60);
     }
 
     #[test]

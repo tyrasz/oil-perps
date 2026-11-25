@@ -574,35 +574,73 @@ pub fn params_timelock_secs(cur_delay: u32, new_delay: u32, cur_window: u32, new
 }
 
 /// Open seconds in one CME week (Sun 6 h + Mon–Thu 4 × 23 h + Fri 17 h),
-/// the most any supported schedule is open between two weekly closes.
+/// the most `SCHEDULE_ALWAYS_OPEN` and `SCHEDULE_CME_GLOBEX` are held to
+/// between two weekly closes (`week_open_secs`).
 pub const WEEK_OPEN_SECS: u64 = 414_000;
 /// One day of open time that every week, and every claim window, must leave
-/// ungated for `lp_withdraw` (§1.2, D38).
+/// ungated for `lp_withdraw` (§1.2, D38), on those two schedules.
 pub const LP_UNGATED_SECS: u64 = 86_400;
+/// Session opens per CME week the reopen quiet `Q` gates (Sunday and
+/// Monday–Thursday 18:00 ET).
+pub const SESSION_OPENS_PER_WEEK: u64 = 5;
+
+/// `session::SCHEDULE_TEST_HOURLY` (localnet only, D46; this file takes no
+/// `crate::` paths). Pinned to the session constant by a perps-core test.
+const SCHEDULE_TEST_HOURLY: u8 = 2;
+/// Open seconds per `SCHEDULE_TEST_HOURLY` week (`session::TEST_WEEK_OPEN`).
+pub const TEST_WEEK_OPEN_SECS: u64 = 2_820;
+/// The test week's ungated LP exit time: the CME ratio, 86_400 / 414_000 of
+/// the week's open time (589 s), rounded to 600 s.
+pub const TEST_LP_UNGATED_SECS: u64 = 600;
+/// Session opens per test week: the week start and the end of each of the
+/// three daily breaks.
+pub const TEST_SESSION_OPENS_PER_WEEK: u64 = 4;
+
+/// Open seconds per week of `schedule` (D38, D46): the test schedule's
+/// compressed week, else the CME week for every schedule, as before.
+pub fn week_open_secs(schedule: u8) -> u64 {
+    if schedule == SCHEDULE_TEST_HOURLY { TEST_WEEK_OPEN_SECS } else { WEEK_OPEN_SECS }
+}
+
+/// Open time a week of `schedule` must leave ungated for `lp_withdraw` (D38, D46).
+pub fn lp_ungated_secs(schedule: u8) -> u64 {
+    if schedule == SCHEDULE_TEST_HOURLY { TEST_LP_UNGATED_SECS } else { LP_UNGATED_SECS }
+}
+
+/// Session opens per week of `schedule` that the reopen quiet gates (D38, D46).
+pub fn session_opens_per_week(schedule: u8) -> u64 {
+    if schedule == SCHEDULE_TEST_HOURLY { TEST_SESSION_OPENS_PER_WEEK } else { SESSION_OPENS_PER_WEEK }
+}
 
 /// Upper bound on the open seconds per week the LP gates close
 /// `lp_withdraw` (D38): the pre-close window `W` (wall seconds, so at least
-/// its open seconds) plus the reopen quiet `Q` after each of the five weekly
-/// session opens (Sunday and Monday–Thursday 18:00 ET).
-pub fn lp_gated_secs_per_week(window: u32, quiet: u32) -> u64 {
-    window as u64 + 5 * quiet as u64
+/// its open seconds) plus the reopen quiet `Q` after each of the week's
+/// session opens (five on CME: Sunday and Monday–Thursday 18:00 ET).
+pub fn lp_gated_secs_per_week(schedule: u8, window: u32, quiet: u32) -> u64 {
+    window as u64 + session_opens_per_week(schedule) * quiet as u64
 }
 
-/// Shortest claim window (open seconds) that always holds a day of ungated
-/// `lp_withdraw` time: `W + 5·Q + 1 day` (D38).
-pub fn min_claim_window_secs(window: u32, quiet: u32) -> u64 {
-    lp_gated_secs_per_week(window, quiet) + LP_UNGATED_SECS
+/// `validate`'s D38 rule: `W + opens·Q + ungated ≤ week open time`, so every
+/// week keeps its ungated LP exit time (`W + 5·Q + 86_400 ≤ 414_000` on CME).
+pub fn lp_gates_leave_exit_time(schedule: u8, window: u32, quiet: u32) -> bool {
+    lp_gated_secs_per_week(schedule, window, quiet) + lp_ungated_secs(schedule) <= week_open_secs(schedule)
+}
+
+/// Shortest claim window (open seconds) that always holds the ungated
+/// `lp_withdraw` time: `W + 5·Q + 1 day` on CME (D38).
+pub fn min_claim_window_secs(schedule: u8, window: u32, quiet: u32) -> u64 {
+    lp_gated_secs_per_week(schedule, window, quiet) + lp_ungated_secs(schedule)
 }
 
 /// The claim window a request is held to: the one stored at request time,
 /// but never shorter than what the gates in force now need, so a later
 /// `apply_pool_params` that widens `W` or `Q` cannot expire it inside gated
 /// time (D38). `0` (never lapses) stays 0.
-pub fn effective_claim_window_secs(stored: u32, window: u32, quiet: u32) -> u64 {
+pub fn effective_claim_window_secs(schedule: u8, stored: u32, window: u32, quiet: u32) -> u64 {
     if stored == 0 {
         0
     } else {
-        (stored as u64).max(min_claim_window_secs(window, quiet))
+        (stored as u64).max(min_claim_window_secs(schedule, window, quiet))
     }
 }
 

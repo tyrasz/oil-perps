@@ -11,20 +11,49 @@ pub const SCHEDULE_ALWAYS_OPEN: u8 = 0;
 /// CME Globex hours used by WTI, gold, silver, copper and natural gas futures:
 /// Sunday 18:00 to Friday 17:00 ET, with a daily break from 17:00 to 18:00 ET.
 pub const SCHEDULE_CME_GLOBEX: u8 = 1;
+/// TEST ONLY (docs/localnet.md): a CME-like week compressed into one hour of
+/// Unix time, so a live localnet run of a few hours crosses several weekly
+/// closes and reopens. Each "week" is `ts.div_euclid(3_600)`; within it
+/// (`c = ts.rem_euclid(3_600)`) the market is open for `[0, 3_000)` except
+/// three 60 s "daily breaks" at `[750, 810)`, `[1_500, 1_560)` and
+/// `[2_250, 2_310)`, and closed for the 600 s "weekend" `[3_000, 3_600)`:
+/// four open "days" (750 + 3 × 690 s) and 2_820 open seconds a week.
+///
+/// The session functions below always know it, so the keeper, the sim and
+/// the frontend mirrors compile one schedule set, but a market can only be
+/// set to it by a perps-core built with the `localnet` cargo feature
+/// (`is_valid_schedule`), which no production build enables.
+pub const SCHEDULE_TEST_HOURLY: u8 = 2;
 
 const HOUR: i64 = 3_600;
 const DAY: i64 = 86_400;
 const SESSION_CLOSE: i64 = 17 * HOUR; // 17:00 ET
 const SESSION_OPEN: i64 = 18 * HOUR; // 18:00 ET
 
+/// Length of a `SCHEDULE_TEST_HOURLY` week (wall seconds).
+pub const TEST_WEEK_SECS: i64 = 3_600;
+/// Offset of the weekly close within a test week; closed from here to the end.
+pub const TEST_WEEKLY_CLOSE: i64 = 3_000;
+/// Length of each test "daily break".
+pub const TEST_BREAK_SECS: i64 = 60;
+/// Offsets of the test daily breaks within a week.
+pub const TEST_BREAKS: [i64; 3] = [750, 1_500, 2_250];
+/// Open seconds per test week: 3_000 − 3 × 60.
+pub const TEST_WEEK_OPEN: i64 = 2_820;
+
+/// Schedules `update_market_config` accepts (markets start always open). The test
+/// schedule only in a `localnet` build (never a production deploy, D46).
 pub fn is_valid_schedule(schedule: u8) -> bool {
-    schedule == SCHEDULE_ALWAYS_OPEN || schedule == SCHEDULE_CME_GLOBEX
+    schedule == SCHEDULE_ALWAYS_OPEN
+        || schedule == SCHEDULE_CME_GLOBEX
+        || (cfg!(feature = "localnet") && schedule == SCHEDULE_TEST_HOURLY)
 }
 
 /// Whether the market is in session at `ts`.
 pub fn is_open(schedule: u8, ts: i64) -> bool {
     match schedule {
         SCHEDULE_CME_GLOBEX => cme_is_open(ts),
+        SCHEDULE_TEST_HOURLY => test_is_open(ts),
         _ => true,
     }
 }
@@ -34,6 +63,7 @@ pub fn is_open(schedule: u8, ts: i64) -> bool {
 pub fn seconds_until_weekly_close(schedule: u8, ts: i64) -> Option<i64> {
     match schedule {
         SCHEDULE_CME_GLOBEX if cme_is_open(ts) => Some(cme_next_weekly_close(ts) - ts),
+        SCHEDULE_TEST_HOURLY if test_is_open(ts) => Some(TEST_WEEKLY_CLOSE - ts.rem_euclid(TEST_WEEK_SECS)),
         _ => None,
     }
 }
@@ -55,12 +85,14 @@ pub fn open_seconds_between(schedule: u8, a: i64, b: i64) -> i64 {
     }
     match schedule {
         SCHEDULE_CME_GLOBEX => cme_open_seconds_until(b) - cme_open_seconds_until(a),
+        SCHEDULE_TEST_HOURLY => test_open_seconds_until(b) - test_open_seconds_until(a),
         _ => b - a,
     }
 }
 
 /// Seconds since the current session opened (Sunday 18:00 or the daily
-/// 18:00 reopen), or `None` if the market is closed or never closes.
+/// 18:00 reopen; on the test schedule the week start or the end of a daily
+/// break), or `None` if the market is closed or never closes.
 #[inline(never)]
 pub fn seconds_since_open(schedule: u8, ts: i64) -> Option<i64> {
     match schedule {
@@ -72,6 +104,11 @@ pub fn seconds_since_open(schedule: u8, ts: i64) -> Option<i64> {
                 _ if s < SESSION_CLOSE => s + (DAY - SESSION_OPEN),
                 _ => s - SESSION_OPEN,
             })
+        }
+        SCHEDULE_TEST_HOURLY if test_is_open(ts) => {
+            let c = ts.rem_euclid(TEST_WEEK_SECS);
+            let start = TEST_BREAKS.iter().map(|b| b + TEST_BREAK_SECS).filter(|&o| o <= c).max().unwrap_or(0);
+            Some(c - start)
         }
         _ => None,
     }
@@ -112,6 +149,21 @@ fn cme_open_seconds_until(ts: i64) -> i64 {
         _ => WEEK_OPEN,
     };
     (day - wd).div_euclid(7) * WEEK_OPEN + in_week
+}
+
+fn test_is_open(ts: i64) -> bool {
+    let c = ts.rem_euclid(TEST_WEEK_SECS);
+    c < TEST_WEEKLY_CLOSE && !TEST_BREAKS.iter().any(|&b| c >= b && c < b + TEST_BREAK_SECS)
+}
+
+/// Cumulative test-schedule open seconds up to `ts` (from Unix 0).
+fn test_open_seconds_until(ts: i64) -> i64 {
+    let c = ts.rem_euclid(TEST_WEEK_SECS);
+    let mut open = c.min(TEST_WEEKLY_CLOSE);
+    for b in TEST_BREAKS {
+        open -= (c - b).clamp(0, TEST_BREAK_SECS);
+    }
+    ts.div_euclid(TEST_WEEK_SECS) * TEST_WEEK_OPEN + open
 }
 
 fn cme_is_open(ts: i64) -> bool {
@@ -366,6 +418,119 @@ mod tests {
         assert!(!funding_current(SCHEDULE_CME_GLOBEX, false, close - 60, 0, 3_600, close + 49 * HOUR + 3_540));
         assert!(funding_current(SCHEDULE_CME_GLOBEX, true, 0, 0, 3_600, close));
         assert!(!funding_current(SCHEDULE_ALWAYS_OPEN, false, close - 3_600, 0, 3_600, close));
+    }
+
+    // SCHEDULE_TEST_HOURLY (localnet only, docs/localnet.md)
+
+    const TEST: u8 = SCHEDULE_TEST_HOURLY;
+    /// A test week start (ts ≡ 0 mod 3_600) in November 2026.
+    const TEST_WEEK0: i64 = 1_794_607_200;
+
+    #[test]
+    fn test_schedule_matches_reference_vectors() {
+        assert!(TEST_SESSION_VECTORS.len() > 400);
+        for &(ts, open, until_close, since_open, open_until) in TEST_SESSION_VECTORS {
+            assert_eq!(is_open(TEST, ts), open, "is_open at {}", ts);
+            let opt = |v: i64| if v >= 0 { Some(v) } else { None };
+            assert_eq!(seconds_until_weekly_close(TEST, ts), opt(until_close), "until close at {}", ts);
+            assert_eq!(seconds_since_open(TEST, ts), opt(since_open), "since open at {}", ts);
+            // Open seconds since Unix 0 (negative before it)
+            let since_epoch = open_seconds_between(TEST, 0, ts) - open_seconds_between(TEST, ts, 0);
+            assert_eq!(since_epoch, open_until, "open seconds at {}", ts);
+        }
+    }
+
+    /// Second by second over three test weeks: open seconds, the session
+    /// start and the weekly close (open, then closed for over the longest
+    /// daily break) all agree with `is_open`.
+    #[test]
+    fn test_schedule_matches_brute_force() {
+        let (a, b) = (TEST_WEEK0 - 1, TEST_WEEK0 + 3 * TEST_WEEK_SECS);
+        let mut acc = 0;
+        let mut open_at: Option<i64> = None;
+        let mut opens = 0;
+        for t in a..b {
+            assert_eq!(open_seconds_between(TEST, a, t), acc, "at {}", t);
+            let open = is_open(TEST, t);
+            if open && !is_open(TEST, t - 1) {
+                open_at = Some(t);
+                opens += 1;
+            }
+            if open {
+                acc += 1;
+                assert_eq!(seconds_since_open(TEST, t), Some(t - open_at.unwrap()), "at {}", t);
+                let close = (t..).find(|&c| (c..c + TEST_BREAK_SECS + 1).all(|x| !is_open(TEST, x))).unwrap();
+                assert_eq!(seconds_until_weekly_close(TEST, t), Some(close - t), "at {}", t);
+                assert!(in_pre_close_window(TEST, t, (close - t) as u32));
+                assert!(!in_pre_close_window(TEST, t, (close - t - 1) as u32));
+            } else {
+                assert_eq!(seconds_since_open(TEST, t), None);
+                assert_eq!(seconds_until_weekly_close(TEST, t), None);
+                assert!(!in_pre_close_window(TEST, t, 3_600));
+            }
+        }
+        // Four session opens a week (the week start and three break ends)
+        assert_eq!(opens, 3 * 4);
+        assert_eq!(acc, 3 * TEST_WEEK_OPEN);
+    }
+
+    #[test]
+    fn test_week_shape() {
+        let w = TEST_WEEK0;
+        assert_eq!(open_seconds_between(TEST, w, w + TEST_WEEK_SECS), TEST_WEEK_OPEN);
+        assert_eq!(open_seconds_between(TEST, w - 7 * TEST_WEEK_SECS, w), 7 * TEST_WEEK_OPEN);
+        // Days: 750 s, then three of 690 s
+        assert!(is_open(TEST, w) && is_open(TEST, w + 749) && !is_open(TEST, w + 750));
+        assert!(!is_open(TEST, w + 809) && is_open(TEST, w + 810));
+        assert_eq!(seconds_since_open(TEST, w + 810), Some(0));
+        assert_eq!(seconds_since_open(TEST, w + 2_999), Some(689));
+        assert!(!is_open(TEST, w + 3_000) && !is_open(TEST, w + 3_599) && is_open(TEST, w + 3_600));
+        assert_eq!(seconds_until_weekly_close(TEST, w), Some(3_000));
+        assert_eq!(seconds_until_weekly_close(TEST, w + 2_999), Some(1));
+        // A 300 s pre-close window: [2_700, 3_000), across no break
+        assert!(!in_pre_close_window(TEST, w + 2_699, 300));
+        assert!(in_pre_close_window(TEST, w + 2_700, 300));
+        assert!(in_pre_close_window(TEST, w + 2_999, 300));
+        assert!(!in_pre_close_window(TEST, w + 3_000, 300));
+        // Funding is current across the weekend: 60 s interval, crank 30 s before the close
+        assert!(funding_current(TEST, false, w + 2_970, 0, 60, w + 3_600 + 29));
+        assert!(!funding_current(TEST, false, w + 2_970, 0, 60, w + 3_600 + 30));
+        assert!(funding_current(TEST, false, w + 2_970, 20, 60, w + 3_600 + 9));
+        assert!(!funding_current(TEST, false, w + 2_970, 20, 60, w + 3_600 + 10));
+        assert!(funding_current(TEST, true, 0, 0, 60, w + 3_000));
+    }
+
+    #[test]
+    fn test_open_seconds_are_additive() {
+        let mut x = 0x0bad_cafe_dead_beefu64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..20_000 {
+            let mut v = [0i64; 3];
+            for e in v.iter_mut() {
+                *e = TEST_WEEK0 - 50 * TEST_WEEK_SECS + (next() % (100 * TEST_WEEK_SECS as u64)) as i64;
+            }
+            v.sort();
+            let [a, c, b] = v;
+            let f = |a, b| open_seconds_between(TEST, a, b);
+            assert_eq!(f(a, c) + f(c, b), f(a, b), "{} {} {}", a, c, b);
+            assert!(f(a, b) <= b - a && f(a, b) >= 0);
+        }
+    }
+
+    /// The test schedule is only accepted by a `localnet` build of perps-core;
+    /// the default (production) build rejects it like any unknown schedule.
+    #[test]
+    fn test_schedule_is_only_valid_in_localnet_builds() {
+        assert!(is_valid_schedule(SCHEDULE_ALWAYS_OPEN));
+        assert!(is_valid_schedule(SCHEDULE_CME_GLOBEX));
+        assert_eq!(is_valid_schedule(SCHEDULE_TEST_HOURLY), cfg!(feature = "localnet"));
+        assert!(!is_valid_schedule(3));
+        assert!(!is_valid_schedule(u8::MAX));
     }
 
     #[test]

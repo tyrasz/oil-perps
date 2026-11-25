@@ -18,6 +18,7 @@ import { ReferralPanel } from './components/ReferralPanel';
 import { AdminPanel } from './components/AdminPanel';
 import { useTriggerOrderMonitor } from './hooks/useTriggerOrderMonitor';
 import { useMarketFeed } from './hooks/useMarket';
+import { NETWORK } from './config/program';
 import './App.css';
 
 type Tab = 'positions' | 'orders' | 'trades' | 'account' | 'vault' | 'mm' | 'analytics' | 'alerts' | 'referrals' | 'admin';
@@ -153,7 +154,7 @@ function App() {
           <a href="#api">API</a>
         </div>
         <div className="footer-info">
-          <span>Network: Devnet</span>
+          <span>Network: {NETWORK === 'localnet' ? 'Localnet (test schedule, mock oracle)' : 'Devnet'}</span>
           <span className="status-dot online"></span>
         </div>
       </footer>

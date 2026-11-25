@@ -6,6 +6,7 @@ use crate::state::anchor_discriminator;
 use crate::{get_lp_pool_pda, get_user_account_pda, get_vault_pda, get_vault_token_pda};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
+    hash::Hash,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{Keypair, Signature, Signer},
@@ -16,6 +17,22 @@ pub type KeeperResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// `PerpsError::PoolCashInsufficient` (Anchor custom error 6057 = 0x17a9).
 pub const ERR_POOL_CASH_INSUFFICIENT: u32 = 6057;
+/// `PerpsError::NotLiquidatable` (6007 = 0x1777).
+pub const ERR_NOT_LIQUIDATABLE: u32 = 6007;
+/// `PerpsError::PositionAlreadyClosed` (6012 = 0x177c).
+pub const ERR_POSITION_ALREADY_CLOSED: u32 = 6012;
+/// `PerpsError::NothingToSettle` (6072) and `SettleWouldBankrupt` (6073).
+pub const ERR_NOTHING_TO_SETTLE: u32 = 6072;
+pub const ERR_SETTLE_WOULD_BANKRUPT: u32 = 6073;
+/// `PerpsError::FundingNotDue` (6082 = 0x17c2).
+pub const ERR_FUNDING_NOT_DUE: u32 = 6082;
+
+/// A settle refused only because the position changed since the scan: the
+/// owner closed it, the price moved it back to a profit, or the loss grew
+/// past its collateral (the liquidator's job now).
+pub fn is_settle_race(err: &str) -> bool {
+    [ERR_POSITION_ALREADY_CLOSED, ERR_NOTHING_TO_SETTLE, ERR_SETTLE_WOULD_BANKRUPT].iter().any(|&c| has_program_error(err, c))
+}
 
 /// Whether an RPC error (simulation or confirmation) carries custom program
 /// error `code`; matches both the "custom program error: 0x.." text and the
@@ -157,6 +174,59 @@ pub fn send(client: &RpcClient, keypair: &Keypair, ix: Instruction) -> KeeperRes
     Ok(client.send_and_confirm_transaction(&tx)?)
 }
 
+/// Sign each instruction as its own transaction (one blockhash), send them
+/// all, then confirm them together. A burst of liquidations after a reopen gap
+/// then lands within a slot or two instead of one confirmation round trip
+/// (~0.5 s) each, during which owners close the positions first. Sending runs
+/// the preflight simulation, so one the program would refuse (closed since
+/// the scan) fails at once without landing. Results are in `ixs` order.
+pub fn send_batch(client: &RpcClient, keypair: &Keypair, ixs: Vec<Instruction>, timeout: std::time::Duration) -> Vec<KeeperResult<Signature>> {
+    let blockhash: Hash = match client.get_latest_blockhash() {
+        Ok(b) => b,
+        Err(e) => {
+            let e = e.to_string();
+            return ixs.iter().map(|_| Err(e.clone().into())).collect();
+        }
+    };
+    let mut out: Vec<Option<KeeperResult<Signature>>> = Vec::with_capacity(ixs.len());
+    let mut pending: Vec<(usize, Signature)> = Vec::new();
+    for (i, ix) in ixs.into_iter().enumerate() {
+        let tx = Transaction::new_signed_with_payer(&[ix], Some(&keypair.pubkey()), &[keypair], blockhash);
+        match client.send_transaction(&tx) {
+            Ok(sig) => {
+                out.push(None);
+                pending.push((i, sig));
+            }
+            Err(e) => out.push(Some(Err(e.into()))),
+        }
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    while !pending.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut still = Vec::new();
+        // getSignatureStatuses takes at most 256 signatures
+        for chunk in pending.chunks(256) {
+            let sigs: Vec<Signature> = chunk.iter().map(|p| p.1).collect();
+            let Ok(statuses) = client.get_signature_statuses(&sigs) else {
+                still.extend_from_slice(chunk);
+                continue;
+            };
+            for (&(i, sig), status) in chunk.iter().zip(statuses.value) {
+                match status {
+                    Some(s) if s.err.is_some() => out[i] = Some(Err(format!("{}: {}", sig, s.err.unwrap()).into())),
+                    Some(s) if s.satisfies_commitment(client.commitment()) => out[i] = Some(Ok(sig)),
+                    _ => still.push((i, sig)),
+                }
+            }
+        }
+        pending = still;
+    }
+    for (i, sig) in pending {
+        out[i] = Some(Err(format!("{} not confirmed within {:?}", sig, timeout).into()));
+    }
+    out.into_iter().map(|r| r.expect("every instruction has a result")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +299,15 @@ mod tests {
         assert!(!has_program_error("custom program error: 0x17aa", ERR_POOL_CASH_INSUFFICIENT));
         // ProfitCloseQuiet (6092)
         assert!(has_program_error("custom program error: 0x17cc", 6092));
+        // A confirmed transaction's error as send_batch reports it, and a preflight refusal
+        let landed = format!("sig: {}", solana_sdk::transaction::TransactionError::InstructionError(0, solana_sdk::instruction::InstructionError::Custom(ERR_POSITION_ALREADY_CLOSED)));
+        assert!(has_program_error(&landed, ERR_POSITION_ALREADY_CLOSED));
+        assert!(has_program_error("RPC response error -32002: Transaction simulation failed: Error processing Instruction 0: custom program error: 0x1777; 3 log messages", ERR_NOT_LIQUIDATABLE));
+        // An LP's or a bot's crank landed first
+        assert!(has_program_error("Error processing Instruction 0: custom program error: 0x17c2", ERR_FUNDING_NOT_DUE));
+        // The owner closed the position between the scan and the settle
+        assert!(is_settle_race("Error processing Instruction 0: custom program error: 0x177c"));
+        assert!(is_settle_race("custom program error: 0x17b8") && is_settle_race("custom program error: 0x17b9"));
+        assert!(!is_settle_race("custom program error: 0x178b")); // MarketClosed is not a race
     }
 }

@@ -1,0 +1,28 @@
+[package]
+name = "mock-pyth"
+version = "0.1.0"
+description = "LOCALNET/TEST ONLY: a writable Pyth v2 price feed for live local runs. Never deploy to a public cluster."
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "mock_pyth"
+
+[features]
+no-entrypoint = []
+default = []
+
+[profile.release]
+overflow-checks = true
+
+[dependencies]
+solana-program = "1.16"
+
+[dev-dependencies]
+# Native and SBF (SBF_OUT_DIR) end-to-end tests; the feed is parsed with the
+# same pyth-sdk-solana as perps-core
+solana-program-test = "~1.16"
+solana-sdk = "~1.16"
+pyth-sdk-solana = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

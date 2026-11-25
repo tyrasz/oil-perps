@@ -658,6 +658,56 @@ mod tests {
         plan(&m, &pool, &short, ADL_MODE_DEFICIT, 0, mark, now).unwrap();
     }
 
+    /// The localnet test schedule (D46, docs/localnet.md): the keeper's
+    /// session decisions come from the shared session.rs, so funding, weekend
+    /// margins, liquidation and the ADL quiet time follow the compressed week
+    /// (open [0, 3_000) of each hour minus 60 s breaks at 750, 1_500 and 2_250).
+    #[test]
+    fn test_schedule_drives_the_keeper_decisions() {
+        const W0: i64 = 1_794_607_200; // a test week start (ts ≡ 0 mod 3_600)
+        let m = MarketData {
+            session_schedule: session::SCHEDULE_TEST_HOURLY,
+            funding_interval: 60,
+            last_funding_time: W0 + 2_970,
+            maintenance_margin_ratio: 500,
+            pre_close_window_secs: 300,
+            weekend_maintenance_margin_ratio: 1_000,
+            ..Default::default()
+        };
+        // Funding: 30 open seconds before the close, the rest after the reopen
+        assert!(!m.funding_due(W0 + 3_599));
+        assert!(!m.funding_due(W0 + 3_600 + 29));
+        assert!(m.funding_due(W0 + 3_600 + 30));
+        // ... and across a daily break [750, 810)
+        let b = MarketData { last_funding_time: W0 + 720, ..m.clone() };
+        assert!(!b.funding_due(W0 + 809));
+        assert!(!b.funding_due(W0 + 839));
+        assert!(b.funding_due(W0 + 840));
+        // Weekend maintenance margin in the last 300 s before the close
+        assert_eq!(m.maintenance_margin_ratio_at(W0 + 2_699), 500);
+        assert_eq!(m.maintenance_margin_ratio_at(W0 + 2_700), 1_000);
+        assert!(m.is_in_session(W0 + 2_999) && !m.is_in_session(W0 + 3_000));
+        assert!(!m.is_in_session(W0 + 750) && m.is_in_session(W0 + 810));
+        // Deficit ADL waits out the profit-close quiet time after every reopen
+        let (mut m, mut pool) = (market(), pool());
+        m.session_schedule = session::SCHEDULE_TEST_HOURLY;
+        pool.params.profit_close_quiet_secs = 60;
+        let short = open(&mut m, &mut pool, SIDE_SHORT, 100 * C6, 75 * C6, 1_500 * C6);
+        let _long = open(&mut m, &mut pool, SIDE_LONG, 100 * C6, 75 * C6, 1_500 * C6);
+        pool.pending_bad_debt_long = 10 * C6;
+        // The score floor decays over ADL_FLOOR_DECAY_SECS (6 open hours, so
+        // 7.7 test weeks): pending for 8 test weeks, it is gone
+        pool.pending_since_long = W0 - 8 * 3_600;
+        assert!(pending_age(&m, W0 - 8 * 3_600, W0 + 3_600) >= ADL_FLOOR_DECAY_SECS);
+        let mark = 64 * C6;
+        for t in [W0 + 3_600, W0 + 3_659, W0 + 3_600 + 810, W0 + 3_600 + 869] {
+            assert_eq!(plan(&m, &pool, &short, ADL_MODE_DEFICIT, 0, mark, t), Err(Reject::ProfitCloseQuiet), "at {}", t);
+        }
+        plan(&m, &pool, &short, ADL_MODE_DEFICIT, 0, mark, W0 + 3_660).unwrap();
+        // Pending age counts open seconds only: 100 before the close, 60 after
+        assert_eq!(pending_age(&m, W0 + 2_900, W0 + 3_660), 160);
+    }
+
     /// adl.rs `deficit_adl_waits_out_the_profit_close_quiet_time` (D23, D35).
     #[test]
     fn deficit_adl_waits_out_the_quiet_time() {

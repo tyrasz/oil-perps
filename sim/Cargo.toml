@@ -25,3 +25,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # Reproducible runs and the JSON report
 rand = "0.8"
 serde_json = "1"
+
+# The #[path]-included perps-core session.rs gates the localnet test schedule
+# on perps-core's `localnet` feature (D46); this crate never sets it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("localnet"))'] }
