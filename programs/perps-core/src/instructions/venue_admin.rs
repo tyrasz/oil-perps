@@ -93,7 +93,7 @@ pub fn register_venue(ctx: Context<RegisterVenue>, params: VenueParams, expected
     venue.total_fills = 0;
     venue.total_notional = 0;
     venue.enabled = true;
-    venue.bump = *ctx.bumps.get("venue").unwrap();
+    venue.bump = ctx.bumps.venue;
     msg!("Venue registered: program={}, market={}, authority={}, upgrade_authority={}", program, market_key, venue.authority, venue.upgrade_authority);
     Ok(())
 }

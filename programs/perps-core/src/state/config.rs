@@ -6,7 +6,10 @@ use anchor_lang::prelude::*;
 ///   It starts as the upgrade authority and can be handed to another key or a
 ///   multisig with propose_admin / accept_admin.
 /// - `guardian` can only pause markets, for fast response in emergencies.
-/// - `oracle_program` is the Pyth program; market price feeds must be owned by it.
+/// - `oracle_program` is the Pyth Solana Receiver program: a market's price feed
+///   (a `PriceUpdateV2` account) must be owned by it when the market is created
+///   or its feed rotated; each market keeps a copy (`Market.oracle_program`,
+///   docs/lp-pool.md D47), so changing it here does not move existing markets.
 /// - `venue_fills_paused` stops every venue fill in every market. The guardian
 ///   can set it; only the admin can clear it.
 #[account]
@@ -37,7 +40,7 @@ mod tests {
     #[test]
     fn account_size_is_unchanged_so_the_existing_config_still_loads() {
         assert_eq!(ProtocolConfig::LEN, 201);
-        let serialized = ProtocolConfig::default().try_to_vec().unwrap().len();
+        let serialized = anchor_lang::prelude::borsh::to_vec(&ProtocolConfig::default()).unwrap().len();
         assert_eq!(8 + serialized + 63, ProtocolConfig::LEN);
     }
 }

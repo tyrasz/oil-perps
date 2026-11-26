@@ -1,13 +1,13 @@
 //! End-to-end tests: the real perps-core program runs in-process under
-//! solana-program-test, with SPL Token and a fake Pyth price account whose
-//! price and timestamp the tests control.
+//! solana-program-test, with SPL Token and fake Pyth Receiver `PriceUpdateV2`
+//! accounts whose price and publish time the tests control.
 
 use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
 use perps_core::errors::PerpsError;
 use perps_core::instructions::{InitializeMarketParams, MarketConfigParams, OpenPositionParams, ProtocolRolesParams};
 use perps_core::session::SCHEDULE_CME_GLOBEX;
 use perps_core::state::{LpPool, Market, PoolParams, Position, PositionStatus, UserAccount};
-use pyth_sdk_solana::state::{AccountType, PriceAccount, PriceInfo, PriceStatus, MAGIC, VERSION_2};
+use perps_core::pyth_receiver::{set_publish_times, PriceUpdateV2View};
 use solana_program_test::{processor, BanksClientError, ProgramTest, ProgramTestContext};
 use solana_sdk::{
     account::{Account, AccountSharedData},
@@ -33,6 +33,9 @@ mod lp;
 // House trading against the pool: caps, liquidation, ADL, funding
 #[path = "trading/mod.rs"]
 mod trading;
+// The PriceUpdateV2 oracle: read_price's checks and the feed rotation (D47)
+#[path = "oracle/mod.rs"]
+mod oracle;
 
 const USDC: u64 = 1_000_000;
 /// Stands in for the Pyth program: owner of every test price feed.
@@ -47,6 +50,9 @@ const SATURDAY: i64 = FRIDAY_CLOSE + 86_400;
 
 fn process(program_id: &Pubkey, accounts: &[solana_sdk::account_info::AccountInfo], data: &[u8]) -> solana_sdk::entrypoint::ProgramResult {
     // Anchor's entrypoint wants one lifetime for the slice and its elements.
+    // Anchor 1.2's entry wants one lifetime for the id, the accounts and the data
+    let program_id: &Pubkey = Box::leak(Box::new(*program_id));
+    let data: &[u8] = Box::leak(data.to_vec().into_boxed_slice());
     let accounts = Box::leak(Box::new(accounts.to_vec()));
     perps_core::entry(program_id, accounts, data)
 }
@@ -96,27 +102,24 @@ fn user_account(owner: &Pubkey, market: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"user", owner.as_ref(), market.as_ref()], &perps_core::ID).0
 }
 
-/// A Pyth v2 price account: `price * 10^expo` with confidence `conf`.
-fn pyth_account(price: i64, conf: u64, expo: i32, timestamp: i64) -> Account {
-    let mut acct = PriceAccount {
-        magic: MAGIC,
-        ver: VERSION_2,
-        atype: AccountType::Price as u32,
-        expo,
-        timestamp,
-        prev_timestamp: timestamp,
-        prev_price: price,
-        prev_conf: conf,
-        ..Default::default()
-    };
-    acct.agg = PriceInfo { price, conf, status: PriceStatus::Trading, ..Default::default() };
-    Account {
-        lamports: 1_000_000_000,
-        data: bytemuck::bytes_of(&acct).to_vec(),
-        owner: PYTH_PROGRAM,
-        executable: false,
-        rent_epoch: 0,
+/// Pyth feed ids: OIL is USOILSPOT's (support::OIL_FEED_ID), GOLD XAU/USD's.
+fn feed_id(commodity: &str) -> [u8; 32] {
+    match commodity {
+        "GOLD" => GOLD_FEED_ID,
+        _ => support::OIL_FEED_ID,
     }
+}
+
+/// XAU/USD: 765d2ba9…4bb2
+const GOLD_FEED_ID: [u8; 32] = [
+    0x76, 0x5d, 0x2b, 0xa9, 0x06, 0xdb, 0xc3, 0x2c, 0xa1, 0x7c, 0xc1, 0x1f, 0x53, 0x10, 0xa8, 0x9e,
+    0x9e, 0xe1, 0xf6, 0x42, 0x05, 0x08, 0xc6, 0x38, 0x61, 0xf2, 0xf8, 0xba, 0x4e, 0xe3, 0x4b, 0xb2,
+];
+
+/// A Full Pyth Receiver `PriceUpdateV2` for `commodity`'s feed id:
+/// `price * 10^expo` with confidence `conf`, published at `timestamp`.
+fn pyth_account(commodity: &str, price: i64, conf: u64, expo: i32, timestamp: i64) -> Account {
+    support::feed_account(PriceUpdateV2View::new(feed_id(commodity), price, conf, expo, timestamp).to_bytes(), PYTH_PROGRAM)
 }
 
 fn dollars(d: f64) -> i64 {
@@ -134,6 +137,7 @@ fn oil_params(commodity: &str) -> InitializeMarketParams {
         liquidation_fee: 100,
         max_open_interest: 1_000_000 * CONTRACT,
         funding_interval: 3_600,
+        pyth_feed_id: feed_id(commodity),
     }
 }
 
@@ -191,10 +195,10 @@ impl Env {
         });
         let oil_oracle = Pubkey::new_unique();
         let gold_oracle = Pubkey::new_unique();
-        pt.add_account(oil_oracle, pyth_account(dollars(75.0), 0, -8, WEDNESDAY));
-        pt.add_account(gold_oracle, pyth_account(dollars(2_000.0), 0, -8, WEDNESDAY));
+        pt.add_account(oil_oracle, pyth_account("OIL", dollars(75.0), 0, -8, WEDNESDAY));
+        pt.add_account(gold_oracle, pyth_account("GOLD", dollars(2_000.0), 0, -8, WEDNESDAY));
         let mut ctx = pt.start_with_context().await;
-        support::install_event_log();
+        support::install_native_stubs();
 
         let guardian = Keypair::new();
         let mint = Keypair::new();
@@ -292,10 +296,7 @@ impl Env {
         self.ctx.set_sysvar(&clock);
         for oracle in [self.oil.oracle, self.gold.oracle] {
             let mut acct = self.ctx.banks_client.get_account(oracle).await.unwrap().unwrap();
-            let mut pa: PriceAccount = *bytemuck::from_bytes(&acct.data);
-            pa.timestamp = unix_timestamp;
-            pa.prev_timestamp = unix_timestamp;
-            acct.data = bytemuck::bytes_of(&pa).to_vec();
+            set_publish_times(&mut acct.data, unix_timestamp);
             self.ctx.set_account(&oracle, &AccountSharedData::from(acct));
         }
     }
@@ -307,7 +308,7 @@ impl Env {
     async fn set_price(&mut self, commodity: &str, price: i64, conf: u64) {
         let now = self.now().await;
         let oracle = self.keys(commodity).oracle;
-        self.ctx.set_account(&oracle, &AccountSharedData::from(pyth_account(price, conf, -8, now)));
+        self.ctx.set_account(&oracle, &AccountSharedData::from(pyth_account(commodity, price, conf, -8, now)));
     }
 
     async fn init_market(&mut self, commodity: &str) -> Result<(), BanksClientError> {
@@ -936,7 +937,7 @@ async fn only_the_admin_creates_markets_with_a_genuine_feed() {
 
     // A feed account not owned by the configured oracle program is refused
     let fake_feed = Pubkey::new_unique();
-    let mut fake = pyth_account(dollars(2_000.0), 0, -8, WEDNESDAY);
+    let mut fake = pyth_account("GOLD", dollars(2_000.0), 0, -8, WEDNESDAY);
     fake.owner = Pubkey::new_unique();
     env.ctx.set_account(&fake_feed, &AccountSharedData::from(fake));
     let authority = env.authority.insecure_clone();
@@ -946,6 +947,70 @@ async fn only_the_admin_creates_markets_with_a_genuine_feed() {
     );
 
     env.init_market("GOLD").await.unwrap();
+}
+
+/// initialize_market takes a non-zero feed id and requires the account to
+/// be a Full PriceUpdateV2 for it; the update's age is not checked
+/// (docs/lp-pool.md D47).
+#[tokio::test]
+async fn markets_need_a_full_update_for_their_feed_id() {
+    let mut env = Env::new().await;
+    let authority = env.authority.insecure_clone();
+    let gold_oracle = env.gold.oracle;
+    let invalid_config = code(PerpsError::InvalidMarketConfig);
+    assert_eq!(
+        custom_error(env.init_market_as(&authority, "GOLD", InitializeMarketParams { pyth_feed_id: [0; 32], ..oil_params("GOLD") }, gold_oracle).await),
+        invalid_config
+    );
+    // The OIL feed id against the GOLD account
+    assert_eq!(
+        custom_error(env.init_market_as(&authority, "GOLD", InitializeMarketParams { pyth_feed_id: feed_id("OIL"), ..oil_params("GOLD") }, gold_oracle).await),
+        code(PerpsError::OracleFeedIdMismatch)
+    );
+    let v = PriceUpdateV2View::new(GOLD_FEED_ID, dollars(2_000.0), 0, -8, WEDNESDAY);
+    let mut wrong_disc = v.to_bytes();
+    wrong_disc[7] ^= 0xff;
+    for (data, expected) in [
+        (v.to_partial_bytes(13), code(PerpsError::OracleNotFullyVerified)),
+        (wrong_disc, code(PerpsError::InvalidOracleAccount)),
+        (v.to_bytes()[..132].to_vec(), code(PerpsError::InvalidOracleAccount)),
+    ] {
+        env.ctx.set_account(&gold_oracle, &AccountSharedData::from(support::feed_account(data, PYTH_PROGRAM)));
+        assert_eq!(custom_error(env.init_market_as(&authority, "GOLD", oil_params("GOLD"), gold_oracle).await), expected);
+    }
+    // A day-old update is fine at creation (the market may open later)
+    let stale = PriceUpdateV2View { publish_time: WEDNESDAY - 86_400, ..v };
+    env.ctx.set_account(&gold_oracle, &AccountSharedData::from(support::feed_account(stale.to_bytes(), PYTH_PROGRAM)));
+    env.init_market_seeded(&authority, "GOLD", oil_params("GOLD"), gold_oracle, 0).await.unwrap();
+    let m: Market = env.load(env.gold.market).await;
+    assert_eq!((m.pyth_price_feed, m.pyth_feed_id, m.oracle_program), (gold_oracle, GOLD_FEED_ID, PYTH_PROGRAM));
+}
+
+/// Under one of Pyth's Receivers the market's account must be the push
+/// oracle's shard-0 PDA for its feed id (docs/lp-pool.md D52): a Receiver-
+/// owned account anyone can post into, or the other pair's PDA, is refused.
+#[tokio::test]
+async fn markets_under_a_pyth_receiver_pin_the_push_feed_account() {
+    use perps_core::pyth_push::{push_feed_address, PYTH_PUSH_ORACLE_LEGACY, PYTH_PUSH_ORACLE_PRO, PYTH_RECEIVER_PRO};
+    let mut env = Env::new().await;
+    let authority = env.authority.insecure_clone();
+    let guardian = env.guardian.pubkey();
+    let accounts = perps_core::accounts::AdminOnly { admin: authority.pubkey(), config: config_pda() };
+    let params = ProtocolRolesParams { guardian, oracle_program: PYTH_RECEIVER_PRO };
+    env.exec(accounts, perps_core::instruction::UpdateRoles { params }, &[&authority]).await.unwrap();
+    let data = PriceUpdateV2View::new(GOLD_FEED_ID, dollars(2_000.0), 0, -8, WEDNESDAY).to_bytes();
+    for key in [Pubkey::new_unique(), push_feed_address(&PYTH_PUSH_ORACLE_LEGACY, &GOLD_FEED_ID), push_feed_address(&PYTH_PUSH_ORACLE_PRO, &feed_id("OIL"))] {
+        env.ctx.set_account(&key, &AccountSharedData::from(support::feed_account(data.clone(), PYTH_RECEIVER_PRO)));
+        assert_eq!(
+            custom_error(env.init_market_seeded(&authority, "GOLD", oil_params("GOLD"), key, 0).await),
+            code(PerpsError::InvalidOracleAccount)
+        );
+    }
+    let pda = push_feed_address(&PYTH_PUSH_ORACLE_PRO, &GOLD_FEED_ID);
+    env.ctx.set_account(&pda, &AccountSharedData::from(support::feed_account(data, PYTH_RECEIVER_PRO)));
+    env.init_market_seeded(&authority, "GOLD", oil_params("GOLD"), pda, 0).await.unwrap();
+    let m: Market = env.load(env.gold.market).await;
+    assert_eq!((m.pyth_price_feed, m.pyth_feed_id, m.oracle_program), (pda, GOLD_FEED_ID, PYTH_RECEIVER_PRO));
 }
 
 #[tokio::test]

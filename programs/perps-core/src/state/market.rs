@@ -52,6 +52,17 @@ pub struct Market {
     pub funding_rate: i64,                    // Latest per-period funding rate (6 decimals, 100 = 0.01%)
     pub funding_carry_secs: u32,              // Open seconds accrued but not yet charged (docs/lp-pool.md §8)
     pub settled_at: i64,                      // Unix time settle_market ran; 0 = not settled (or settled before it existed)
+
+    // Oracle (docs/lp-pool.md D47), appended at 295..431. `pyth_price_feed`
+    // (offset 104) is the pinned Pyth Solana Receiver `PriceUpdateV2`
+    // account (the push oracle's shard-0 feed account, or the mock on a
+    // localnet); read_price also requires these:
+    pub pyth_feed_id: [u8; 32],               // 295  Pyth feed id the account must carry
+    pub oracle_program: Pubkey,               // 327  required owner: ProtocolConfig.oracle_program when the feed was set
+    // Timelocked feed rotation (propose / apply / cancel_oracle_feed)
+    pub pending_price_feed: Pubkey,           // 359
+    pub pending_feed_id: [u8; 32],            // 391
+    pub pending_oracle_at: i64,               // 423  when the pending feed may be applied; 0 = none
 }
 
 impl Market {
@@ -88,6 +99,11 @@ impl Market {
         8 +   // funding_rate
         4 +   // funding_carry_secs
         8 +   // settled_at
+        32 +  // pyth_feed_id
+        32 +  // oracle_program
+        32 +  // pending_price_feed
+        32 +  // pending_feed_id
+        8 +   // pending_oracle_at
         3;    // padding for future use
 
     /// Convert commodity bytes to string
@@ -314,11 +330,45 @@ mod tests {
         );
     }
 
+    /// D47 appended the oracle fields: 298 -> 434 (pre-launch, no deployed
+    /// markets to migrate). Still `8 + serialized + 3` padding bytes.
     #[test]
-    fn account_size_is_unchanged_so_existing_markets_still_load() {
-        assert_eq!(Market::LEN, 298);
-        let serialized = Market::default().try_to_vec().unwrap().len();
+    fn account_size_includes_the_oracle_fields() {
+        assert_eq!(Market::LEN, 434);
+        let serialized = anchor_lang::prelude::borsh::to_vec(&Market::default()).unwrap().len();
         assert_eq!(8 + serialized + 3, Market::LEN);
+    }
+
+    /// docs/lp-pool.md D47: the oracle fields follow `settled_at`, at
+    /// 295..431; `pyth_price_feed` stays at 104 and the open interest at
+    /// 168/176 (the frontend reads those offsets).
+    #[test]
+    fn oracle_fields_are_appended() {
+        use anchor_lang::AccountSerialize;
+        let m = Market {
+            pyth_price_feed: Pubkey::new_from_array([1; 32]),
+            long_open_interest: 0x0102,
+            short_open_interest: 0x0304,
+            settled_at: -3,
+            pyth_feed_id: [2; 32],
+            oracle_program: Pubkey::new_from_array([3; 32]),
+            pending_price_feed: Pubkey::new_from_array([4; 32]),
+            pending_feed_id: [5; 32],
+            pending_oracle_at: -7,
+            ..Default::default()
+        };
+        let mut b = Vec::new();
+        m.try_serialize(&mut b).unwrap();
+        assert_eq!(&b[104..136], &[1; 32]);
+        assert_eq!(&b[168..176], &0x0102u64.to_le_bytes());
+        assert_eq!(&b[176..184], &0x0304u64.to_le_bytes());
+        assert_eq!(&b[287..295], &(-3i64).to_le_bytes());
+        assert_eq!(&b[295..327], &[2; 32]);
+        assert_eq!(&b[327..359], &[3; 32]);
+        assert_eq!(&b[359..391], &[4; 32]);
+        assert_eq!(&b[391..423], &[5; 32]);
+        assert_eq!(&b[423..431], &(-7i64).to_le_bytes());
+        assert_eq!(b.len() + 3, Market::LEN);
     }
 
     /// docs/lp-pool.md §1.1: `funding_carry_secs` is appended after
@@ -333,7 +383,8 @@ mod tests {
         assert_eq!(&b[283..287], &0x0a0b_0c0du32.to_le_bytes());
         // settled_at (docs/lp-pool.md §0 D35) follows at 287..295
         assert_eq!(&b[287..295], &(-3i64).to_le_bytes());
-        assert_eq!(b.len(), 295);
+        // The D47 oracle fields follow (oracle_fields_are_appended)
+        assert_eq!(b.len(), 431);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { SystemProgram } from '@solana/web3.js';
 import { usePerpsProgram } from './usePerpsProgram';
 import { getReferralCodePDA, getUserReferralPDA, codeToBytes, bytesToCode } from '../utils/pda';
 import { PRICE_DECIMALS } from '../config/program';
@@ -172,6 +173,7 @@ export function useOnChainReferral() {
         .accounts({
           owner: publicKey,
           referralCode: referralCodePda,
+          systemProgram: SystemProgram.programId,
         })
         .rpc();
 
@@ -208,6 +210,7 @@ export function useOnChainReferral() {
           user: publicKey,
           referralCode: referralCodePda,
           userReferral: userReferralPda,
+          systemProgram: SystemProgram.programId,
         })
         .rpc();
 

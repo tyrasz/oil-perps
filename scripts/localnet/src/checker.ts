@@ -91,7 +91,8 @@ const closes: Record<string, unknown>[] = [];
 const reopens: Record<string, unknown>[] = [];
 const breaks: { t: number; kind: string }[] = [];
 const keeperTx: { sig: string; t: number; ok: boolean; ixs: string[]; cu: number | null; events: string[]; detail: Record<string, unknown>[]; err?: string }[] = [];
-let keeperUntil: string | undefined;
+/** Keeper signatures already read (pollKeeper). */
+const keeperSeen = new Set<string>();
 let lastBoundHeld: { t: number; nn: bigint; b: bigint; badDebtCum: bigint; oracle: bigint; g: bigint } | null = null;
 let liquidationsSinceHeld = 0;
 let maxRatioBetweenCloses = 0;
@@ -145,7 +146,7 @@ async function snapshot(): Promise<Snapshot | null> {
       continue;
     }
     const positions = posAccts.map((a) => {
-      const p = P.perps.coder.accounts.decode("Position", a.account.data) as any;
+      const p = P.perps.coder.accounts.decode("position", a.account.data) as any;
       return {
         address: a.pubkey.toBase58(),
         owner: (p.owner as PublicKey).toBase58(),
@@ -330,11 +331,20 @@ function fillReopens(final = false) {
   }
 }
 
+/**
+ * The keeper's transactions since the last poll. No `until` cursor: the
+ * validator's `--limit-ledger-size` purges old slots, and once the cursor's
+ * slot is purged every later call fails "Transaction … not found". That
+ * happened when setup waited for the LP deposit window: the cursor was
+ * setup's funding transfer, purged before the keeper's first transaction
+ * (docs/lp-pool.md D52). The newest 1_000 are read and those already seen
+ * skipped (the keeper sends at most 64 a pass).
+ */
 async function pollKeeper() {
-  const sigs = await conn.getSignaturesForAddress(keeperKey, { until: keeperUntil, limit: 1_000 }, "confirmed");
+  const sigs = (await conn.getSignaturesForAddress(keeperKey, { limit: 1_000 }, "confirmed")).filter((s) => !keeperSeen.has(s.signature));
   if (sigs.length === 0) return;
-  keeperUntil = sigs[0].signature;
   for (const s of sigs.reverse()) {
+    keeperSeen.add(s.signature);
     const tx = await conn.getTransaction(s.signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
     // Only what the keeper sent (setup's funding transfers also name its address)
     if (!tx || !tx.transaction.message.staticAccountKeys[0].equals(keeperKey)) continue;

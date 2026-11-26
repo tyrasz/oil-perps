@@ -17,7 +17,8 @@
 //! (invariant 2) is fatal by default; --lenient-solvency reports it as a
 //! finding instead (--strict-solvency is accepted and does nothing).
 
-#[allow(dead_code)]
+// (deprecated: its base64::decode, as in perps-core's own tests)
+#[allow(dead_code, deprecated)]
 #[path = "../../programs/perps-core/tests/support/market_env.rs"]
 mod support;
 
@@ -44,7 +45,6 @@ mod metrics;
 mod model;
 mod oracle;
 mod predict;
-mod quiet_events;
 mod report;
 mod scenario;
 mod schedule;

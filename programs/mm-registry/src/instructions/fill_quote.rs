@@ -116,7 +116,7 @@ pub struct FillQuote<'info> {
 }
 
 pub fn handler(ctx: Context<FillQuote>, params: FillQuoteParams) -> Result<FillQuoteResult> {
-    let bump = *ctx.bumps.get("venue_authority").unwrap();
+    let bump = ctx.bumps.venue_authority;
     let current_time = Clock::get()?.unix_timestamp;
     let quote = &ctx.accounts.quote;
 
@@ -234,7 +234,7 @@ fn cpi_venue_fill<'info>(a: &FillQuote<'info>, bump: u8, params: VenueFillParams
         lp_pool: a.perps_lp_pool.to_account_info(),
     };
     perps_core::cpi::venue_fill(
-        CpiContext::new_with_signer(a.perps_core_program.to_account_info(), accounts, &[seeds]),
+        CpiContext::new_with_signer(a.perps_core_program.key(), accounts, &[seeds]),
         params,
     )
 }

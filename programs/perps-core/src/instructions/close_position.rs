@@ -59,7 +59,7 @@ pub struct ClosePosition<'info> {
 
     /// CHECK: Pyth price feed, validated below
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
-    pub pyth_price_feed: AccountInfo<'info>,
+    pub pyth_price_feed: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 
@@ -80,7 +80,11 @@ pub struct ClosePosition<'info> {
 
     /// The referrer's token account; the reward is paid here at close.
     /// Validated in the handler (owner = referral code owner, market's mint).
-    #[account(mut)]
+    /// `dup`: the trader's own token account here is refused by that check
+    /// (InvalidReferralParams), not by Anchor 1.x's duplicate-mutable check
+    /// (2040); token accounts are not written back by Anchor, so the alias is
+    /// harmless until the handler refuses it.
+    #[account(mut, dup)]
     pub referrer_token_account: Option<Box<Account<'info, TokenAccount>>>,
 
     // docs/lp-pool.md §4.5: account 13, after the three optionals (a client
@@ -159,7 +163,7 @@ pub fn handler(ctx: Context<ClosePosition>, acceptable_price: u64) -> Result<()>
                 to,
                 authority: a.vault.to_account_info(),
             };
-            let cpi_ctx = CpiContext::new_with_signer(a.token_program.to_account_info(), cpi_accounts, signer);
+            let cpi_ctx = CpiContext::new_with_signer(a.token_program.key(), cpi_accounts, signer);
             token::transfer(cpi_ctx, amount)?;
         }
     }
@@ -175,7 +179,7 @@ pub fn handler(ctx: Context<ClosePosition>, acceptable_price: u64) -> Result<()>
         o.fee,
         o.payout
     );
-    emit!(PositionClosed {
+    emit_event!(PositionClosed {
         position: position_key,
         owner: a.position.owner,
         mark,

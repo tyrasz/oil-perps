@@ -16,6 +16,9 @@ use solana_program_test::{processor, ProgramTest};
 use support::*;
 
 fn mm_process(program_id: &Pubkey, accounts: &[solana_sdk::account_info::AccountInfo], data: &[u8]) -> solana_sdk::entrypoint::ProgramResult {
+    // Anchor 1.2's entry wants one lifetime for the id, the accounts and the data
+    let program_id: &Pubkey = Box::leak(Box::new(*program_id));
+    let data: &[u8] = Box::leak(data.to_vec().into_boxed_slice());
     let accounts = Box::leak(Box::new(accounts.to_vec()));
     mm_registry::entry(program_id, accounts, data)
 }
@@ -430,11 +433,16 @@ async fn fills_open_matched_perps_positions_and_move_no_tokens() {
     let out = env.base.ctx.banks_client.process_transaction_with_metadata(tx).await.unwrap();
     out.result.unwrap();
     support::watch_buckets(&mut env.base.ctx, &ixs).await;
-    let mut data = out.metadata.unwrap().return_data.expect("fill_quote returns its result").data;
-    // The runtime strips trailing zero bytes from return data; fee is the last field
-    data.resize(24, 0);
-    let result = FillQuoteResult::try_from_slice(&data).unwrap();
-    assert_eq!((result.fill_price, result.fill_size, result.fee), (ASK, 10 * CONTRACT, 0));
+    // SBF only: natively Anchor 1.2 cannot set return data (solana-cpi's
+    // native `set_return_data` is a no-op, and Anchor's generated handler
+    // calls it directly), so a native run has none
+    if support::is_sbf() {
+        let mut data = out.metadata.unwrap().return_data.expect("fill_quote returns its result").data;
+        // The runtime strips trailing zero bytes from return data; fee is the last field
+        data.resize(24, 0);
+        let result = FillQuoteResult::try_from_slice(&data).unwrap();
+        assert_eq!((result.fill_price, result.fill_size, result.fee), (ASK, 10 * CONTRACT, 0));
+    }
     // First fill also creates the taker's approval
     assert_eq!(lamports_before - lamports(&mut env.base, taker).await, 2 * position_rent + approval_rent + SIGNATURE_FEE);
 

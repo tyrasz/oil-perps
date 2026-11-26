@@ -6,7 +6,7 @@
 // LOCALNET ONLY. Every connection goes through `connect()`, which refuses any
 // RPC URL that is not on this machine.
 
-import * as anchor from "@coral-xyz/anchor";
+import * as anchor from "@anchor-lang/core";
 import {
   ComputeBudgetProgram,
   Connection,
@@ -20,6 +20,12 @@ import {
 import * as fs from "fs";
 import * as path from "path";
 import * as util from "util";
+// Generated with the IDLs by scripts/gen-idl.sh (scripts/localnet/build.sh)
+import type { PerpsCore } from "../../../target/types/perps_core";
+import type { MmRegistry } from "../../../target/types/mm_registry";
+import type { Orderbook } from "../../../target/types/orderbook";
+import { PYTH_FEED_IDS, feedIdFromHex, feedIdToHex } from "../../../frontend/src/config/pythFeeds";
+import { PRICE_UPDATE_V2_LEN, parsePriceUpdateV2 } from "../../../frontend/src/utils/oracleAccount";
 
 export { anchor };
 export const BN = anchor.BN;
@@ -93,6 +99,8 @@ export interface LocalnetState {
   createdAt: number;
   mint: string;
   feed: string;
+  /** The feed's Pyth feed id (hex), as the market pins it */
+  feedId: string;
   market: string;
   vault: string;
   vaultToken: string;
@@ -128,29 +136,40 @@ export function stopRequested(): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Programs (IDLs from scripts/idlgen in target/idl)
+// Programs (IDLs from scripts/gen-idl.sh in target/idl)
 // ---------------------------------------------------------------------------
 
+// @anchor-lang/core camelCases every IDL name in a Program, account and type
+// names included: `perps.coder.accounts.decode("market", ..)`, events
+// "positionLiquidated" (decodeEvents below restores the Rust names).
 export interface Programs {
   provider: anchor.AnchorProvider;
-  perps: anchor.Program;
-  mm: anchor.Program;
-  book: anchor.Program;
+  perps: anchor.Program<PerpsCore>;
+  mm: anchor.Program<MmRegistry>;
+  book: anchor.Program<Orderbook>;
 }
 
-function idl(name: string): anchor.Idl {
+/** target/idl/<name>.json as written (Rust names). */
+function idl<T extends anchor.Idl = anchor.Idl>(name: string): T {
   const file = path.join(ROOT, "target/idl", `${name}.json`);
   if (!fs.existsSync(file)) throw new Error(`${file} is missing: run scripts/localnet/build.sh`);
   return JSON.parse(fs.readFileSync(file, "utf-8"));
+}
+
+/** The IDL of the program at `id` (@anchor-lang/core takes the program id from `address`). */
+function idlAt<T extends anchor.Idl>(name: string, id: PublicKey): T {
+  const i = idl<T>(name);
+  if (i.address !== id.toBase58()) throw new Error(`target/idl/${name}.json: address ${i.address}, expected ${id.toBase58()}`);
+  return i;
 }
 
 export function programs(conn: Connection, payer: Keypair): Programs {
   const provider = new anchor.AnchorProvider(conn, new anchor.Wallet(payer), { commitment: "confirmed" });
   return {
     provider,
-    perps: new anchor.Program(idl("perps_core"), PERPS_ID, provider),
-    mm: new anchor.Program(idl("mm_registry"), MM_REGISTRY_ID, provider),
-    book: new anchor.Program(idl("orderbook"), ORDERBOOK_ID, provider),
+    perps: new anchor.Program(idlAt<PerpsCore>("perps_core", PERPS_ID), provider),
+    mm: new anchor.Program(idlAt<MmRegistry>("mm_registry", MM_REGISTRY_ID), provider),
+    book: new anchor.Program(idlAt<Orderbook>("orderbook", ORDERBOOK_ID), provider),
   };
 }
 
@@ -215,16 +234,22 @@ export const wallNow = () => Date.now() / 1000;
 // mock-pyth (TEST ONLY)
 // ---------------------------------------------------------------------------
 
-export const PRICE_ACCOUNT_SIZE = 3_312;
+/** mock-pyth writes Pyth Receiver PriceUpdateV2 accounts of this size (docs/lp-pool.md D47). */
+export const PRICE_ACCOUNT_SIZE = PRICE_UPDATE_V2_LEN;
 export const PRICE_EXPO = -8;
 export const STATUS_TRADING = 1;
+/** The localnet OIL feed carries the production OIL feed id (Commodities.USOILSPOT). */
+export const OIL_FEED_ID: number[] = Array.from(feedIdFromHex(PYTH_FEED_IDS.OIL!));
 
-export function mockPythInitializeIx(feed: PublicKey, authority: PublicKey, price: bigint, conf: bigint): TransactionInstruction {
-  const d = Buffer.alloc(1 + 8 + 8 + 4);
+/** mock-pyth `Initialize` (tag 0): feed_id[32], price i64, conf u64, expo i32; the feed and the authority sign. */
+export function mockPythInitializeIx(feed: PublicKey, authority: PublicKey, price: bigint, conf: bigint, feedId: number[] = OIL_FEED_ID): TransactionInstruction {
+  if (feedId.length !== 32) throw new Error("a feed id is 32 bytes");
+  const d = Buffer.alloc(1 + 32 + 8 + 8 + 4);
   d.writeUInt8(0, 0);
-  d.writeBigInt64LE(price, 1);
-  d.writeBigUInt64LE(conf, 9);
-  d.writeInt32LE(PRICE_EXPO, 17);
+  Buffer.from(feedId).copy(d, 1);
+  d.writeBigInt64LE(price, 33);
+  d.writeBigUInt64LE(conf, 41);
+  d.writeInt32LE(PRICE_EXPO, 49);
   return new TransactionInstruction({
     programId: MOCK_PYTH_ID,
     keys: [
@@ -235,6 +260,11 @@ export function mockPythInitializeIx(feed: PublicKey, authority: PublicKey, pric
   });
 }
 
+/**
+ * mock-pyth `SetPrice` (tag 1): price, conf, expo, status. Status 1
+ * (Trading) publishes at the chain clock; 0, 2 and 3 write nothing (the
+ * update goes stale, as a closed Pyth market's does).
+ */
 export function mockPythSetPriceIx(feed: PublicKey, authority: PublicKey, price: bigint, conf: bigint, status = STATUS_TRADING): TransactionInstruction {
   const d = Buffer.alloc(1 + 8 + 8 + 4 + 4);
   d.writeUInt8(1, 0);
@@ -253,20 +283,25 @@ export function mockPythSetPriceIx(feed: PublicKey, authority: PublicKey, price:
 }
 
 export interface FeedView {
-  /** 6-dp price, as perps-core converts it (expo −8 → 6 dp, truncated). */
+  /** 6-dp price, as perps-core converts it (expo -8 to 6 dp, truncated). */
   price6: bigint;
   conf6: bigint;
   publishTime: number;
-  trading: boolean;
+  /** Lowercase hex */
+  feedId: string;
 }
 
-/** The feed as read_price sees it: the aggregate while Trading, else prev_*. */
+/**
+ * The feed as read_price parses it (a Full PriceUpdateV2; frontend
+ * oracleAccount.ts). Throws on anything perps-core would refuse to parse, so
+ * the checker never reasons on a price no instruction can read.
+ */
 export function decodeFeed(data: Buffer): FeedView {
-  const trading = data.readUInt32LE(224) === STATUS_TRADING;
-  const price = trading ? data.readBigInt64LE(208) : data.readBigInt64LE(184);
-  const conf = trading ? data.readBigUInt64LE(216) : data.readBigUInt64LE(192);
-  const publishTime = Number(trading ? data.readBigInt64LE(96) : data.readBigInt64LE(200));
-  return { price6: price / 100n, conf6: conf / 100n, publishTime, trading };
+  const parsed = parsePriceUpdateV2(data);
+  if (!parsed.ok) throw new Error(`oracle feed is not a usable PriceUpdateV2 (${parsed.reason})`);
+  const u = parsed.update;
+  if (u.exponent !== PRICE_EXPO) throw new Error(`oracle feed exponent ${u.exponent}, the harness writes ${PRICE_EXPO}`);
+  return { price6: u.price / 100n, conf6: u.conf / 100n, publishTime: Number(u.publishTime), feedId: feedIdToHex(u.feedId) };
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +369,8 @@ function errorNames(): Record<string, Record<number, string>> {
   return ERROR_NAMES;
 }
 
-// Anchor framework errors (anchor-lang 0.28 ErrorCode) that a client race can produce
+// Anchor framework errors that a client race can produce (anchor-lang 1.2.2
+// ErrorCode; these numbers are unchanged since 0.28)
 const ANCHOR_ERRORS: Record<number, string> = {
   2000: "ConstraintMut",
   2001: "ConstraintHasOne",
@@ -447,15 +483,20 @@ export interface TxResult {
 }
 
 let EVENT_CODER: anchor.BorshCoder | null = null;
-/** perps-core events (`emit!`, "Program data:" lines) in `logs`. */
+/**
+ * perps-core events (`emit!`, "Program data:" lines) in `logs`, with the Rust
+ * event name ("PositionLiquidated") and camelCase fields, as Anchor 0.28 gave
+ * them: the camelCased IDL gives the fields, the name's first letter is
+ * restored (every perps-core event name is PascalCase).
+ */
 export function decodeEvents(logs: string[] | null | undefined): { name: string; data: any }[] {
-  if (!EVENT_CODER) EVENT_CODER = new anchor.BorshCoder(idl("perps_core"));
+  if (!EVENT_CODER) EVENT_CODER = new anchor.BorshCoder(anchor.convertIdlToCamelCase(idl("perps_core")));
   const out: { name: string; data: any }[] = [];
   for (const l of logs ?? []) {
     if (!l.startsWith("Program data: ")) continue;
     try {
       const e = EVENT_CODER.events.decode(l.slice("Program data: ".length));
-      if (e) out.push({ name: e.name, data: e.data });
+      if (e) out.push({ name: e.name.charAt(0).toUpperCase() + e.name.slice(1), data: e.data });
     } catch {
       // another program's data
     }

@@ -35,7 +35,7 @@ pub fn initialize_config(ctx: Context<InitializeConfig>, oracle_program: Pubkey)
     config.admin = ctx.accounts.upgrade_authority.key();
     config.pending_admin = Pubkey::default();
     config.oracle_program = oracle_program;
-    config.bump = *ctx.bumps.get("config").unwrap();
+    config.bump = ctx.bumps.config;
     msg!("Protocol config: admin={}, oracle_program={}", config.admin, config.oracle_program);
     Ok(())
 }
@@ -60,7 +60,9 @@ pub fn propose_admin(ctx: Context<AdminOnly>, new_admin: Pubkey) -> Result<()> {
     Ok(())
 }
 
-/// Change the oracle program that vault price feeds must belong to.
+/// Change the oracle program that the price feeds of vaults created from
+/// now on must belong to. Existing vaults keep the owner they snapshotted
+/// (`LpVault.oracle_program`, docs/lp-pool.md D52).
 pub fn set_oracle_program(ctx: Context<AdminOnly>, oracle_program: Pubkey) -> Result<()> {
     ctx.accounts.config.oracle_program = oracle_program;
     msg!("Oracle program set to {}", oracle_program);

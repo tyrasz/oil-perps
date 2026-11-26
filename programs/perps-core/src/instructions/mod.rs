@@ -20,6 +20,7 @@ pub mod pool_admin;
 pub mod lp_pool;
 pub mod settle_close;
 pub mod adl;
+pub mod oracle_admin;
 
 pub use initialize_market::*;
 pub use initialize_user::*;
@@ -43,3 +44,4 @@ pub use pool_admin::*;
 pub use lp_pool::*;
 pub use settle_close::*;
 pub use adl::*;
+pub use oracle_admin::*;

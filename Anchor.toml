@@ -1,5 +1,7 @@
 [features]
-seeds = false
+# Anchor 0.30 renamed `seeds` to `resolution`; false keeps the IDL free of
+# account resolution, as `seeds = false` did
+resolution = false
 
 [programs.localnet]
 perps_core = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
@@ -7,9 +9,6 @@ orderbook = "2XhUqeGhdkhKdZXkjHmMmFMXBJfYVVCbFxKjKqkCdMzt"
 vamm = "3Vft6oJxPvHXELuqrPgCdPqJf1LxGpqDxBdqNhJxLZbm"
 prop_amm = "PropAMM111111111111111111111111111111111111"
 mm_registry = "MMReg11111111111111111111111111111111111111"
-
-[registry]
-url = "https://anchor.projectserum.com"
 
 [provider]
 cluster = "localnet"

@@ -72,7 +72,7 @@ pub fn handler(ctx: Context<DeregisterMm>) -> Result<()> {
             authority: ctx.accounts.market_maker.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
+            ctx.accounts.token_program.key(),
             cpi_accounts,
             signer
         );
@@ -85,7 +85,7 @@ pub fn handler(ctx: Context<DeregisterMm>) -> Result<()> {
             authority: ctx.accounts.market_maker.to_account_info(),
         };
         let close_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
+            ctx.accounts.token_program.key(),
             close_accounts,
             signer
         );

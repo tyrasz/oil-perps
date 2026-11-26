@@ -12,11 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Pinned: newer compilers reject code in solana-client 1.18 (never-type
-      # fallback). This is the version the tests are verified with.
+      # Host Rust for the in-process tests: solana-program-test 4.4.1 needs
+      # 1.98 (docs/lp-pool.md D48). This is the version the tests are verified with.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.97.0"
+          toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@v2
       # mock-pyth: the localnet-only test oracle (docs/localnet.md), never deployed
       - run: cargo test -p perps-core -p prop-amm -p vamm -p mm-registry -p orderbook -p mock-pyth
@@ -24,21 +24,40 @@ jobs:
       - run: cargo test -p perps-core --features localnet test_schedule
       # The simulation's own model and schedule against the spec and the IANA session vectors
       - run: cargo test -p sim
+      # The committed IDL copies the frontend and the mm-registry SDK build
+      # against match the programs (scripts/gen-idl.sh, D49)
+      - run: scripts/gen-idl.sh --check
 
   sbf:
     name: SBF build, end-to-end on SBF, TypeScript suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Host toolchain for MSRV-aware resolution in build-sbf.sh (needs cargo >= 1.84)
+      # Host toolchain: the SBF end-to-end tests and the simulation link
+      # solana-program-test 4.4.1 (Rust 1.98); build-sbf.sh needs cargo >= 1.84
+      # for MSRV-aware resolution. The SBF builds use platform-tools v1.57 (Rust 1.95).
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.97.0"
+          toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@v2
-      - name: Install Solana 1.18 tools
+      # Agave 4.4.1 CLI: solana-test-validator 4.4.1, cargo-build-sbf 4.5.0
+      # (docs/lp-pool.md D48). The release and the platform-tools v1.57 that
+      # cargo-build-sbf installs under ~/.cache/solana on first use are cached.
+      - name: Cache Agave 4.4.1 and platform-tools v1.57
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/agave-v4.4.1
+            ~/.cache/solana/v1.57
+          key: agave-v4.4.1-platform-tools-v1.57-${{ runner.os }}
+      - name: Install Agave 4.4.1 tools
         run: |
-          curl -sSfL https://github.com/anza-xyz/agave/releases/download/v1.18.26/solana-release-x86_64-unknown-linux-gnu.tar.bz2 | tar xj -C "$HOME"
-          echo "$HOME/solana-release/bin" >> "$GITHUB_PATH"
+          if [ ! -x "$HOME/agave-v4.4.1/solana-release/bin/solana-test-validator" ]; then
+            mkdir -p "$HOME/agave-v4.4.1"
+            curl -sSfL https://github.com/anza-xyz/agave/releases/download/v4.4.1/solana-release-x86_64-unknown-linux-gnu.tar.bz2 | tar xj -C "$HOME/agave-v4.4.1"
+          fi
+          echo "$HOME/agave-v4.4.1/solana-release/bin" >> "$GITHUB_PATH"
+      - run: solana-test-validator --version && cargo-build-sbf --version
       - run: scripts/build-sbf.sh
       # Native tests can't catch SBF-only failures (e.g. the 4 KB stack limit)
       - run: SBF_OUT_DIR=$PWD/target/deploy cargo test -p perps-core -p prop-amm -p mm-registry -p orderbook --test integration
@@ -65,8 +84,11 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # IDLs and TS types into target/idl and target/types (D49): the harness's
+      # programs are typed with them
+      - run: scripts/gen-idl.sh
       # The live localnet harness (scripts/localnet, docs/localnet.md) type-checks
-      # against the IDL-independent mirrors it imports from the frontend
+      # against the IDL types and the mirrors it imports from the frontend
       - run: npx tsc -p scripts/localnet/tsconfig.json
       # ... and its pure decisions (reopen print, checker coverage, gaps, bad debt, gapper sizing)
       - run: npx ts-node -P scripts/localnet/tsconfig.json --transpile-only scripts/localnet/src/selftest.ts
@@ -88,16 +110,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.97.0"
+          toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             .
             backend/keeper
-      - name: Install Solana 1.18 tools
+      # Agave 4.4.1 CLI: solana-test-validator 4.4.1, cargo-build-sbf 4.5.0
+      # (docs/lp-pool.md D48). The release and the platform-tools v1.57 that
+      # cargo-build-sbf installs under ~/.cache/solana on first use are cached.
+      - name: Cache Agave 4.4.1 and platform-tools v1.57
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/agave-v4.4.1
+            ~/.cache/solana/v1.57
+          key: agave-v4.4.1-platform-tools-v1.57-${{ runner.os }}
+      - name: Install Agave 4.4.1 tools
         run: |
-          curl -sSfL https://github.com/anza-xyz/agave/releases/download/v1.18.26/solana-release-x86_64-unknown-linux-gnu.tar.bz2 | tar xj -C "$HOME"
-          echo "$HOME/solana-release/bin" >> "$GITHUB_PATH"
+          if [ ! -x "$HOME/agave-v4.4.1/solana-release/bin/solana-test-validator" ]; then
+            mkdir -p "$HOME/agave-v4.4.1"
+            curl -sSfL https://github.com/anza-xyz/agave/releases/download/v4.4.1/solana-release-x86_64-unknown-linux-gnu.tar.bz2 | tar xj -C "$HOME/agave-v4.4.1"
+          fi
+          echo "$HOME/agave-v4.4.1/solana-release/bin" >> "$GITHUB_PATH"
+      - run: solana-test-validator --version && cargo-build-sbf --version
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -116,11 +152,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Pinned: newer compilers reject code in solana-client 1.18 (never-type
-      # fallback). This is the version the tests are verified with.
+      # The same host Rust as the programs (the keeper is on the Anchor 1.2.2 /
+      # solana-v3 client crates, D48)
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.97.0"
+          toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: backend/keeper
@@ -140,6 +176,9 @@ jobs:
       - run: npm ci
         working-directory: frontend
       - run: npx vitest run
+        working-directory: frontend
+      # Builds against the committed IDL copy in frontend/src/idl (D49)
+      - run: npm run build
         working-directory: frontend
 
   session-vectors:

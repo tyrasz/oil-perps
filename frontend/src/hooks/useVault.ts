@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { PublicKey, type TransactionInstruction } from '@solana/web3.js';
+import { SystemProgram, type TransactionInstruction } from '@solana/web3.js';
 import { clusterUnixTime, ensureFundingCurrent } from '../utils/fundingCrank';
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddress } from '@solana/spl-token';
-import { BN } from '@project-serum/anchor';
+import { BN } from '@anchor-lang/core';
 import { usePerpsProgram } from './usePerpsProgram';
 import { useLpPool } from './useLpPool';
 import { useMarketStore } from '../stores/marketStore';
@@ -22,7 +22,7 @@ import {
 } from '../utils/pool';
 import { navPerShare, redeemValue, type PoolView } from '../utils/poolMath';
 import { parseAnchorError } from '../utils/transaction';
-import { LP_DEPOSIT_SLIPPAGE_BPS, PYTH_PRICE_FEEDS } from '../config/program';
+import { LP_DEPOSIT_SLIPPAGE_BPS } from '../config/program';
 import type { ErrorContext } from '../utils/errors';
 
 const nowSecs = () => Math.floor(Date.now() / 1000);
@@ -106,7 +106,9 @@ export function useVault() {
   const context = useCallback(async () => {
     if (!program || !publicKey || !data || !lpPositionPda) throw new Error('Wallet not connected');
     if (!data.pool) throw new Error('This market has no LP pool');
-    const pythPriceFeed = PYTH_PRICE_FEEDS[selectedCommodity.id] ?? new PublicKey(selectedCommodity.pythPriceFeed);
+    // The market's pinned feed (perps-core refuses any other key); after a
+    // feed rotation it differs from the config's default
+    const pythPriceFeed = data.priceFeed;
     const connection = program.provider.connection;
     const fresh = await ensureFundingCurrent({
       fetchMarket: async () => decodeMarket((await program.account.market.fetch(data.marketAddress)) as Record<string, unknown>),
@@ -118,7 +120,7 @@ export function useVault() {
     });
     const g = lpGates(fresh.market, data.pool, null, fresh.now);
     return { program, publicKey, data, lpPositionPda, pythPriceFeed, gates: g };
-  }, [program, publicKey, data, lpPositionPda, selectedCommodity]);
+  }, [program, publicKey, data, lpPositionPda]);
 
   const run = useCallback(
     async (action: ErrorContext['action'], send: () => Promise<string>, gates?: LpGates) => {
@@ -160,7 +162,12 @@ export function useVault() {
           pre.unshift(
             await c.program.methods
               .initLpPosition(LP_CLASS_COMMON)
-              .accounts({ owner: c.publicKey, lpPool: c.data.poolAddress, lpPosition: c.lpPositionPda })
+              .accounts({
+                owner: c.publicKey,
+                lpPool: c.data.poolAddress,
+                lpPosition: c.lpPositionPda,
+                systemProgram: SystemProgram.programId,
+              })
               .instruction()
           );
         }

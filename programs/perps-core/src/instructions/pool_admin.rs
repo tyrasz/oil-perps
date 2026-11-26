@@ -61,7 +61,7 @@ pub fn initialize_pool(ctx: Context<InitializePool>, params: PoolParams, adl_kee
     pool.market = market.key();
     pool.adl_keeper = adl_keeper;
     pool.params = params;
-    pool.bump = *ctx.bumps.get("lp_pool").unwrap();
+    pool.bump = ctx.bumps.lp_pool;
 
     msg!("LP pool initialized: {} for market {}", pool.key(), market.key());
     Ok(())
@@ -103,8 +103,8 @@ pub fn propose_pool_params(ctx: Context<ProposePoolParams>, params: PoolParams) 
         pool.params = params;
         pool.pending_params = PoolParams::default();
         pool.pending_params_at = 0;
-        emit!(PoolParamsProposed { params, effective_at: now });
-        emit!(PoolParamsApplied { params, effective_at: now });
+        emit_event!(PoolParamsProposed { params, effective_at: now });
+        emit_event!(PoolParamsApplied { params, effective_at: now });
         msg!("Pool params applied (no LPs yet)");
         return Ok(());
     }
@@ -113,7 +113,7 @@ pub fn propose_pool_params(ctx: Context<ProposePoolParams>, params: PoolParams) 
     let effective_at = now.checked_add(t).ok_or(PerpsError::MathOverflow)?;
     pool.pending_params = params;
     pool.pending_params_at = effective_at;
-    emit!(PoolParamsProposed { params, effective_at });
+    emit_event!(PoolParamsProposed { params, effective_at });
     msg!("Pool params proposed, effective at {}", effective_at);
     Ok(())
 }
@@ -143,7 +143,7 @@ pub fn apply_pool_params(ctx: Context<ApplyPoolParams>) -> Result<()> {
     pool.params = params;
     pool.pending_params = PoolParams::default();
     pool.pending_params_at = 0;
-    emit!(PoolParamsApplied { params, effective_at });
+    emit_event!(PoolParamsApplied { params, effective_at });
     msg!("Pool params applied");
     Ok(())
 }
@@ -169,7 +169,7 @@ pub fn cancel_pool_params(ctx: Context<PoolAdminOnly>) -> Result<()> {
     let (params, effective_at) = (pool.pending_params, pool.pending_params_at);
     pool.pending_params = PoolParams::default();
     pool.pending_params_at = 0;
-    emit!(PoolParamsCancelled { params, effective_at });
+    emit_event!(PoolParamsCancelled { params, effective_at });
     msg!("Pool params proposal cancelled");
     Ok(())
 }
@@ -221,8 +221,11 @@ pub struct WithdrawTreasury<'info> {
 
     /// Not the vault itself: a self-transfer moves no tokens, so the
     /// treasury would leave the books and strand its tokens as surplus.
+    /// `dup` keeps that refusal VaultInvariantViolated rather than Anchor
+    /// 1.x's duplicate-mutable 2040 (the constraint below still refuses it).
     #[account(
         mut,
+        dup,
         constraint = destination.mint == market.collateral_mint,
         constraint = destination.key() != vault_token_account.key() @ PerpsError::VaultInvariantViolated
     )]
@@ -241,7 +244,7 @@ pub fn withdraw_treasury(ctx: Context<WithdrawTreasury>, amount: u64) -> Result<
     let vault_seeds = &[b"vault".as_ref(), market_key.as_ref(), &[ctx.accounts.vault.bump]];
     let signer = &[&vault_seeds[..]];
     let cpi = CpiContext::new_with_signer(
-        ctx.accounts.token_program.to_account_info(),
+        ctx.accounts.token_program.key(),
         Transfer {
             from: ctx.accounts.vault_token_account.to_account_info(),
             to: ctx.accounts.destination.to_account_info(),
@@ -255,6 +258,6 @@ pub fn withdraw_treasury(ctx: Context<WithdrawTreasury>, amount: u64) -> Result<
     pool.treasury = pool.treasury.checked_sub(amount).ok_or(PerpsError::BucketUnderflow)?;
     let after = vt_before.checked_sub(amount).ok_or(PerpsError::VaultInvariantViolated)?;
     assert_backed(pool, &ctx.accounts.market, after)?;
-    emit!(TreasuryWithdrawn { amount, destination: ctx.accounts.destination.key() });
+    emit_event!(TreasuryWithdrawn { amount, destination: ctx.accounts.destination.key() });
     Ok(())
 }

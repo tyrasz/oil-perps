@@ -283,4 +283,17 @@ pub enum PerpsError {
 
     #[msg("Profitable closes wait profit_close_quiet_secs after a session open")]
     ProfitCloseQuiet,
+
+    // Pyth PriceUpdateV2 oracle (docs/lp-pool.md D47)
+    #[msg("Oracle price update is not fully verified")]
+    OracleNotFullyVerified,
+
+    #[msg("Oracle price update is for another feed id")]
+    OracleFeedIdMismatch,
+
+    #[msg("No oracle feed change is pending")]
+    NoPendingOracleChange,
+
+    #[msg("Oracle feed change is still timelocked")]
+    OracleChangeTimelocked,
 }

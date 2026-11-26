@@ -139,7 +139,7 @@ pub mod vamm {
         vamm.total_short = 0;
         vamm.total_volume = 0;
         vamm.is_active = true;
-        vamm.bump = *ctx.bumps.get("vamm").unwrap();
+        vamm.bump = ctx.bumps.vamm;
 
         msg!("vAMM initialized: k={}, price={}", vamm.k, vamm.get_price());
         Ok(())

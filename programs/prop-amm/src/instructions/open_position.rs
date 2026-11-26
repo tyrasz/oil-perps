@@ -1,7 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Token, TokenAccount};
-use pyth_sdk_solana::load_price_feed_from_account_info;
-use crate::oracle::{validate_price, PriceRejection};
+use crate::oracle::read_vault_price;
 use crate::state::{LpVault, ProtocolConfig};
 use crate::errors::PropAmmError;
 
@@ -50,9 +49,9 @@ pub struct OpenPositionAmm<'info> {
     )]
     pub trader_token_account: Account<'info, TokenAccount>,
 
-    /// CHECK: Pyth price feed
+    /// CHECK: the vault's Pyth Receiver `PriceUpdateV2`, validated by read_vault_price
     #[account(constraint = pyth_price_feed.key() == vault.pyth_price_feed)]
-    pub pyth_price_feed: AccountInfo<'info>,
+    pub pyth_price_feed: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -75,22 +74,13 @@ pub fn handler(ctx: Context<OpenPositionAmm>, params: OpenPositionParams) -> Res
     );
 
     // Get oracle price
-    let price_feed = load_price_feed_from_account_info(&ctx.accounts.pyth_price_feed)
-        .map_err(|_| PropAmmError::InvalidOraclePrice)?;
-
     let current_time = Clock::get()?.unix_timestamp;
-    let price_data = price_feed
-        .get_price_no_older_than(current_time, 60)
-        .ok_or(PropAmmError::StaleOraclePrice)?;
-
-    require!(price_data.price > 0, PropAmmError::InvalidOraclePrice);
-
-    // Same price rules as perps-core: 6 decimals, default 1% confidence limit
-    let oracle_price = validate_price(price_data.price, price_data.conf, price_data.expo, 0, 0)
-        .map_err(|r| match r {
-            PriceRejection::ConfidenceTooWide => PropAmmError::OracleConfidenceTooWide,
-            _ => PropAmmError::InvalidOraclePrice,
-        })?;
+    let oracle_price = read_vault_price(
+        &ctx.accounts.pyth_price_feed,
+        &ctx.accounts.vault.oracle_program,
+        &ctx.accounts.vault.pyth_feed_id,
+        current_time,
+    )?;
 
     // Calculate entry price with spread
     let entry_price = vault.calculate_entry_price(oracle_price, params.is_long);

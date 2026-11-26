@@ -3,7 +3,11 @@
 // scripts/localnet; `node ... ts-node ... selftest.ts` locally.
 
 import * as assert from "assert";
-import { classifyError, errorText } from "./lib";
+import { Keypair } from "@solana/web3.js";
+import { MOCK_PYTH_ID, OIL_FEED_ID, PRICE_ACCOUNT_SIZE, classifyError, decodeFeed, errorText, mockPythInitializeIx, mockPythSetPriceIx } from "./lib";
+import { MARKET_PARAMS } from "./params";
+import { PYTH_FEED_IDS } from "../../../frontend/src/config/pythFeeds";
+import { writePriceUpdateV2 } from "../../../frontend/src/utils/oracleAccount";
 import {
   badDebtEvents,
   breakIndexAt,
@@ -94,6 +98,50 @@ test("thrown non-Error values keep their content", () => {
   const code = classifyError({ reason: "socket closed" }, []);
   assert.ok(code.startsWith("other:") && code.includes("socket_closed"), code);
   assert.strictEqual(classifyError(new Error("fetch failed"), []), "infra:RpcUnavailable");
+});
+
+test("mock-pyth instructions and the feed decoder follow the PriceUpdateV2 layout (D47)", () => {
+  const feed = Keypair.generate().publicKey;
+  const auth = Keypair.generate().publicKey;
+  // Initialize: tag 0, feed_id[32], price i64, conf u64, expo i32 (53 bytes); feed and authority sign
+  const init = mockPythInitializeIx(feed, auth, 7_500_000_000n, 2_500_000n);
+  assert.ok(init.programId.equals(MOCK_PYTH_ID));
+  assert.strictEqual(init.data.length, 53);
+  assert.strictEqual(init.data[0], 0);
+  assert.deepStrictEqual(Array.from(init.data.subarray(1, 33)), OIL_FEED_ID);
+  assert.strictEqual(init.data.readBigInt64LE(33), 7_500_000_000n);
+  assert.strictEqual(init.data.readBigUInt64LE(41), 2_500_000n);
+  assert.strictEqual(init.data.readInt32LE(49), -8);
+  assert.deepStrictEqual(init.keys.map((k) => [k.isSigner, k.isWritable]), [[true, true], [true, false]]);
+  // SetPrice: tag 1, price, conf, expo, status (25 bytes); unchanged by D47
+  const set = mockPythSetPriceIx(feed, auth, 1n, 2n, 2);
+  assert.strictEqual(set.data.length, 25);
+  assert.deepStrictEqual([set.data[0], set.data.readUInt32LE(21)], [1, 2]);
+  // The market and the feed carry the production OIL feed id
+  assert.strictEqual(Buffer.from(MARKET_PARAMS.pythFeedId).toString("hex"), PYTH_FEED_IDS.OIL);
+  assert.strictEqual(PRICE_ACCOUNT_SIZE, 134);
+
+  const u = {
+    writeAuthority: auth.toBytes(),
+    feedId: Uint8Array.from(OIL_FEED_ID),
+    price: 7_512_345_678n,
+    conf: 2_500_099n,
+    exponent: -8,
+    publishTime: 1_795_604_400n,
+    prevPublishTime: 1_795_604_397n,
+    emaPrice: 7_512_345_678n,
+    emaConf: 2_500_099n,
+    postedSlot: 42n,
+  };
+  // 6 dp, truncated, as perps-core's normalize_pyth_price
+  assert.deepStrictEqual(decodeFeed(Buffer.from(writePriceUpdateV2(u))), {
+    price6: 75_123_456n, conf6: 25_000n, publishTime: 1_795_604_400, feedId: PYTH_FEED_IDS.OIL,
+  });
+  const partial = Buffer.from(writePriceUpdateV2(u));
+  partial[40] = 0;
+  assert.throws(() => decodeFeed(partial), /notFullyVerified/);
+  assert.throws(() => decodeFeed(Buffer.alloc(3_312)), /wrongDiscriminator/);
+  assert.throws(() => decodeFeed(Buffer.from(writePriceUpdateV2({ ...u, exponent: -6 }))), /exponent/);
 });
 
 console.log(`selftest: ${n} passed`);

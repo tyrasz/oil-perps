@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "programs/*",
     # Agent-based simulation driving the programs in-process (test tooling)
-    "sim"
+    "sim",
+    # TEST ONLY: solana-sdk paths for the integration tests
+    "test-sdk",
 ]
 # Backend is excluded due to dependency conflicts with Solana versions
 # Build backend separately with: cargo build -p oil-perps-api
@@ -13,11 +15,9 @@ exclude = [
     "backend/keeper"
 ]
 
-[workspace.dependencies]
-anchor-lang = "0.28.0"
-anchor-spl = "0.28.0"
-solana-program = "1.16"
-pyth-sdk-solana = "0.8"
+# No [workspace.dependencies]: scripts/build-sbf.sh builds each program from a
+# standalone copy of its own manifest, so versions are spelled out there
+# (Anchor 1.2.2 on the solana-v3 cohort; docs/lp-pool.md D48).
 
 [profile.release]
 # Fail loudly instead of silently wrapping on arithmetic overflow

@@ -40,8 +40,9 @@ pub struct PositionData {
     pub opened_price: u64,
 }
 
-/// Mirrors `Market` (Market::LEN = 298). `funding_carry_secs` sits at byte
-/// 283 and `settled_at` at 287 (with the discriminator).
+/// Mirrors `Market` (Market::LEN = 434; 431 bytes with the discriminator,
+/// then 3 bytes of padding). `funding_carry_secs` sits at byte 283,
+/// `settled_at` at 287 and the oracle fields (D47) at 295..431.
 #[derive(BorshDeserialize, BorshSerialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct MarketData {
     pub authority: Pubkey,
@@ -79,9 +80,23 @@ pub struct MarketData {
     /// Unix time `settle_market` ran; 0 = not settled, or settled before the
     /// field existed (D35).
     pub settled_at: i64,
+    /// Pyth feed id the `pyth_price_feed` update must carry (295, D47).
+    pub pyth_feed_id: [u8; 32],
+    /// Owner the `pyth_price_feed` account must have (327).
+    pub oracle_program: Pubkey,
+    /// Proposed feed rotation (`propose_oracle_feed`): the new account (359),
+    /// its feed id (391) and when `apply_oracle_feed` may run (423; 0 = none).
+    /// `read_price` uses neither until it is applied.
+    pub pending_price_feed: Pubkey,
+    pub pending_feed_id: [u8; 32],
+    pub pending_oracle_at: i64,
 }
 
 impl MarketData {
+    /// `Market::LEN`.
+    #[cfg(test)]
+    pub const LEN: usize = 434;
+
     pub fn is_settled(&self) -> bool {
         self.settlement_price > 0
     }
@@ -478,13 +493,55 @@ mod tests {
 
     #[test]
     fn market_offsets_of_the_appended_fields() {
-        // §16.3: funding_carry_secs at 283 and settled_at at 287, LEN 298
-        let m = MarketData { funding_carry_secs: 0xa1b2_c3d4, settled_at: -0x0102_0304_0506_0708, ..Default::default() };
+        // §16.3: funding_carry_secs at 283 and settled_at at 287; D47: the
+        // oracle fields at 295..431, then 3 bytes of padding (LEN 434)
+        let m = MarketData {
+            pyth_price_feed: Pubkey::new_from_array([0x0f; 32]),
+            long_open_interest: 0x1111_2222_3333_4444,
+            short_open_interest: 0x5555_6666_7777_8888,
+            funding_carry_secs: 0xa1b2_c3d4,
+            settled_at: -0x0102_0304_0506_0708,
+            pyth_feed_id: [0xf1; 32],
+            oracle_program: Pubkey::new_from_array([0xf2; 32]),
+            pending_price_feed: Pubkey::new_from_array([0xf3; 32]),
+            pending_feed_id: [0xf4; 32],
+            pending_oracle_at: -0x0a0b_0c0d_0e0f_1011,
+            ..Default::default()
+        };
         let mut b = vec![0u8; 8];
         b.extend(borsh::to_vec(&m).unwrap());
+        // Unchanged offsets the SDK, frontend and getProgramAccounts filters use
+        assert_eq!(&b[104..136], &[0x0f; 32]);
+        assert_eq!(u64::from_le_bytes(b[168..176].try_into().unwrap()), 0x1111_2222_3333_4444);
+        assert_eq!(u64::from_le_bytes(b[176..184].try_into().unwrap()), 0x5555_6666_7777_8888);
         assert_eq!(u32::from_le_bytes(b[283..287].try_into().unwrap()), 0xa1b2_c3d4);
         assert_eq!(i64::from_le_bytes(b[287..295].try_into().unwrap()), -0x0102_0304_0506_0708);
-        assert_eq!(b.len() + 3, 298);
+        assert_eq!(&b[295..327], &[0xf1; 32]);
+        assert_eq!(&b[327..359], &[0xf2; 32]);
+        assert_eq!(&b[359..391], &[0xf3; 32]);
+        assert_eq!(&b[391..423], &[0xf4; 32]);
+        assert_eq!(i64::from_le_bytes(b[423..431].try_into().unwrap()), -0x0a0b_0c0d_0e0f_1011);
+        assert_eq!(b.len() + 3, MarketData::LEN);
+        // A whole account (with its padding) decodes back to the same market
+        b.extend([0u8; 3]);
+        let program = Pubkey::new_unique();
+        b[..8].copy_from_slice(&anchor_discriminator("account", "Market"));
+        assert_eq!(decode_account::<MarketData>(&program, &b, &program, "Market"), Some(m));
+    }
+
+    /// perps-core's `Market::LEN` sum (state/market.rs) is the mirror's.
+    #[test]
+    fn market_len_matches_the_program() {
+        let src = include_str!("../../../programs/perps-core/src/state/market.rs");
+        let start = src.find("pub const LEN: usize = ").unwrap();
+        let end = start + src[start..].find(';').unwrap();
+        let len: usize = src[start + "pub const LEN: usize = ".len()..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap().trim().trim_end_matches('+').trim())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.parse::<usize>().unwrap())
+            .sum();
+        assert_eq!(len, MarketData::LEN);
     }
 
     #[test]

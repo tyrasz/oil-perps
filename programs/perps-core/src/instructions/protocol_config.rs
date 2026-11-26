@@ -44,7 +44,7 @@ pub fn initialize_config(ctx: Context<InitializeConfig>, params: ProtocolRolesPa
     config.pending_admin = Pubkey::default();
     config.guardian = params.guardian;
     config.oracle_program = params.oracle_program;
-    config.bump = *ctx.bumps.get("config").unwrap();
+    config.bump = ctx.bumps.config;
     msg!("Protocol config: admin={}, guardian={}, oracle_program={}", config.admin, config.guardian, config.oracle_program);
     Ok(())
 }

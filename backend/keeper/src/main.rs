@@ -1,6 +1,6 @@
 use solana_client::rpc_client::RpcClient;
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
@@ -12,13 +12,14 @@ mod funding;
 mod ix;
 mod liquidator;
 mod mirror;
+mod oracle;
 mod settle;
 mod state;
 #[cfg(test)]
 mod testkit;
 // Compiled from the program's sources so the keeper makes the same decisions.
-// All three are dependency-free (docs/lp-pool.md §2.7, D29). They build with
-// Rust 1.75 on-chain, so newer clippy lints are allowed here.
+// All four are dependency-free (docs/lp-pool.md §2.7, D29, D47). They build
+// with the platform-tools' Rust on-chain, so newer clippy lints are allowed here.
 #[allow(dead_code, clippy::unnecessary_map_or)]
 #[path = "../../../programs/perps-core/src/session.rs"]
 mod session;
@@ -28,6 +29,11 @@ mod price;
 #[allow(dead_code, clippy::manual_is_multiple_of)]
 #[path = "../../../programs/perps-core/src/pool_math.rs"]
 mod pool_math;
+// perps-core's Pyth Solana Receiver `PriceUpdateV2` reader (D47); `oracle`
+// applies the checks of perps-core's `oracle::read_price` with it.
+#[allow(dead_code)]
+#[path = "../../../programs/perps-core/src/pyth_receiver.rs"]
+mod pyth_receiver;
 
 // Program configuration
 pub struct KeeperConfig {
@@ -176,7 +182,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn load_keypair(path: &str) -> Result<Keypair, Box<dyn std::error::Error>> {
     let keypair_data = std::fs::read_to_string(path)?;
     let bytes: Vec<u8> = serde_json::from_str(&keypair_data)?;
-    Ok(Keypair::from_bytes(&bytes)?)
+    // solana-keypair 3 also checks the public half against the secret key.
+    Ok(Keypair::try_from(bytes.as_slice())?)
 }
 
 // Helpers to derive PDAs (must match the seeds in programs/perps-core)

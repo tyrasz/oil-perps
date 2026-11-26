@@ -4,7 +4,7 @@ import { PublicKey, type Connection } from '@solana/web3.js';
 import { useMarketStore, COMMODITIES, DEFAULT_COMMODITY } from '../stores/marketStore';
 import { ORACLE_SOURCE } from '../config/program';
 import { getCommodityMarket } from '../utils/pda';
-import { decodeMarketOpenInterest, decodeOraclePrice, MARKET_PYTH_PRICE_FEED_OFFSET } from '../utils/oracleAccount';
+import { decodeMarketOpenInterest, marketOraclePrice, MARKET_PYTH_PRICE_FEED_OFFSET } from '../utils/oracleAccount';
 import type { CommodityConfig } from '../config/commodities';
 import type { Trade } from '../types';
 
@@ -33,7 +33,7 @@ async function fetchChainMarket(connection: Connection, commodity: CommodityConf
   if (!info || info.data.length < MARKET_PYTH_PRICE_FEED_OFFSET + 32) return null;
   const feed = new PublicKey(info.data.subarray(MARKET_PYTH_PRICE_FEED_OFFSET, MARKET_PYTH_PRICE_FEED_OFFSET + 32));
   const feedInfo = await connection.getAccountInfo(feed);
-  const oracle = feedInfo ? decodeOraclePrice(feedInfo.data) : null;
+  const oracle = feedInfo ? marketOraclePrice(info.data, feedInfo.data, feedInfo.owner.toBytes()) : null;
   if (!oracle) return null;
   const first = firstPrice.get(commodity.id) ?? oracle.price;
   firstPrice.set(commodity.id, first);

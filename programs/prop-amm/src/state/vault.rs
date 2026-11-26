@@ -42,6 +42,14 @@ pub struct LpVault {
 
     pub bump: u8,
     pub is_active: bool,
+
+    /// Pyth feed id `pyth_price_feed` must carry (docs/lp-pool.md D47)
+    pub pyth_feed_id: [u8; 32],
+    /// The program that must own `pyth_price_feed`: `config.oracle_program`
+    /// when the vault was created (D52). A later `set_oracle_program` reaches
+    /// new vaults only; a vault has no feed rotation, so it stays bound to
+    /// this owner and this account for good.
+    pub oracle_program: Pubkey,
 }
 
 impl LpVault {
@@ -70,7 +78,9 @@ impl LpVault {
         8 +   // withdrawal_delay
         1 +   // bump
         1 +   // is_active
-        64;   // padding
+        32 +  // pyth_feed_id
+        32 +  // oracle_program
+        32;   // padding
 
     /// Calculate current spread based on exposure skew
     pub fn calculate_spread(&self, is_long: bool) -> u32 {
@@ -216,5 +226,28 @@ impl LpVault {
         self.total_assets += lp_fee;
         self.cumulative_fees += fee;
         self.cumulative_pnl += vault_pnl;
+    }
+}
+
+#[cfg(test)]
+mod account_size {
+    use super::*;
+
+    /// LEN = discriminator + the Borsh fields + 32 bytes of padding, and the
+    /// D47/D52 fields at fixed offsets (D52).
+    #[test]
+    fn len_matches_the_serialized_fields() {
+        let v = LpVault::default();
+        let fields = anchor_lang::prelude::borsh::to_vec(&v).unwrap().len();
+        assert_eq!(8 + fields + 32, LpVault::LEN);
+        assert_eq!(LpVault::LEN, 382);
+
+        let feed_id = [0xa5u8; 32];
+        let oracle_program = Pubkey::new_from_array([0x5a; 32]);
+        let mut data = Vec::new();
+        LpVault { pyth_feed_id: feed_id, oracle_program, ..Default::default() }.try_serialize(&mut data).unwrap();
+        assert_eq!(data.len(), LpVault::LEN - 32);
+        assert_eq!(&data[286..318], &feed_id);
+        assert_eq!(&data[318..350], oracle_program.as_ref());
     }
 }

@@ -12,7 +12,8 @@ import {
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
 } from "@solana/spl-token";
-import { Program, AnchorProvider, BN } from "@coral-xyz/anchor";
+import { Program, AnchorProvider, BN } from "@anchor-lang/core";
+import type { MmRegistry as MmRegistryIdl } from "./idl/mm_registry";
 import {
   MmRegistry,
   MarketMaker,
@@ -51,6 +52,7 @@ import {
   decodeLpPool,
   MARKET_FUNDING_CARRY_SECS,
   MARKET_SETTLED_AT,
+  decodeMarketOracleFields,
 } from "./perpsPool";
 import {
   FILL_COMPUTE_UNITS,
@@ -85,7 +87,12 @@ const VENUE_ENABLED = 165;
 
 /** The perps-core Market fields a fill needs */
 export interface PerpsMarketInfo {
+  /** The pinned price feed account every fill must pass (D47) */
   pythPriceFeed: PublicKey;
+  /** The Pyth feed id the feed must carry (32 bytes, D47) */
+  pythFeedId: Buffer;
+  /** The program that must own the feed (snapshot of ProtocolConfig.oracle_program, D47) */
+  oracleProgram: PublicKey;
   maxLeverage: number;
   initialMarginBps: number;
   /** 0 = same as initialMarginBps */
@@ -147,7 +154,10 @@ function encodeVenueApprovalParams(params: VenueApprovalParams): Buffer {
 export class MmRegistryClient {
   readonly connection: Connection;
   readonly programId: PublicKey;
-  private program: Program | null = null;
+  // Built by the caller from mm-registry's IDL (MM_REGISTRY_IDL, the
+  // committed copy in ./idl; @anchor-lang/core takes the program id from the
+  // IDL's `address`)
+  private program: Program<MmRegistryIdl> | null = null;
 
   constructor(
     connection: Connection,
@@ -160,7 +170,7 @@ export class MmRegistryClient {
   /**
    * Set the Anchor program instance (required for instruction building)
    */
-  setProgram(program: Program): void {
+  setProgram(program: Program<MmRegistryIdl>): void {
     this.program = program;
   }
 
@@ -710,8 +720,11 @@ export class MmRegistryClient {
     const info = await this.connection.getAccountInfo(market);
     if (!info) throw new Error("perps-core market not found");
     const d = info.data;
+    const oracle = decodeMarketOracleFields(d);
     return {
       pythPriceFeed: new PublicKey(d.subarray(MARKET_PYTH_PRICE_FEED, MARKET_PYTH_PRICE_FEED + 32)),
+      pythFeedId: oracle.pythFeedId,
+      oracleProgram: oracle.oracleProgram,
       maxLeverage: d.readUInt32LE(MARKET_MAX_LEVERAGE),
       initialMarginBps: d.readUInt32LE(MARKET_INITIAL_MARGIN_RATIO),
       weekendInitialMarginBps: d.readUInt32LE(MARKET_WEEKEND_INITIAL_MARGIN_RATIO),

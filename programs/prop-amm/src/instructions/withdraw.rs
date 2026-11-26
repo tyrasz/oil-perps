@@ -78,7 +78,7 @@ pub fn handler(ctx: Context<Withdraw>, shares_to_burn: u64) -> Result<()> {
         to: ctx.accounts.owner_token_account.to_account_info(),
         authority: ctx.accounts.vault.to_account_info(),
     };
-    let cpi_program = ctx.accounts.token_program.to_account_info();
+    let cpi_program = ctx.accounts.token_program.key();
     let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
     token::transfer(cpi_ctx, assets_to_return)?;
 

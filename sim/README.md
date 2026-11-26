@@ -33,6 +33,18 @@ scripts/build-sbf.sh                                              # then, on SBF
 SBF_OUT_DIR=$PWD/target/deploy cargo run -p sim --release -- --scenario stress --seed 1 --report out.json
 ```
 
+It is built on the programs' test stack (docs/lp-pool.md D48): Anchor 1.2.2,
+solana-program-test 4.4.1 and `test-sdk/` as `solana-sdk`, on host Rust
+1.98.1 (`cargo +1.98.1 ...`). A native run differs from an SBF run only in
+what the programs can log: they reach program-test's clock and CPI through
+test-sdk's forwarding stubs (installed before the market is set up), and an
+Anchor 1.2 program run natively logs no `msg!` lines (solana-msg prints them
+to stdout instead) and no mm-registry or orderbook events. perps-core's
+events still reach the log (`emit_event!`), and a failure's error name is
+read from the failing program's `#[error_code]` enum instead of the log
+(`chain.rs`), so the predictions are checked the same way; compute units are
+meaningless natively.
+
 Options: `--scenario normal|stress|adversarial`, `--seed N`, `--days D` (default 5),
 `--tick-secs S` (default 300), `--report path.json`, `--lenient-solvency`
 (`--strict-solvency`, the default, is accepted and does nothing).

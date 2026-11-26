@@ -106,7 +106,7 @@ pub struct SettlePositionPnl<'info> {
 
     /// CHECK: Pyth price feed, validated by read_price (unused once settled)
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
-    pub pyth_price_feed: AccountInfo<'info>,
+    pub pyth_price_feed: UncheckedAccount<'info>,
 }
 
 /// Move a losing position's unrealized loss (incl. funding) into pool cash
@@ -141,7 +141,7 @@ pub fn settle_position_pnl(ctx: Context<SettlePositionPnl>) -> Result<()> {
     let a = &mut *ctx.accounts;
     let mark = mark_price(&a.market, &a.pyth_price_feed, now)?;
     let loss = settle_pnl(&a.market, &mut a.lp_pool, &mut a.position, mark, now)?;
-    emit!(PositionPnlSettled { position: key, mark, loss, new_collateral: a.position.collateral });
+    emit_event!(PositionPnlSettled { position: key, mark, loss, new_collateral: a.position.collateral });
     Ok(())
 }
 
@@ -187,7 +187,7 @@ pub struct AdlPosition<'info> {
 
     /// CHECK: Pyth price feed, validated by read_price (unused once settled)
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
-    pub pyth_price_feed: AccountInfo<'info>,
+    pub pyth_price_feed: UncheckedAccount<'info>,
 }
 
 /// Everything an ADL checked before it applied anything.
@@ -405,7 +405,7 @@ pub fn adl(ctx: Context<AdlPosition>, mode: u8, size: u64) -> Result<()> {
         require!(exposure_stop_ok(v.net, &after, plan.target), PerpsError::AdlOvershoot);
     }
 
-    emit!(Adl {
+    emit_event!(Adl {
         mode,
         position: key,
         owner: a.position.owner,
@@ -453,7 +453,7 @@ pub fn write_off_bad_debt(ctx: Context<WriteOffBadDebt>) -> Result<()> {
     require!(pool.adl_required(), PerpsError::AdlNotRequired);
     let w = write_off_stale(m, pool, now);
     require!(w > 0, PerpsError::BadDebtNotStale);
-    emit!(BadDebtWrittenOff { amount: w });
+    emit_event!(BadDebtWrittenOff { amount: w });
     Ok(())
 }
 

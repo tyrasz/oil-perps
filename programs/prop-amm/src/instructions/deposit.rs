@@ -60,7 +60,7 @@ pub fn handler(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         to: ctx.accounts.vault_token_account.to_account_info(),
         authority: ctx.accounts.depositor.to_account_info(),
     };
-    let cpi_program = ctx.accounts.token_program.to_account_info();
+    let cpi_program = ctx.accounts.token_program.key();
     let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
     token::transfer(cpi_ctx, amount)?;
 
@@ -74,7 +74,7 @@ pub fn handler(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         lp_position.owner = ctx.accounts.depositor.key();
         lp_position.vault = vault.key();
         lp_position.deposited_at = current_time;
-        lp_position.bump = *ctx.bumps.get("lp_position").unwrap();
+        lp_position.bump = ctx.bumps.lp_position;
     }
 
     lp_position.shares += shares_to_mint;

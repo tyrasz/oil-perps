@@ -52,4 +52,11 @@ pub enum PropAmmError {
 
     #[msg("Price feed is not owned by the configured oracle program")]
     InvalidOracleAccount,
+
+    // Pyth PriceUpdateV2 oracle (docs/lp-pool.md D47)
+    #[msg("Oracle price update is not fully verified")]
+    OracleNotFullyVerified,
+
+    #[msg("Oracle price update is for another feed id")]
+    OracleFeedIdMismatch,
 }

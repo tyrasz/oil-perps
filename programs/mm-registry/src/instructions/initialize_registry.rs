@@ -74,7 +74,7 @@ pub fn handler(ctx: Context<InitializeRegistry>, params: InitializeRegistryParam
     registry.is_open = true;
     registry.is_trading_enabled = true;
 
-    registry.bump = *ctx.bumps.get("registry").unwrap();
+    registry.bump = ctx.bumps.registry;
 
     msg!(
         "MM Registry initialized: min_collateral={}, max_spread={}bps",

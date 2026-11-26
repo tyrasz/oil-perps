@@ -9,6 +9,8 @@ export interface LpPoolData {
   poolAddress: PublicKey;
   /** The market's collateral mint (USDC). */
   marketCollateralMint: PublicKey;
+  /** The price feed account the market pins (Market.pyth_price_feed): every price-reading instruction must pass it. */
+  priceFeed: PublicKey;
   market: MarketState;
   /** null when the market has no pool (not initialised, or a pre-pool deployment). */
   pool: LpPoolAccount | null;
@@ -42,6 +44,7 @@ export function useLpPool(commodityId: string, refreshMs = 15_000) {
         marketAddress,
         poolAddress,
         marketCollateralMint: (rawMarket as { collateralMint: PublicKey }).collateralMint,
+        priceFeed: (rawMarket as { pythPriceFeed: PublicKey }).pythPriceFeed,
         market: decodeMarket(rawMarket as Record<string, unknown>),
         pool: rawPool ? decodeLpPool(rawPool as Record<string, unknown>) : null,
       });

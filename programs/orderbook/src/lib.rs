@@ -102,7 +102,7 @@ pub mod orderbook {
         orderbook.total_bids = 0;
         orderbook.total_asks = 0;
         orderbook.sequence_number = 0;
-        orderbook.bump = *ctx.bumps.get("orderbook").unwrap();
+        orderbook.bump = ctx.bumps.orderbook;
         orderbook.matcher = Pubkey::default();
         Ok(())
     }
@@ -129,7 +129,7 @@ pub mod orderbook {
             .ok_or(ErrorCode::InvalidOrderParams)?;
         system_program::transfer(
             CpiContext::new(
-                ctx.accounts.system_program.to_account_info(),
+                ctx.accounts.system_program.key(),
                 system_program::Transfer {
                     from: ctx.accounts.owner.to_account_info(),
                     to: ctx.accounts.order.to_account_info(),
@@ -151,7 +151,7 @@ pub mod orderbook {
         order.created_at = current_time;
         order.expires_at = p.expires_at;
         order.sequence_number = orderbook.sequence_number;
-        order.bump = *ctx.bumps.get("order").unwrap();
+        order.bump = ctx.bumps.order;
         order.leverage = p.leverage;
         order.max_fills = p.max_fills;
         order.fills = 0;
@@ -261,7 +261,7 @@ pub mod orderbook {
             position_nonce,
         };
         let price = params.price;
-        cpi_venue_fill(a, taker_is_bid, *ctx.bumps.get("venue_authority").unwrap(), params)?;
+        cpi_venue_fill(a, taker_is_bid, ctx.bumps.venue_authority, params)?;
 
         let rent = Rent::get()?;
         let position_rent = rent.minimum_balance(Position::LEN);
@@ -322,7 +322,7 @@ fn cpi_venue_fill<'info>(a: &MatchOrders<'info>, taker_is_bid: bool, bump: u8, p
         lp_pool: a.perps_lp_pool.to_account_info(),
     };
     perps_core::cpi::venue_fill(
-        CpiContext::new_with_signer(a.perps_core_program.to_account_info(), accounts, &[seeds]),
+        CpiContext::new_with_signer(a.perps_core_program.key(), accounts, &[seeds]),
         params,
     )
 }
@@ -626,7 +626,7 @@ mod tests {
             total_asks: 0, sequence_number: 0, bump: 0, matcher: Pubkey::default(),
         };
         assert_eq!(OrderBook::LEN, 145);
-        assert_eq!(8 + book.try_to_vec().unwrap().len(), OrderBook::LEN);
+        assert_eq!(8 + anchor_lang::prelude::borsh::to_vec(&book).unwrap().len(), OrderBook::LEN);
 
         let order = Order {
             owner: Pubkey::default(), market: Pubkey::default(), side: OrderSide::Bid, order_type: OrderType::Limit,
@@ -634,6 +634,6 @@ mod tests {
             sequence_number: 0, bump: 0, leverage: 0, max_fills: 0, fills: 0, min_fill_size: 0,
         };
         assert_eq!(Order::LEN, 156);
-        assert_eq!(8 + order.try_to_vec().unwrap().len() + 18, Order::LEN);
+        assert_eq!(8 + anchor_lang::prelude::borsh::to_vec(&order).unwrap().len() + 18, Order::LEN);
     }
 }

@@ -49,7 +49,7 @@ pub fn handler(ctx: Context<DepositCollateral>, amount: u64) -> Result<()> {
         to: ctx.accounts.mm_collateral_account.to_account_info(),
         authority: ctx.accounts.owner.to_account_info(),
     };
-    let cpi_program = ctx.accounts.token_program.to_account_info();
+    let cpi_program = ctx.accounts.token_program.key();
     let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
     token::transfer(cpi_ctx, amount)?;
 

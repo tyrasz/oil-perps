@@ -5,14 +5,18 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-solana-sdk = "1.17"
-solana-client = "1.17"
-solana-account-decoder = "1.17"
-anchor-client = "0.29.0"
-anchor-lang = "0.29.0"
-spl-token = "4.0"
-spl-associated-token-account = "2.2"
-pyth-sdk-solana = "0.10"
+# The Anchor 1.2.2 / solana-v3 cohort of the programs (docs/lp-pool.md D48):
+# Agave 3.1 client crates, solana-sdk 3 and the SPL interface crates all share
+# solana-pubkey 3, so their `Pubkey`s are one type. The JSON-RPC wire format
+# is unchanged, so this client talks to the Agave 4.4.1 test validator.
+solana-sdk = "3.0.0"
+solana-client = "3.1.14"
+solana-account-decoder = "3.1.14"
+solana-commitment-config = "3.1.1"
+anchor-client = "=1.2.2"
+anchor-lang = "=1.2.2"
+spl-token = { package = "spl-token-interface", version = "2.0.0" }
+spl-associated-token-account = { package = "spl-associated-token-account-interface", version = "2.0.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
@@ -20,7 +24,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 shellexpand = "3.1"
-borsh = "0.10"
+borsh = { version = "1", features = ["derive"] }
 bs58 = "0.5"
 
 # The #[path]-included perps-core session.rs gates the localnet test schedule

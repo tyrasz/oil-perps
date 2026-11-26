@@ -297,11 +297,11 @@ mod tests {
     #[test]
     fn account_sizes_are_pinned() {
         assert_eq!(Position::LEN, 168);
-        let serialized = Position::default().try_to_vec().unwrap().len();
+        let serialized = anchor_lang::prelude::borsh::to_vec(&Position::default()).unwrap().len();
         assert_eq!(8 + serialized + 24, Position::LEN);
-        assert_eq!(ExecutionSource::Venue.try_to_vec().unwrap(), vec![2]);
+        assert_eq!(anchor_lang::prelude::borsh::to_vec(&ExecutionSource::Venue).unwrap(), vec![2]);
         assert_eq!(UserAccount::LEN, 85);
-        assert_eq!(8 + UserAccount::default().try_to_vec().unwrap().len() + 8, UserAccount::LEN);
+        assert_eq!(8 + anchor_lang::prelude::borsh::to_vec(&UserAccount::default()).unwrap().len() + 8, UserAccount::LEN);
     }
 
     /// docs/lp-pool.md §1.1: appended fields, existing offsets unchanged.

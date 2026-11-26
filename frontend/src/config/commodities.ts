@@ -1,12 +1,14 @@
 // Commodity configuration for multi-commodity trading support
 // Each commodity has a unique identifier, display properties, and market parameters
+import { PYTH_FEED_IDS } from './pythFeeds';
 
 export interface CommodityConfig {
   id: string;                    // Unique identifier (e.g., 'OIL', 'GOLD', 'SILVER')
   symbol: string;                // Trading symbol (e.g., 'OIL-PERP')
   name: string;                  // Full name (e.g., 'Crude Oil')
   icon: string;                  // Emoji or icon identifier
-  pythPriceFeed: string;         // Pyth Network price feed address
+  /** Pyth Core feed id (hex); null = no verified feed id yet (the market cannot launch). The account is derived from it (config/program.ts). */
+  pythFeedId: string | null;
   basePrice: number;             // Reference base price for mock data
   decimals: number;              // Price decimals
   contractUnit: string;          // Unit per contract (e.g., 'barrel', 'oz')
@@ -16,15 +18,9 @@ export interface CommodityConfig {
   color: string;                 // Brand color for UI
 }
 
-// Pyth Price Feed IDs (Devnet)
-// https://pyth.network/developers/price-feed-ids
-const PYTH_FEEDS = {
-  OIL: 'GVXRSBjFk6e6J3NbVPXohDJetcTjaeeuykUpbQF8UoMU',      // WTI Crude Oil
-  GOLD: 'sXgHcPCNsXM8KaC3CXNXQS8qprLR4dVxQyJyxNmBsLR',     // Gold
-  SILVER: '77JipqJaP9LPFyEGjT2zqz5qxL6KBx3nVtbMd1PPdPr9',  // Silver
-  NATGAS: 'DBE3N8uNjhKPNAR4oJT8vKwZQN5yDsRXGBCQu4k3Gfgr',  // Natural Gas
-  COPPER: '4wxQsP2B7HNyH4sH3n2J1oKeW6vPExU6mBLgPswN8pqZ',  // Copper
-};
+// Pyth Core feed ids (docs/lp-pool.md D47, D50): one table for the frontend,
+// the deploy scripts and the localnet harness (config/pythFeeds.ts)
+const PYTH_FEEDS = PYTH_FEED_IDS;
 
 export const COMMODITIES: CommodityConfig[] = [
   {
@@ -32,7 +28,7 @@ export const COMMODITIES: CommodityConfig[] = [
     symbol: 'OIL-PERP',
     name: 'Crude Oil',
     icon: '⛽',
-    pythPriceFeed: PYTH_FEEDS.OIL,
+    pythFeedId: PYTH_FEEDS.OIL,
     basePrice: 75,
     decimals: 2,
     contractUnit: 'barrel',
@@ -46,7 +42,7 @@ export const COMMODITIES: CommodityConfig[] = [
     symbol: 'GOLD-PERP',
     name: 'Gold',
     icon: '🥇',
-    pythPriceFeed: PYTH_FEEDS.GOLD,
+    pythFeedId: PYTH_FEEDS.GOLD,
     basePrice: 2000,
     decimals: 2,
     contractUnit: 'oz',
@@ -60,7 +56,7 @@ export const COMMODITIES: CommodityConfig[] = [
     symbol: 'SILVER-PERP',
     name: 'Silver',
     icon: '🥈',
-    pythPriceFeed: PYTH_FEEDS.SILVER,
+    pythFeedId: PYTH_FEEDS.SILVER,
     basePrice: 24,
     decimals: 3,
     contractUnit: 'oz',
@@ -74,7 +70,7 @@ export const COMMODITIES: CommodityConfig[] = [
     symbol: 'NATGAS-PERP',
     name: 'Natural Gas',
     icon: '🔥',
-    pythPriceFeed: PYTH_FEEDS.NATGAS,
+    pythFeedId: PYTH_FEEDS.NATGAS,
     basePrice: 2.5,
     decimals: 3,
     contractUnit: 'MMBtu',
@@ -88,7 +84,7 @@ export const COMMODITIES: CommodityConfig[] = [
     symbol: 'COPPER-PERP',
     name: 'Copper',
     icon: '🔶',
-    pythPriceFeed: PYTH_FEEDS.COPPER,
+    pythFeedId: PYTH_FEEDS.COPPER,
     basePrice: 4.2,
     decimals: 4,
     contractUnit: 'lb',

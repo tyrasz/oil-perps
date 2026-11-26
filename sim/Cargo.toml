@@ -13,13 +13,20 @@ path = "src/main.rs"
 perps-core = { path = "../programs/perps-core", features = ["cpi"] }
 mm-registry = { path = "../programs/mm-registry", features = ["cpi"] }
 orderbook = { path = "../programs/orderbook", features = ["cpi"] }
-anchor-lang = "0.28.0"
-# What the shared harness (programs/perps-core/tests/support/market_env.rs) needs
-solana-program-test = "~1.16"
-solana-sdk = "~1.16"
-spl-token = { version = "3.5", features = ["no-entrypoint"] }
-pyth-sdk-solana = "0.8"
-bytemuck = "1"
+anchor-lang = "=1.2.2"
+# What the shared harness (programs/perps-core/tests/support/market_env.rs)
+# needs: the same test stack as the programs' integration tests (D48)
+# Agave 4.x gates the crate behind `agave-unstable-api`
+solana-program-test = { version = "=4.4.1", features = ["agave-unstable-api"] }
+# solana-sdk paths without solana-sdk itself: solana-sdk 5.0 breaks
+# solana-runtime 4.4.1 in this graph (test-sdk/Cargo.toml says why)
+solana-sdk = { package = "oil-test-sdk", path = "../test-sdk" }
+# The two types chain.rs names that test-sdk does not re-export (the versions
+# solana-transaction 5 and solana-banks-client 4.4 use)
+solana-hash = "4"
+solana-signature = "3"
+# spl-token 3.5 no longer builds on these crates; same instructions and state
+spl-token = { package = "spl-token-interface", version = "2" }
 bincode = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # Reproducible runs and the JSON report

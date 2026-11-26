@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn two_sided_quote_len_is_unchanged() {
         // `leverage` came out of the padding, so existing accounts need no realloc
-        let serialized = TwoSidedQuote::default().try_to_vec().unwrap().len();
+        let serialized = anchor_lang::prelude::borsh::to_vec(&TwoSidedQuote::default()).unwrap().len();
         assert_eq!(TwoSidedQuote::LEN, 194);
         assert_eq!(TwoSidedQuote::LEN, 8 + serialized + 28);
     }

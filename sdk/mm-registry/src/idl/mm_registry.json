@@ -1,0 +1,1471 @@
+{
+  "address": "MMReg11111111111111111111111111111111111111",
+  "metadata": {
+    "name": "mm_registry",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Market Maker Registry for permissionless liquidity provision"
+  },
+  "instructions": [
+    {
+      "name": "cancel_quote",
+      "docs": [
+        "Cancel a quote"
+      ],
+      "discriminator": [
+        41,
+        51,
+        237,
+        236,
+        153,
+        159,
+        210,
+        185
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "registry",
+          "writable": true
+        },
+        {
+          "name": "market_maker",
+          "writable": true
+        },
+        {
+          "name": "quote",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "deposit_collateral",
+      "docs": [
+        "Deposit additional collateral"
+      ],
+      "discriminator": [
+        156,
+        131,
+        142,
+        116,
+        146,
+        247,
+        162,
+        120
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "registry"
+        },
+        {
+          "name": "market_maker",
+          "writable": true
+        },
+        {
+          "name": "mm_collateral_account",
+          "writable": true
+        },
+        {
+          "name": "owner_token_account",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "deregister_mm",
+      "docs": [
+        "Deregister as a Market Maker"
+      ],
+      "discriminator": [
+        151,
+        175,
+        138,
+        184,
+        217,
+        152,
+        207,
+        250
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "registry",
+          "writable": true
+        },
+        {
+          "name": "market_maker",
+          "writable": true
+        },
+        {
+          "name": "mm_collateral_account",
+          "writable": true
+        },
+        {
+          "name": "owner_token_account",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "fill_quote",
+      "docs": [
+        "Fill a quote (called by order router or traders)"
+      ],
+      "discriminator": [
+        12,
+        116,
+        225,
+        132,
+        142,
+        74,
+        167,
+        253
+      ],
+      "accounts": [
+        {
+          "name": "taker",
+          "docs": [
+            "Also perps-core's payer: being in a Signer slot of the CPI is what makes",
+            "the taker count towards the venue's `min_signers` (Anchor's CPI passes",
+            "the UncheckedAccount `taker` slot as a non-signer)."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "registry",
+          "writable": true
+        },
+        {
+          "name": "market_maker",
+          "writable": true
+        },
+        {
+          "name": "quote",
+          "writable": true
+        },
+        {
+          "name": "mm_owner"
+        },
+        {
+          "name": "venue_authority"
+        },
+        {
+          "name": "perps_config"
+        },
+        {
+          "name": "perps_venue",
+          "writable": true
+        },
+        {
+          "name": "venue_program_data"
+        },
+        {
+          "name": "market",
+          "docs": [
+            "Never a typed Account here: the CPI mutates it."
+          ],
+          "writable": true
+        },
+        {
+          "name": "pyth_price_feed"
+        },
+        {
+          "name": "taker_user",
+          "writable": true
+        },
+        {
+          "name": "taker_approval",
+          "writable": true
+        },
+        {
+          "name": "taker_position",
+          "writable": true
+        },
+        {
+          "name": "mm_user",
+          "writable": true
+        },
+        {
+          "name": "mm_approval",
+          "writable": true
+        },
+        {
+          "name": "mm_position",
+          "writable": true
+        },
+        {
+          "name": "perps_lp_pool",
+          "writable": true
+        },
+        {
+          "name": "perps_core_program"
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "FillQuoteParams"
+            }
+          }
+        }
+      ],
+      "returns": {
+        "defined": {
+          "name": "FillQuoteResult"
+        }
+      }
+    },
+    {
+      "name": "initialize_registry",
+      "docs": [
+        "Initialize the Market Maker Registry"
+      ],
+      "discriminator": [
+        189,
+        181,
+        20,
+        17,
+        174,
+        57,
+        249,
+        59
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "Must be the perps-core admin: the registry PDA is one per market, so a",
+            "permissionless init would let anyone claim it with their own mint/fees."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config"
+        },
+        {
+          "name": "registry",
+          "writable": true
+        },
+        {
+          "name": "market",
+          "docs": [
+            "The perps-core market this registry serves (owner checked by Account)"
+          ]
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "InitializeRegistryParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "post_quote",
+      "docs": [
+        "Post a two-sided quote (bid and ask)"
+      ],
+      "discriminator": [
+        68,
+        231,
+        88,
+        224,
+        13,
+        116,
+        27,
+        84
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "registry",
+          "writable": true
+        },
+        {
+          "name": "market_maker",
+          "writable": true
+        },
+        {
+          "name": "quote",
+          "writable": true
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "PostQuoteParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "register_mm",
+      "docs": [
+        "Register as a Market Maker"
+      ],
+      "discriminator": [
+        76,
+        114,
+        159,
+        23,
+        18,
+        109,
+        33,
+        5
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "registry",
+          "writable": true
+        },
+        {
+          "name": "market_maker",
+          "writable": true
+        },
+        {
+          "name": "mm_collateral_account",
+          "writable": true
+        },
+        {
+          "name": "owner_token_account",
+          "writable": true
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "rent"
+        }
+      ],
+      "args": [
+        {
+          "name": "initial_collateral",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "update_quote",
+      "docs": [
+        "Update an existing quote"
+      ],
+      "discriminator": [
+        235,
+        69,
+        162,
+        233,
+        147,
+        53,
+        42,
+        225
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "registry"
+        },
+        {
+          "name": "market_maker",
+          "writable": true
+        },
+        {
+          "name": "quote",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "UpdateQuoteParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "withdraw_collateral",
+      "docs": [
+        "Withdraw available collateral"
+      ],
+      "discriminator": [
+        115,
+        135,
+        168,
+        106,
+        139,
+        214,
+        138,
+        150
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "registry"
+        },
+        {
+          "name": "market_maker",
+          "writable": true
+        },
+        {
+          "name": "mm_collateral_account",
+          "writable": true
+        },
+        {
+          "name": "owner_token_account",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "MarketMaker",
+      "discriminator": [
+        151,
+        123,
+        40,
+        58,
+        68,
+        211,
+        104,
+        56
+      ]
+    },
+    {
+      "name": "MmRegistry",
+      "discriminator": [
+        205,
+        77,
+        231,
+        124,
+        181,
+        116,
+        50,
+        250
+      ]
+    },
+    {
+      "name": "TwoSidedQuote",
+      "discriminator": [
+        106,
+        93,
+        221,
+        190,
+        77,
+        6,
+        44,
+        17
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "RegistryClosed",
+      "msg": "Registry is not open for new registrations"
+    },
+    {
+      "code": 6001,
+      "name": "TradingDisabled",
+      "msg": "Trading is not enabled"
+    },
+    {
+      "code": 6002,
+      "name": "InsufficientCollateral",
+      "msg": "Insufficient collateral"
+    },
+    {
+      "code": 6003,
+      "name": "MarketMakerNotActive",
+      "msg": "Market maker is not active"
+    },
+    {
+      "code": 6004,
+      "name": "MarketMakerSuspended",
+      "msg": "Market maker is suspended"
+    },
+    {
+      "code": 6005,
+      "name": "MaxQuotesReached",
+      "msg": "Maximum quotes reached"
+    },
+    {
+      "code": 6006,
+      "name": "QuoteSizeTooSmall",
+      "msg": "Quote size below minimum"
+    },
+    {
+      "code": 6007,
+      "name": "QuoteSizeTooLarge",
+      "msg": "Quote size above maximum"
+    },
+    {
+      "code": 6008,
+      "name": "SpreadTooWide",
+      "msg": "Quote spread exceeds maximum"
+    },
+    {
+      "code": 6009,
+      "name": "QuoteExpired",
+      "msg": "Quote has expired"
+    },
+    {
+      "code": 6010,
+      "name": "QuoteNotActive",
+      "msg": "Quote is not active"
+    },
+    {
+      "code": 6011,
+      "name": "FillSizeTooSmall",
+      "msg": "Fill size too small"
+    },
+    {
+      "code": 6012,
+      "name": "FillSizeExceedsRemaining",
+      "msg": "Fill size exceeds remaining"
+    },
+    {
+      "code": 6013,
+      "name": "InvalidPrice",
+      "msg": "Invalid price"
+    },
+    {
+      "code": 6014,
+      "name": "InvalidQuoteParams",
+      "msg": "Invalid quote parameters"
+    },
+    {
+      "code": 6015,
+      "name": "Unauthorized",
+      "msg": "Unauthorized"
+    },
+    {
+      "code": 6016,
+      "name": "MathOverflow",
+      "msg": "Math overflow"
+    },
+    {
+      "code": 6017,
+      "name": "CollateralLocked",
+      "msg": "Cannot withdraw locked collateral"
+    },
+    {
+      "code": 6018,
+      "name": "HasActiveQuotes",
+      "msg": "Has active quotes - cancel them first"
+    },
+    {
+      "code": 6019,
+      "name": "HasOpenInventory",
+      "msg": "Has open inventory - close it first"
+    },
+    {
+      "code": 6020,
+      "name": "FillsDisabled",
+      "msg": "Quote fills are disabled until they settle into perps-core positions"
+    },
+    {
+      "code": 6021,
+      "name": "InvalidCollateralMint",
+      "msg": "Collateral mint must be the market's collateral mint"
+    },
+    {
+      "code": 6022,
+      "name": "PriceWorseThanLimit",
+      "msg": "Quote price is worse than the taker's limit"
+    },
+    {
+      "code": 6023,
+      "name": "QuoteNotFillable",
+      "msg": "Legacy quote: set a leverage and expiry with update_quote"
+    },
+    {
+      "code": 6024,
+      "name": "SelfTrade",
+      "msg": "Taker cannot fill their own quote"
+    },
+    {
+      "code": 6025,
+      "name": "WrongMarket",
+      "msg": "Market is not this registry's market"
+    }
+  ],
+  "types": [
+    {
+      "name": "FillQuoteParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "size",
+            "type": "u64"
+          },
+          {
+            "name": "is_buy",
+            "type": "bool"
+          },
+          {
+            "name": "limit_price",
+            "type": "u64"
+          },
+          {
+            "name": "taker_leverage",
+            "type": "u32"
+          },
+          {
+            "name": "allow_partial",
+            "type": "bool"
+          },
+          {
+            "name": "position_nonce",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FillQuoteResult",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "fill_price",
+            "type": "u64"
+          },
+          {
+            "name": "fill_size",
+            "type": "u64"
+          },
+          {
+            "name": "fee",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "InitializeRegistryParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "min_collateral",
+            "type": "u64"
+          },
+          {
+            "name": "max_spread",
+            "type": "u32"
+          },
+          {
+            "name": "min_quote_size",
+            "type": "u64"
+          },
+          {
+            "name": "max_quote_size",
+            "type": "u64"
+          },
+          {
+            "name": "mm_fee",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Market",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "collateral_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "pyth_price_feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "commodity",
+            "type": {
+              "array": [
+                "u8",
+                8
+              ]
+            }
+          },
+          {
+            "name": "max_leverage",
+            "type": "u32"
+          },
+          {
+            "name": "maintenance_margin_ratio",
+            "type": "u32"
+          },
+          {
+            "name": "initial_margin_ratio",
+            "type": "u32"
+          },
+          {
+            "name": "taker_fee",
+            "type": "u32"
+          },
+          {
+            "name": "maker_fee",
+            "type": "u32"
+          },
+          {
+            "name": "liquidation_fee",
+            "type": "u32"
+          },
+          {
+            "name": "long_open_interest",
+            "type": "u64"
+          },
+          {
+            "name": "short_open_interest",
+            "type": "u64"
+          },
+          {
+            "name": "max_open_interest",
+            "type": "u64"
+          },
+          {
+            "name": "cumulative_funding",
+            "type": "i64"
+          },
+          {
+            "name": "last_funding_time",
+            "type": "i64"
+          },
+          {
+            "name": "funding_interval",
+            "type": "i64"
+          },
+          {
+            "name": "insurance_fund",
+            "type": "u64"
+          },
+          {
+            "name": "total_positions",
+            "type": "u64"
+          },
+          {
+            "name": "total_trades",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "is_paused",
+            "type": "bool"
+          },
+          {
+            "name": "session_schedule",
+            "type": "u8"
+          },
+          {
+            "name": "pre_close_window_secs",
+            "type": "u32"
+          },
+          {
+            "name": "weekend_initial_margin_ratio",
+            "type": "u32"
+          },
+          {
+            "name": "weekend_maintenance_margin_ratio",
+            "type": "u32"
+          },
+          {
+            "name": "max_confidence_bps",
+            "type": "u32"
+          },
+          {
+            "name": "min_oracle_price",
+            "type": "u64"
+          },
+          {
+            "name": "settlement_price",
+            "type": "u64"
+          },
+          {
+            "name": "funding_rate",
+            "type": "i64"
+          },
+          {
+            "name": "funding_carry_secs",
+            "type": "u32"
+          },
+          {
+            "name": "settled_at",
+            "type": "i64"
+          },
+          {
+            "name": "pyth_feed_id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "oracle_program",
+            "type": "pubkey"
+          },
+          {
+            "name": "pending_price_feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "pending_feed_id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "pending_oracle_at",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketMaker",
+      "docs": [
+        "Individual Market Maker account"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "docs": [
+              "Owner/operator of this MM account"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "registry",
+            "docs": [
+              "Registry this MM belongs to"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "collateral_account",
+            "docs": [
+              "MM's collateral token account"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "collateral_deposited",
+            "docs": [
+              "Total collateral deposited. The vault is a registration bond only:",
+              "fills margin from the MM's own perps-core UserAccount."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "collateral_locked",
+            "docs": [
+              "Collateral locked in legacy quotes; only ever released now"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "collateral_available",
+            "docs": [
+              "Available collateral (deposited - locked)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "inventory",
+            "docs": [
+              "Deprecated, always 0: fills open perps-core positions owned by the MM's",
+              "wallet, which hold the inventory and PnL. Kept for the account layout."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "avg_inventory_price",
+            "docs": [
+              "Deprecated, always 0"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "unrealized_pnl",
+            "docs": [
+              "Deprecated, always 0"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "realized_pnl",
+            "docs": [
+              "Deprecated, always 0"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "total_volume",
+            "docs": [
+              "Total volume traded"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_fills",
+            "docs": [
+              "Total number of fills"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_fees_paid",
+            "docs": [
+              "Total fees paid. No fee is charged at fill (perps-core charges the",
+              "taker fee on close), so this no longer grows."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "registered_at",
+            "docs": [
+              "Registration timestamp"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "last_active_at",
+            "docs": [
+              "Last activity timestamp"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "active_quotes",
+            "docs": [
+              "Number of active quotes"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "max_quotes",
+            "docs": [
+              "Maximum allowed active quotes"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "status",
+            "docs": [
+              "Current status"
+            ],
+            "type": {
+              "defined": {
+                "name": "MmStatus"
+              }
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "quotes_posted",
+            "docs": [
+              "Quotes ever posted; seeds the next quote PDA (active_quotes can repeat",
+              "after a cancel, which made post_quote collide with a live quote)."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MmRegistry",
+      "docs": [
+        "Global configuration for the Market Maker Registry"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "docs": [
+              "Authority that can update registry parameters"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "docs": [
+              "Market this registry serves"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "collateral_mint",
+            "docs": [
+              "Collateral mint (USDC)"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "min_collateral",
+            "docs": [
+              "Minimum collateral required to register as MM"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "max_spread",
+            "docs": [
+              "Maximum spread allowed (basis points)"
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "min_quote_size",
+            "docs": [
+              "Minimum quote size"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "max_quote_size",
+            "docs": [
+              "Maximum quote size"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "mm_fee",
+            "docs": [
+              "Reserved: no fee is charged at fill. perps-core charges its taker fee",
+              "on each leg when it is closed."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "total_mms",
+            "docs": [
+              "Total registered market makers"
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "active_quotes",
+            "docs": [
+              "Total active quotes"
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "total_volume",
+            "docs": [
+              "Total volume traded through MMs"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_fees",
+            "docs": [
+              "Total fees collected; no longer grows (see `mm_fee`)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "is_open",
+            "docs": [
+              "Whether registry is accepting new MMs"
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "is_trading_enabled",
+            "docs": [
+              "Whether trading is enabled"
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MmStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Inactive"
+          },
+          {
+            "name": "Active"
+          },
+          {
+            "name": "Suspended"
+          },
+          {
+            "name": "Deregistered"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PostQuoteParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bid_price",
+            "type": "u64"
+          },
+          {
+            "name": "bid_size",
+            "type": "u64"
+          },
+          {
+            "name": "ask_price",
+            "type": "u64"
+          },
+          {
+            "name": "ask_size",
+            "type": "u64"
+          },
+          {
+            "name": "min_fill_size",
+            "type": "u64"
+          },
+          {
+            "name": "expires_in",
+            "type": "i64"
+          },
+          {
+            "name": "leverage",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ProtocolConfig",
+      "docs": [
+        "Protocol-wide roles, created once by the program's upgrade authority.",
+        "",
+        "- `admin` creates markets and changes their settings (including settlement).",
+        "It starts as the upgrade authority and can be handed to another key or a",
+        "multisig with propose_admin / accept_admin.",
+        "- `guardian` can only pause markets, for fast response in emergencies.",
+        "- `oracle_program` is the Pyth Solana Receiver program: a market's price feed",
+        "(a `PriceUpdateV2` account) must be owned by it when the market is created",
+        "or its feed rotated; each market keeps a copy (`Market.oracle_program`,",
+        "docs/lp-pool.md D47), so changing it here does not move existing markets.",
+        "- `venue_fills_paused` stops every venue fill in every market. The guardian",
+        "can set it; only the admin can clear it."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "pending_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "guardian",
+            "type": "pubkey"
+          },
+          {
+            "name": "oracle_program",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "venue_fills_paused",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TwoSidedQuote",
+      "docs": [
+        "Two-sided quote (bid and ask together)"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market_maker",
+            "docs": [
+              "Market maker who posted this quote"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "registry",
+            "docs": [
+              "Registry this quote belongs to"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "bid_price",
+            "docs": [
+              "Bid price (6 decimals)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bid_size",
+            "docs": [
+              "Bid size"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bid_remaining",
+            "docs": [
+              "Bid remaining size"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "ask_price",
+            "docs": [
+              "Ask price (6 decimals)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "ask_size",
+            "docs": [
+              "Ask size"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "ask_remaining",
+            "docs": [
+              "Ask remaining size"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "min_fill_size",
+            "docs": [
+              "Minimum fill size"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "collateral_locked",
+            "docs": [
+              "Collateral locked. Only legacy quotes have any: fills margin from the",
+              "MM's perps-core account, so new quotes lock nothing."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "created_at",
+            "docs": [
+              "Quote creation timestamp"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "expires_at",
+            "docs": [
+              "Quote expiry timestamp. 0 only on legacy quotes, which cannot be filled."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "updated_at",
+            "docs": [
+              "Last update timestamp"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "is_active",
+            "docs": [
+              "Whether quote is active"
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "leverage",
+            "docs": [
+              "The MM's leverage for fills of this quote (3 decimals, 10x = 10_000).",
+              "0 only on legacy quotes, which cannot be filled."
+            ],
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "UpdateQuoteParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bid_price",
+            "type": {
+              "option": "u64"
+            }
+          },
+          {
+            "name": "bid_size",
+            "type": {
+              "option": "u64"
+            }
+          },
+          {
+            "name": "ask_price",
+            "type": {
+              "option": "u64"
+            }
+          },
+          {
+            "name": "ask_size",
+            "type": {
+              "option": "u64"
+            }
+          },
+          {
+            "name": "leverage",
+            "type": {
+              "option": "u32"
+            }
+          },
+          {
+            "name": "expires_in",
+            "type": {
+              "option": "i64"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

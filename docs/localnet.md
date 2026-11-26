@@ -21,8 +21,8 @@ pieces: [test schedule](#test-schedule-schedule_test_hourly--2-d46),
 
 ## Running a live simulation
 
-Prerequisites: the Solana 1.18 CLI tools on `PATH` (`solana`,
-`solana-test-validator`, `cargo-build-sbf`), a wallet at
+Prerequisites: the Agave 4.4.1 CLI tools on `PATH` (`solana`,
+`solana-test-validator`, `cargo-build-sbf`; [lp-pool.md](lp-pool.md) D48), a wallet at
 `~/.config/solana/id.json` (it becomes the upgrade authority, protocol admin
 and mint authority on the local validator), `npm ci` in the repository root
 and in `frontend/` (screenshots only), and about 5 GB of free disk for the
@@ -58,7 +58,7 @@ crosses one close and one reopen in about 40 minutes.
 | file | what |
 |---|---|
 | `scripts/localnet/common.sh` | paths, ports (`RPC_PORT`, default 8899), component start/stop helpers |
-| `scripts/localnet/build.sh` | `scripts/build-sbf.sh --localnet`, `scripts/idlgen` IDLs and types, `cargo build` of `backend/keeper` |
+| `scripts/localnet/build.sh` | `scripts/build-sbf.sh --localnet`, `scripts/gen-idl.sh` IDLs and types, `cargo build` of `backend/keeper` |
 | `scripts/localnet/up.sh` / `down.sh` / `run.sh` | boot / stop / timed run (above) |
 | `scripts/localnet/src/setup.ts` | mint, feed, protocol config, market, pool, venues, wallets → `target/localnet/state.json` |
 | `scripts/localnet/src/price.ts` | mock-pyth price driver |
@@ -91,10 +91,12 @@ and mock-pyth as a plain BPF program. `setup.ts` then:
 
 1. funds the oracle, keeper, matcher and 25 bot keys with SOL and a 6-decimal
    USDC-like mint;
-2. creates the OIL feed (mock-pyth, $75) and `initialize_config` with
-   `oracle_program` = mock-pyth;
+2. creates the OIL feed (mock-pyth, $75: a Full `PriceUpdateV2` carrying the
+   production OIL feed id, `Commodities.USOILSPOT` `925ca92f…b3e6`) and
+   `initialize_config` with `oracle_program` = mock-pyth;
 3. in one transaction: `initialize_market` (initialize-market.ts's OIL values,
-   funding interval 60 s), `update_market_config` (test schedule, pre-close
+   funding interval 60 s, `pyth_feed_id` = that id; setup then checks that the
+   market pinned the feed, the id and mock-pyth as its oracle program), `update_market_config` (test schedule, pre-close
    window 300 s, weekend IM/MM 20%/10%, 1% confidence, $7.50 floor) and
    `initialize_pool` with the scaled params of the table below. The schedule
    is switched before the pool exists because `validate` checks the scaled
@@ -102,7 +104,10 @@ and mock-pyth as a plain BPF program. `setup.ts` then:
    or CME market (the claim window minimum there is 87_300 s);
 4. seeds the pool with the protocol's $1M (`init_lp_position` + `lp_deposit`)
    as soon as the LP deposit window is open (open and outside Q; it waits up
-   to 12 minutes if setup runs in the weekend). Departure from D11, localnet
+   to 12 minutes if setup runs in the weekend; after a wait the seed
+   transaction also cranks `update_funding`, since the keeper is not running
+   yet and `lp_deposit` refuses a stale accumulator, `FundingStale`;
+   [lp-pool.md](lp-pool.md) D52). Departure from D11, localnet
    only: the seed is a second transaction (on mainnet the bootstrap is one
    transaction so nobody trades against an unseeded pool; nobody else is on
    a local validator);
@@ -193,7 +198,9 @@ build, both with unit tests):
 ### Bots (`bots.ts`)
 
 TypeScript, one process, one async loop per agent, built on
-`@coral-xyz/anchor` 0.28 with the IDLs from `scripts/idlgen` and the
+`@anchor-lang/core` 1.2.2 (Anchor 1.2's TS client, the successor of
+`@coral-xyz/anchor`) with the IDLs from `scripts/gen-idl.sh` (`target/idl`,
+the programs typed with `target/types`; [lp-pool.md](lp-pool.md) D49) and the
 frontend's `pool.ts` / `poolMath.ts` / `session.ts` mirrors for quotes, caps
 and gates (the same code the UI uses, so no formula is re-derived). TS was
 chosen over a Rust crate because Anchor's TS client builds every perps-core,
@@ -320,9 +327,13 @@ node scripts/localnet/screenshots.js [label]     # SCREENSHOT_DIR, FRONTEND_PORT
 starts `vite` with `VITE_NETWORK=localnet`, `VITE_RPC_URL`, `VITE_USDC_MINT`
 and `VITE_PYTH_FEED_OIL` from `state.json` and saves the trading page and the
 LP vault (deviceScaleFactor 2). To use it by hand, start the dev server with
-the same variables. Localnet-only frontend behaviour: prices come from the
+the same variables. `VITE_PYTH_FEED_OIL` is only the configured default since
+lp-pool.md D51: the frontend sends, and reads prices from, the account the
+market pins (`Market.pyth_price_feed`). Localnet-only frontend behaviour: prices come from the
 market's oracle account over RPC (`VITE_ORACLE_SOURCE=chain`, the localnet
-default; `utils/oracleAccount.ts`) instead of `backend/api`, which reads
+default; `utils/oracleAccount.ts`, which shows a price only for a Full update
+of the market's feed id owned by the market's oracle program, as
+`read_price` requires) instead of `backend/api`, which reads
 Hermes, a public service; the WebSocket and backend order book are off; an
 in-browser burner wallet is offered so wallet-only panels load (it holds no
 SOL: `solana airdrop` to it on localhost to trade). The price chart's candles
@@ -400,7 +411,8 @@ Not covered, and why:
 ## CI
 
 * Every push: the SBF job type-checks the harness
-  (`npx tsc -p scripts/localnet/tsconfig.json`, seconds) and runs its
+  (`npx tsc -p scripts/localnet/tsconfig.json`, seconds, after
+  `scripts/gen-idl.sh` has written the IDL types it uses) and runs its
   validator-free self-test (`scripts/localnet/src/selftest.ts`: the reopen
   print timing, the checker's C0 coverage verdict, the weekend-gap and
   bad-debt measurement, the gapper's sizing, error text of non-Error
@@ -577,43 +589,61 @@ its price at will.
 * Program id `MockPyth11111111111111111111111111111111111` (no keypair: load
   it with `solana-test-validator --bpf-program <id> target/deploy-localnet/mock_pyth.so`;
   the random `mock_pyth-keypair.json` cargo-build-sbf writes next to it is
-  unused). Plain `solana-program` 1.16, no Anchor, no IDL.
-* Feeds are pyth-sdk-solana 0.8 `PriceAccount`s (version 2, 3_312 bytes, the
-  layout `scripts/test-ts.sh` writes), owned by the program, so perps-core's
-  `oracle::read_price` and the keeper read them unchanged once
-  `ProtocolConfig.oracle_program` = the mock-pyth id (`initialize_config` /
-  protocol roles; perps-core is not changed). Every write stamps `timestamp`
-  (publish time), `agg.pub_slot`, `last_slot`, `valid_slot` from the on-chain
+  unused). Plain `solana-program` 3 (the solana-v3 cohort Anchor 1.2 uses),
+  no Anchor, no IDL.
+* Feeds are Pyth Solana Receiver `PriceUpdateV2` accounts in
+  pyth-solana-receiver-sdk 2.0.0's layout (134 bytes; docs/lp-pool.md D47),
+  written with perps-core's `pyth_receiver.rs` and owned by the program, so
+  perps-core's `oracle::read_price` reads them as it reads the Receiver's
+  once `ProtocolConfig.oracle_program` = the mock-pyth id (`initialize_config`
+  / protocol roles) and the market was created with the feed's id. Every
+  price write stamps `publish_time` and `posted_slot` from the on-chain
   `Clock`, so `|publish_time − now| ≤ 60 s` is real.
 * Instructions (first byte tag, little-endian):
 
   | tag | name | data after the tag | accounts |
   |---|---|---|---|
-  | 0 | `Initialize` | `price: i64, conf: u64, expo: i32` (20 bytes) | feed `[writable, signer]`, authority `[signer]` |
+  | 0 | `Initialize` | `feed_id: [u8; 32], price: i64, conf: u64, expo: i32` (52 bytes) | feed `[writable, signer]`, authority `[signer]` |
   | 1 | `SetPrice` | `price: i64, conf: u64, expo: i32, status: u32` (24 bytes) | feed `[writable]`, authority `[signer]` |
   | 2 | `SetAuthority` | `new_authority: [u8; 32]` | feed `[writable]`, authority `[signer]` |
+  | 3 | `SetVerification` | `level: u8` (0 Partial, 1 Full), `num_signatures: u8` | feed `[writable]`, authority `[signer]` |
+  | 4 | `SetFeedId` | `feed_id: [u8; 32]` | feed `[writable]`, authority `[signer]` |
 
-  Create the feed first with `SystemProgram.createAccount` (space 3_312,
+  Create the feed first with `SystemProgram.createAccount` (space 134,
   owner = mock-pyth, rent-exempt), in the same transaction as `Initialize` or
-  before. `Initialize` fails on an initialized account
+  before. `Initialize` writes a Full update (publish and previous publish
+  time = now, EMA = price); it fails on an initialized account
   (`AccountAlreadyInitialized`) and without the feed's signature; a non-
-  authority signer gets `IllegalOwner`; a wrong size `InvalidAccountData`.
-* `status`: 0 Unknown, 1 Trading, 2 Halted, 3 Auction (4+ rejected). On each
-  write the last Trading aggregate moves to `prev_*`; while not Trading,
-  readers get `prev_price`/`prev_conf` at `prev_timestamp`, so a halted feed
-  goes stale after 60 s, as on Pyth. Keep `expo` fixed (-8): it also applies
-  to the stored previous price.
-* The authority is stored as the only publisher, `comp[0].publisher`
-  (offset 240), `num = 1`. Byte offsets are in `mock_pyth::offsets`.
+  authority signer gets `IllegalOwner`; a wrong size `InvalidAccountData`;
+  data of the wrong length (the pre-D47 20-byte `Initialize` included)
+  `InvalidInstructionData`.
+* `status`: 1 Trading publishes (`prev_publish_time` takes the old publish
+  time); 0 Unknown, 2 Halted and 3 Auction write nothing, so the update
+  freezes and goes stale after 60 s, as a Pyth feed does while its market is
+  closed (4+ rejected).
+* The authority is the update's `write_authority` (bytes 8..40).
+  `SetVerification` (a Partial update has the Receiver's Partial layout,
+  every later field one byte on) and `SetFeedId` exist for negative tests:
+  perps-core refuses them with `OracleNotFullyVerified` and
+  `OracleFeedIdMismatch`. `mock_pyth::read_update` reads either layout.
 * Tests: `cargo test -p mock-pyth` (native) and
   `SBF_OUT_DIR=$PWD/target/deploy-localnet cargo test -p mock-pyth` (the SBF
-  binary), reading the feed back with pyth-sdk-solana 0.8 and perps-core's
+  binary), reading the feed back with perps-core's `pyth_receiver.rs` and
   `price::validate_price`.
+* The harness (lp-pool.md D51): `lib.ts` creates the feed with space 134
+  (`PRICE_ACCOUNT_SIZE`) and the 53-byte `Initialize` carrying the OIL feed id
+  (`mockPythInitializeIx`; `SetPrice` is unchanged), `setup.ts` passes the
+  same id to `initialize_market`, and `decodeFeed` reads the update with the
+  frontend's `parsePriceUpdateV2` (6-dp price, truncated as perps-core does)
+  and throws on anything perps-core would not parse. `readView` also refuses
+  a feed whose owner or feed id is not the market's, so the checker never
+  reasons on a price no instruction can read. The self-test covers the
+  encoders and the decoder.
 
 ## Localnet build
 
 ```
-export PATH=<solana 1.18 release>/bin:$PATH
+export PATH=<agave 4.4.1 release>/bin:$PATH
 scripts/build-sbf.sh --localnet
 ```
 

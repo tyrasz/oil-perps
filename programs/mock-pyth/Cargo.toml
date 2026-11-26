@@ -1,7 +1,7 @@
 [package]
 name = "mock-pyth"
 version = "0.1.0"
-description = "LOCALNET/TEST ONLY: a writable Pyth v2 price feed for live local runs. Never deploy to a public cluster."
+description = "LOCALNET/TEST ONLY: a writable Pyth Receiver PriceUpdateV2 feed for live local runs. Never deploy to a public cluster."
 edition = "2021"
 publish = false
 
@@ -12,17 +12,27 @@ name = "mock_pyth"
 [features]
 no-entrypoint = []
 default = []
+# Declared so solana-program's entrypoint! cfg checks don't warn (unexpected_cfgs)
+custom-heap = []
+custom-panic = []
+
+# The program macros test `target_os = "solana"`, which the host rustc doesn't list
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
 
 [profile.release]
 overflow-checks = true
 
 [dependencies]
-solana-program = "1.16"
+# The solana-v3 cohort, as Anchor 1.2 (docs/lp-pool.md D48)
+solana-program = "3.0"
 
 [dev-dependencies]
-# Native and SBF (SBF_OUT_DIR) end-to-end tests; the feed is parsed with the
-# same pyth-sdk-solana as perps-core
-solana-program-test = "~1.16"
-solana-sdk = "~1.16"
-pyth-sdk-solana = "0.8"
+# Native and SBF (SBF_OUT_DIR) end-to-end tests; the feed is read back with
+# perps-core's PriceUpdateV2 reader (src/pyth_receiver.rs, which the program
+# itself #[path]-includes). Agave 4.x gates
+# solana-program-test behind `agave-unstable-api`.
+solana-program-test = { version = "=4.4.1", features = ["agave-unstable-api"] }
+# solana-sdk paths without solana-sdk itself (test-sdk/Cargo.toml says why)
+solana-sdk = { package = "oil-test-sdk", path = "../../test-sdk" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

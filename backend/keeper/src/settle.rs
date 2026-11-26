@@ -177,7 +177,7 @@ fn pool_market(
             }
         }
     } else if market.is_in_session_for(now, crate::SESSION_EDGE_GUARD_SECS) {
-        let mark = crate::liquidator::fetch_oracle_price(client, &market, now)?;
+        let mark = crate::oracle::fetch_oracle_price(client, &market, now)?;
         let positions = fetch_open_positions(client, &program, &market_pda)?;
         let periodic = {
             let map = last_settle.lock().unwrap();

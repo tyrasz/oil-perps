@@ -1,4 +1,4 @@
-import { BN } from "@coral-xyz/anchor";
+import { BN } from "@anchor-lang/core";
 import { Keypair } from "@solana/web3.js";
 
 // Price decimals (6 for USDC-style)

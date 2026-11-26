@@ -32,7 +32,7 @@ pub struct OracleView {
 }
 
 pub fn oracle(m: &Market, o: &OracleView, now: i64, max_age: u64) -> Option<Rej> {
-    if (o.published_at - now).unsigned_abs() > max_age {
+    if !perps_core::pyth_receiver::is_fresh(o.published_at, now, max_age) {
         return Some(core("StaleOraclePrice"));
     }
     let limit = if m.max_confidence_bps == 0 { DEFAULT_MAX_CONFIDENCE_BPS } else { m.max_confidence_bps };

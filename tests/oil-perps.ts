@@ -1,5 +1,5 @@
-import * as anchor from "@coral-xyz/anchor";
-import { Program, BN } from "@coral-xyz/anchor";
+import * as anchor from "@anchor-lang/core";
+import { Program, BN } from "@anchor-lang/core";
 import { PerpsCore } from "../target/types/perps_core";
 import {
   Keypair,
@@ -19,6 +19,14 @@ import {
 import { expect } from "chai";
 import * as fs from "fs";
 import {
+  PRICE_UPDATE_V2_LEN,
+  parsePriceUpdateV2,
+} from "../frontend/src/utils/oracleAccount";
+import { feedIdFromHex, feedIdToHex } from "../frontend/src/config/pythFeeds";
+import {
+  MARKET_LEN,
+  MARKET_ORACLE_OFFSETS,
+  decodeMarketOracleFields,
   findLpPoolPda,
   findLpPositionPda,
   neutralPoolParams,
@@ -42,12 +50,27 @@ import {
 const LP_DEAD_SHARES = 1_000_000;
 const SEED = new BN(1_000_000_000_000); // $1M of LP cash, as the Rust harness
 
-/** Genesis Pyth feeds written by scripts/test-ts.sh (fresh ±60 s each) */
+/**
+ * Genesis PriceUpdateV2 feeds written by scripts/test-oracles.js (D47): OIL
+ * (USOILSPOT) feeds 50 s apart, each fresh ±60 s around its publish time,
+ * and the special cases.
+ */
 interface OracleManifest {
   price: number;
-  stale: { pubkey: string; publishTime: number };
+  feedIds: { OIL: string; GOLD: string; SILVER: string };
   feeds: { pubkey: string; publishTime: number }[];
+  stale: { pubkey: string; publishTime: number };
+  gold: { pubkey: string };
+  silver: { pubkey: string };
+  partial: { pubkey: string };
+  wrongOwner: { pubkey: string };
+  legacy: { pubkey: string };
 }
+// The genesis writer, checked against the SDK's bytes below
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const testOracles = require("../scripts/test-oracles.js");
+const FEED_ID_OIL = Array.from(feedIdFromHex("925ca92ff005ae943c158e3563f59698ce7e75c5a8c8dd43303a0a154887b3e6"));
+const FEED_ID_GOLD = Array.from(feedIdFromHex("765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2"));
 
 describe("oil-perps", () => {
   const provider = anchor.AnchorProvider.env();
@@ -91,12 +114,14 @@ describe("oil-perps", () => {
     liquidationFee: 250, // 2.5%
     maxOpenInterest: new BN(1_000_000_000_000), // 1M contracts
     fundingInterval: new BN(3600), // 1 hour
+    pythFeedId: FEED_ID_OIL, // Commodities.USOILSPOT (D47)
   };
 
   // Market params for GOLD commodity (for multi-commodity tests)
   const goldMarketParams = {
     ...marketParams,
     commodity: "GOLD",
+    pythFeedId: FEED_ID_GOLD, // XAU/USD
   };
 
   // ---------------------------------------------------------------------------
@@ -138,6 +163,16 @@ describe("oil-perps", () => {
     const candidates = oracles.feeds.filter((f) => f.publishTime <= now + 55 && f.publishTime >= now + 5);
     if (candidates.length === 0) throw new Error(`no fresh test oracle at chain time ${now}`);
     return new PublicKey(candidates[candidates.length - 1].pubkey);
+  }
+
+  /** A genesis OIL feed published between `from` and `to` seconds after the chain clock (another fresh one if `exclude`). */
+  async function feedPublishedIn(from: number, to: number, exclude: PublicKey[] = []): Promise<PublicKey> {
+    const now = await chainTime();
+    const f = oracles!.feeds.find(
+      (x) => x.publishTime >= now + from && x.publishTime <= now + to && !exclude.some((k) => k.toBase58() === x.pubkey)
+    );
+    if (!f) throw new Error(`no test oracle published in [now + ${from}, now + ${to}] at chain time ${now}`);
+    return new PublicKey(f.pubkey);
   }
 
   function marketPdas(mint: PublicKey, commodity = "OIL") {
@@ -389,6 +424,11 @@ describe("oil-perps", () => {
       expect(market.isPaused).to.equal(false);
       expect(market.fundingCarrySecs).to.equal(0);
       expect(market.settledAt.toNumber()).to.equal(0);
+      // The oracle pinned at creation (D47)
+      expect(market.pythPriceFeed.toBase58()).to.equal(pythPriceFeed.toBase58());
+      expect(market.pythFeedId).to.deep.equal(FEED_ID_OIL);
+      expect(market.oracleProgram.toBase58()).to.equal(SystemProgram.programId.toBase58());
+      expect(market.pendingOracleAt.toNumber()).to.equal(0);
 
       // The pool: neutral params, $1M of cash, LP_DEAD_SHARES owned by nobody
       const lp = await program.account.lpPool.fetch(lpPoolPda);
@@ -412,7 +452,8 @@ describe("oil-perps", () => {
       expect(gold.market.toBase58()).to.not.equal(marketPda.toBase58());
 
       // Without the pool: no trading or collateral is possible until it exists
-      await initMarketIx(goldMarketParams, collateralMint, Keypair.generate().publicKey)
+      // Its own feed: a Full XAU/USD update (initialize_market checks the feed id)
+      await initMarketIx(goldMarketParams, collateralMint, new PublicKey(oracles!.gold.pubkey))
         .signers([authority])
         .rpc();
 
@@ -1058,7 +1099,7 @@ describe("oil-perps", () => {
 
     it("should encode PoolParams as the program's Borsh layout (104 bytes, profit_close_quiet_secs last)", async () => {
       for (const p of [neutralPoolParams(), productionPoolParams()]) {
-        const anchorBytes = await program.coder.types.encode("PoolParams", p);
+        const anchorBytes = await program.coder.types.encode("poolParams", p);
         expect(anchorBytes.length).to.equal(104);
         expect(encodePoolParams(p).equals(anchorBytes)).to.equal(true);
         expect(encodePoolParams(decodePoolParams(anchorBytes)).equals(anchorBytes)).to.equal(true);
@@ -1465,7 +1506,7 @@ describe("oil-perps", () => {
       const mint = await createMint(provider.connection, authority, authority.publicKey, null, 6);
       const p = marketPdas(mint);
       await expectErr(
-        initMarketIx(marketParams, mint, Keypair.generate().publicKey)
+        initMarketIx(marketParams, mint, new PublicKey(oracles!.stale.pubkey))
           .postInstructions([await initPoolIx(authority.publicKey, p.market, p.lpPool, { ...neutralPoolParams(), profitCloseQuietSecs: 3_601 })])
           .signers([authority])
           .rpc(),
@@ -1583,6 +1624,230 @@ describe("oil-perps", () => {
     });
   });
 
+  describe("Pyth PriceUpdateV2 oracle (D47)", () => {
+    const fixtureFile = (name: string) => fs.readFileSync(`${__dirname}/../programs/perps-core/tests/fixtures/${name}`);
+    const pk = (k: { pubkey: string }) => new PublicKey(k.pubkey);
+
+    /** The events a confirmed transaction emitted, camelCase names as the coder decodes them. */
+    async function eventsOf(sig: string): Promise<{ name: string; data: any }[]> {
+      await provider.connection.confirmTransaction({ signature: sig, ...(await provider.connection.getLatestBlockhash()) }, "confirmed");
+      const tx = await provider.connection.getTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
+      const out: { name: string; data: any }[] = [];
+      for (const l of tx?.meta?.logMessages ?? []) {
+        if (!l.startsWith("Program data: ")) continue;
+        const e = program.coder.events.decode(l.slice("Program data: ".length));
+        if (e) out.push(e);
+      }
+      return out;
+    }
+
+    const propose = (m: { market: PublicKey; lpPool: PublicKey }, feed: PublicKey, feedId: number[], admin = authority) =>
+      program.methods
+        .proposeOracleFeed(feedId)
+        .accounts({ admin: admin.publicKey, config: configPda, market: m.market, lpPool: m.lpPool, newPriceFeed: feed })
+        .signers([admin])
+        .rpc();
+    const apply = (m: { market: PublicKey }, feed: PublicKey) =>
+      program.methods.applyOracleFeed().accounts({ market: m.market, config: configPda, newPriceFeed: feed }).rpc();
+    const cancel = (m: { market: PublicKey }, admin = authority) =>
+      program.methods
+        .cancelOracleFeed()
+        .accounts({ admin: admin.publicKey, config: configPda, market: m.market })
+        .signers([admin])
+        .rpc();
+
+    it("the genesis writer (scripts/test-oracles.js) writes pyth-solana-receiver-sdk 2.0.0's bytes", async () => {
+      // tests/pyth_receiver_parity.rs fixture_view(): the SDK's own serialization
+      const fixture = {
+        writeAuthority: Buffer.alloc(32, 0x11),
+        feedIdHex: oracles!.feedIds.OIL,
+        price: 7_512_345_678,
+        conf: 4_200_000,
+        expo: -8,
+        publishTime: 1_794_416_400,
+        prevPublishTime: 1_794_416_399,
+        emaPrice: 7_500_000_000,
+        emaConf: 5_000_000,
+        postedSlot: 123_456_789,
+      };
+      const full = fixtureFile("price_update_v2_full.bin");
+      const partial = fixtureFile("price_update_v2_partial.bin");
+      expect(testOracles.priceUpdateV2(fixture).equals(full)).to.equal(true);
+      expect(testOracles.priceUpdateV2({ ...fixture, partialSignatures: 13 }).equals(partial)).to.equal(true);
+      // And a genesis account as the validator serves it
+      const info = (await provider.connection.getAccountInfo(await freshFeed()))!;
+      expect(info.data.length).to.equal(PRICE_UPDATE_V2_LEN);
+      expect(info.owner.toBase58()).to.equal(SystemProgram.programId.toBase58());
+      const parsed = parsePriceUpdateV2(info.data);
+      if ('reason' in parsed) expect.fail(parsed.reason);
+      expect(feedIdToHex(parsed.update.feedId)).to.equal(oracles!.feedIds.OIL);
+      expect(parsed.update.price.toString()).to.equal("7500000000");
+    });
+
+    it("Market is 434 bytes with the oracle fields at 295..431, as the SDK decodes them", async () => {
+      const raw = (await provider.connection.getAccountInfo(marketPda))!.data;
+      expect(raw.length).to.equal(MARKET_LEN);
+      const m = await program.account.market.fetch(marketPda);
+      const sdk = decodeMarketOracleFields(raw);
+      expect(sdk.pythPriceFeed.toBase58()).to.equal(m.pythPriceFeed.toBase58());
+      expect(Array.from(sdk.pythFeedId)).to.deep.equal(m.pythFeedId);
+      expect(sdk.oracleProgram.toBase58()).to.equal(m.oracleProgram.toBase58());
+      expect(sdk.pendingPriceFeed.toBase58()).to.equal(m.pendingPriceFeed.toBase58());
+      expect(Array.from(sdk.pendingFeedId)).to.deep.equal(m.pendingFeedId);
+      expect(sdk.pendingOracleAt.toString()).to.equal(m.pendingOracleAt.toString());
+      expect(MARKET_ORACLE_OFFSETS).to.deep.equal({
+        pythPriceFeed: 104, pythFeedId: 295, oracleProgram: 327, pendingPriceFeed: 359, pendingFeedId: 391, pendingOracleAt: 423,
+      });
+      expect(Array.from(raw.subarray(295, 327))).to.deep.equal(FEED_ID_OIL);
+      expect(new PublicKey(raw.subarray(327, 359)).toBase58()).to.equal(SystemProgram.programId.toBase58());
+      expect(raw.subarray(359, 434).equals(Buffer.alloc(75))).to.equal(true); // nothing pending, padding zero
+    });
+
+    it("initialize_market refuses a feed perps-core cannot read", async () => {
+      const init = async (feed: PublicKey, params = marketParams) => {
+        const mint = await createMint(provider.connection, authority, authority.publicKey, null, 6);
+        return initMarketIx(params, mint, feed).signers([authority]).rpc();
+      };
+      await expectErr(init(await freshFeed(), { ...marketParams, pythFeedId: Array(32).fill(0) }), "InvalidMarketConfig");
+      await expectErr(init(pk(oracles!.partial)), "OracleNotFullyVerified");
+      await expectErr(init(pk(oracles!.silver)), "OracleFeedIdMismatch");
+      await expectErr(init(pk(oracles!.gold)), "OracleFeedIdMismatch");
+      await expectErr(init(pk(oracles!.wrongOwner)), "InvalidOracleAccount");
+      await expectErr(init(pk(oracles!.legacy)), "InvalidOracleAccount");
+      await expectErr(init(Keypair.generate().publicKey), "InvalidOracleAccount"); // no account: too short
+      // A stale feed is fine at creation: a market may be created while closed
+      await init(pk(oracles!.stale));
+    });
+
+    it("a price read refuses a publish time more than 60 s ahead of the clock too (StaleOraclePrice, two-sided)", async () => {
+      await expectErr(createPoolMarket({ feed: await feedPublishedIn(75, 300) }), "StaleOraclePrice");
+    });
+
+    it("a price read takes only the pinned feed (ConstraintRaw before any parsing)", async () => {
+      const m = await createPoolMarket();
+      const other = await feedPublishedIn(-3_600, 4 * 3_600, [m.feed]);
+      await expectErr(
+        program.methods
+          .lpRequestWithdrawal(new BN(1_000_000))
+          .accounts({ owner: authority.publicKey, market: m.market, lpPool: m.lpPool, lpPosition: lpPositionPda(m.lpPool, authority.publicKey), pythPriceFeed: other })
+          .signers([authority])
+          .rpc(),
+        "ConstraintRaw"
+      );
+    });
+
+    describe("feed rotation before the seed (lp_shares == 0: applies at once)", () => {
+      let u: Awaited<ReturnType<typeof createPoolMarket>>;
+      before(async () => {
+        u = await createPoolMarket({ seed: new BN(0) });
+      });
+
+      it("validates the new feed as initialize_market does, admin only", async () => {
+        const f = await freshFeed();
+        await expectErr(propose(u, f, FEED_ID_OIL, user1), "Unauthorized");
+        await expectErr(propose(u, f, Array(32).fill(0)), "InvalidMarketConfig");
+        await expectErr(propose(u, pk(oracles!.partial), FEED_ID_OIL), "OracleNotFullyVerified");
+        await expectErr(propose(u, pk(oracles!.silver), FEED_ID_OIL), "OracleFeedIdMismatch");
+        await expectErr(propose(u, f, FEED_ID_GOLD), "OracleFeedIdMismatch");
+        await expectErr(propose(u, pk(oracles!.wrongOwner), FEED_ID_OIL), "InvalidOracleAccount");
+        await expectErr(propose(u, pk(oracles!.legacy), FEED_ID_OIL), "InvalidOracleAccount");
+      });
+
+      it("applies a new feed and feed id at once, with OracleFeedProposed and OracleFeedApplied", async () => {
+        // To another feed id (a roll to a new contract, say), then back
+        const t0 = await chainTime();
+        const events = await eventsOf(await propose(u, pk(oracles!.gold), FEED_ID_GOLD));
+        let m = await program.account.market.fetch(u.market);
+        expect(m.pythPriceFeed.toBase58()).to.equal(oracles!.gold.pubkey);
+        expect(m.pythFeedId).to.deep.equal(FEED_ID_GOLD);
+        expect(m.pendingOracleAt.toNumber()).to.equal(0);
+        expect(events.map((e) => e.name)).to.deep.equal(["oracleFeedProposed", "oracleFeedApplied"]);
+        for (const e of events) {
+          expect(e.data.market.toBase58()).to.equal(u.market.toBase58());
+          expect(e.data.priceFeed.toBase58()).to.equal(oracles!.gold.pubkey);
+          expect(e.data.feedId).to.deep.equal(FEED_ID_GOLD);
+          expect(e.data.effectiveAt.toNumber()).to.be.within(t0 - 5, t0 + 30);
+        }
+
+        const f = await freshFeed();
+        await propose(u, f, FEED_ID_OIL);
+        m = await program.account.market.fetch(u.market);
+        expect(m.pythPriceFeed.toBase58()).to.equal(f.toBase58());
+        expect(m.pythFeedId).to.deep.equal(FEED_ID_OIL);
+        // Nothing is pending to apply (the pending key is the zero key) or cancel
+        await expectErr(apply(u, PublicKey.default), "OracleChangeTimelocked");
+        await expectErr(apply(u, f), "InvalidOracleAccount");
+        await expectErr(cancel(u), "NoPendingOracleChange");
+
+        // The seed must use the new pinned feed, not the one before it
+        await provider.sendAndConfirm(new Transaction().add(await initLpPositionIx(authority.publicKey, u.lpPool)), [authority]);
+        await expectErr(
+          lpDepositIx(authority.publicKey, u, u.adminToken, pk(oracles!.gold), SEED, SEED.subn(LP_DEAD_SHARES)).signers([authority]).rpc(),
+          "ConstraintRaw"
+        );
+        await lpDepositIx(authority.publicKey, u, u.adminToken, f, SEED, SEED.subn(LP_DEAD_SHARES)).signers([authority]).rpc();
+        expect((await program.account.lpPool.fetch(u.lpPool)).lpShares.toString()).to.equal(SEED.toString());
+      });
+
+      it("refuses a settled market (MarketSettled)", async () => {
+        const s = await createPoolMarket({ seed: new BN(0) });
+        await program.methods
+          .settleMarket(new BN(75_000_000))
+          .accounts({ authority: authority.publicKey, config: configPda, market: s.market })
+          .signers([authority])
+          .rpc();
+        await expectErr(propose(s, await freshFeed(), FEED_ID_OIL), "MarketSettled");
+      });
+    });
+
+    for (const [label, params, timelock] of [
+      ["neutral params: 5 d (the margin)", neutralPoolParams(), 432_000],
+      ["production params: 4 d + 1 d + 5 d = 10 d", productionPoolParams(), 864_000],
+    ] as [string, PoolParams, number][]) {
+      it(`a seeded market's rotation is timelocked by the pool params timelock (${label}), replaceable and cancellable`, async () => {
+        const s = await createPoolMarket({ params });
+        // Any other OIL update: proposing checks no age
+        const f1 = await feedPublishedIn(-3_600, 4 * 3_600, [s.feed]);
+        const t0 = await chainTime();
+        const proposed = await eventsOf(await propose(s, f1, FEED_ID_OIL));
+        let m = await program.account.market.fetch(s.market);
+        const at = m.pendingOracleAt.toNumber();
+        expect(at - t0).to.be.within(timelock - 5, timelock + 30);
+        expect(m.pendingPriceFeed.toBase58()).to.equal(f1.toBase58());
+        expect(m.pendingFeedId).to.deep.equal(FEED_ID_OIL);
+        expect(m.pythPriceFeed.toBase58()).to.equal(s.feed.toBase58()); // unchanged until applied
+        expect(proposed.map((e) => e.name)).to.deep.equal(["oracleFeedProposed"]);
+        expect(proposed[0].data.effectiveAt.toNumber()).to.equal(at);
+        expect(proposed[0].data.priceFeed.toBase58()).to.equal(f1.toBase58());
+
+        // Anyone may apply, but not before the timelock, and only the pending account
+        await expectErr(apply(s, f1), "OracleChangeTimelocked");
+        await expectErr(apply(s, s.feed), "InvalidOracleAccount");
+
+        // A new proposal replaces it and restarts the clock
+        await expectErr(propose(s, pk(oracles!.silver), FEED_ID_OIL), "OracleFeedIdMismatch");
+        await propose(s, pk(oracles!.gold), FEED_ID_GOLD);
+        m = await program.account.market.fetch(s.market);
+        expect(m.pendingPriceFeed.toBase58()).to.equal(oracles!.gold.pubkey);
+        expect(m.pendingFeedId).to.deep.equal(FEED_ID_GOLD);
+        expect(m.pendingOracleAt.toNumber()).to.be.at.least(at);
+        expect(m.pythFeedId).to.deep.equal(FEED_ID_OIL);
+
+        await expectErr(cancel(s, user1), "Unauthorized");
+        const cancelled = await eventsOf(await cancel(s));
+        expect(cancelled.map((e) => e.name)).to.deep.equal(["oracleFeedCancelled"]);
+        expect(cancelled[0].data.priceFeed.toBase58()).to.equal(oracles!.gold.pubkey);
+        m = await program.account.market.fetch(s.market);
+        expect(m.pendingOracleAt.toNumber()).to.equal(0);
+        expect(m.pendingPriceFeed.toBase58()).to.equal(PublicKey.default.toBase58());
+        expect(m.pendingFeedId).to.deep.equal(Array(32).fill(0));
+        await expectErr(cancel(s), "NoPendingOracleChange");
+        await expectErr(apply(s, pk(oracles!.gold)), "InvalidOracleAccount");
+        await expectErr(apply(s, PublicKey.default), "OracleChangeTimelocked");
+      });
+    }
+  });
+
   describe("Market state tracking", () => {
     it("should verify vault balance tracking", async () => {
       const vault = await program.account.vault.fetch(vaultPda);
@@ -1600,7 +1865,8 @@ describe("oil-perps", () => {
   describe("Error conditions", () => {
     it("should define all error codes", () => {
       // programs/perps-core/src/errors.rs, in order from 6000; the LP pool
-      // appended its 42 after ApprovalViaCpi (§12). Existing codes never move.
+      // appended its 42 after ApprovalViaCpi (§12), the oracle 4 after those (D47).
+      // Existing codes never move.
       const expectedErrors = [
         "MarketPaused",
         "ExcessiveLeverage",
@@ -1696,13 +1962,20 @@ describe("oil-perps", () => {
         "WithdrawalExpired",
         "MarketNotSettled",
         "ProfitCloseQuiet",
+        // Pyth PriceUpdateV2 oracle (D47)
+        "OracleNotFullyVerified",
+        "OracleFeedIdMismatch",
+        "NoPendingOracleChange",
+        "OracleChangeTimelocked",
       ];
-      expect(expectedErrors.length).to.equal(93);
+      expect(expectedErrors.length).to.equal(97);
+      expect(expectedErrors.indexOf("OracleNotFullyVerified")).to.equal(93);
       expect(expectedErrors.indexOf("InvalidPoolParams")).to.equal(51);
-      expect(expectedErrors.length - 51).to.equal(42);
+      expect(expectedErrors.indexOf("OracleNotFullyVerified") - 51).to.equal(42);
 
-      // Against the IDL the deployed program was generated with
-      const idlErrors = (program.idl.errors ?? []).map((e) => [e.code, e.name]);
+      // Against the IDL the deployed program was generated with (`rawIdl`:
+      // `program.idl` has every name camelCased)
+      const idlErrors = (program.rawIdl.errors ?? []).map((e) => [e.code, e.name]);
       expect(idlErrors).to.deep.equal(expectedErrors.map((name, i) => [6000 + i, name]));
     });
   });

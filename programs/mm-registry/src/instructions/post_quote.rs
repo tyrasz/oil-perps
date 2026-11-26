@@ -101,7 +101,7 @@ pub fn handler(ctx: Context<PostQuote>, params: PostQuoteParams) -> Result<()> {
     quote.updated_at = current_time;
 
     quote.is_active = true;
-    quote.bump = *ctx.bumps.get("quote").unwrap();
+    quote.bump = ctx.bumps.quote;
     quote.leverage = params.leverage;
 
     // Update market maker

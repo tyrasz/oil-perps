@@ -20,7 +20,7 @@ pub struct UpdateFunding<'info> {
 
     /// CHECK: Pyth price feed
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
-    pub pyth_price_feed: AccountInfo<'info>,
+    pub pyth_price_feed: UncheckedAccount<'info>,
 }
 
 /// §8 steps 3–8 at `oracle_price`: charge every open funding period missed
@@ -79,7 +79,7 @@ pub fn log_funding(market: &Market, oracle_price: u64, ev: FundingUpdated) {
         market.short_open_interest,
         oracle_price
     );
-    emit!(ev);
+    emit_event!(ev);
 }
 
 /// Crank funding inline if a period is due (D40). Unsettled markets only;

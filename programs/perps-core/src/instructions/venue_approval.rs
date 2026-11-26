@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use crate::errors::PerpsError;
 use anchor_lang::solana_program::instruction::{get_stack_height, TRANSACTION_LEVEL_STACK_HEIGHT};
-use anchor_lang::solana_program::sysvar::instructions::{self as ix_sysvar, load_current_index_checked, load_instruction_at_checked};
+use solana_instructions_sysvar::{self as ix_sysvar, load_current_index_checked, load_instruction_at_checked};
 use crate::state::{Market, Venue, VenueApproval, MAX_APPROVAL_SECS, ROLE_MAKER, SIDE_LONG, SIDE_SHORT};
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
@@ -121,7 +121,7 @@ pub fn approve_venue(ctx: Context<ApproveVenue>, role: u8, params: VenueApproval
     approval.fills = 0;
     approval.collateral_committed = 0;
     approval.role = role;
-    approval.bump = *ctx.bumps.get("approval").unwrap();
+    approval.bump = ctx.bumps.approval;
     msg!("Venue approval: owner={}, venue={}, role={}, allowance={}", approval.owner, approval.venue, role, approval.allowance);
     Ok(())
 }

@@ -3,9 +3,9 @@
 // for everything that is not time; time spans scaled to the one-hour test week
 // of SCHEDULE_TEST_HOURLY (D46).
 
-import { BN, SCHEDULE_TEST_HOURLY, USDC } from "./lib";
+import { BN, OIL_FEED_ID, SCHEDULE_TEST_HOURLY, USDC } from "./lib";
 
-/** initialize-market.ts MARKET_CONFIGS.OIL, funding interval 60 s (the minimum). */
+/** initialize-market.ts MARKET_CONFIGS.OIL, funding interval 60 s (the minimum), the OIL feed id. */
 export const MARKET_PARAMS = {
   commodity: "OIL",
   maxLeverage: 20_000,
@@ -16,6 +16,8 @@ export const MARKET_PARAMS = {
   liquidationFee: 100,
   maxOpenInterest: new BN(10_000_000_000_000),
   fundingInterval: new BN(Number(process.env.FUNDING_INTERVAL_SECS ?? 60)),
+  // The production OIL feed id (USOILSPOT), which the mock-pyth feed carries (D47)
+  pythFeedId: OIL_FEED_ID,
 };
 
 /** initialize-market.ts RISK_CONFIGS.OIL on the test schedule, W = 300 s. */

@@ -462,6 +462,34 @@ async fn venue_oracle_age_is_tighter_than_the_default() {
     env.fill(&fa, fill_params(n)).await.unwrap();
 }
 
+/// venue_fill reads the feed with read_price's checks (docs/lp-pool.md D47),
+/// with the venue's tighter age; a publish time ahead of the clock is bounded
+/// by the fixed `MAX_FUTURE_PUBLISH_SECS` (60 s), not by the venue's age (D52).
+#[tokio::test]
+async fn venue_fill_reads_the_feed_like_open_position() {
+    use perps_core::pyth_receiver::PriceUpdateV2View;
+    let mut env = Env::new().await;
+    let t = env.now().await;
+    let g = PriceUpdateV2View::new(OIL_FEED_ID, pyth_dollars(75.0), 0, -8, t);
+    let (fa, n) = env.std_accounts();
+    for (data, owner, code) in [
+        (g.to_partial_bytes(13), PYTH_PROGRAM, perr(PerpsError::OracleNotFullyVerified)),
+        (PriceUpdateV2View { feed_id: [7; 32], ..g }.to_bytes(), PYTH_PROGRAM, perr(PerpsError::OracleFeedIdMismatch)),
+        (g.to_bytes(), Pubkey::new_unique(), perr(PerpsError::InvalidOracleAccount)),
+        (g.to_bytes()[..132].to_vec(), PYTH_PROGRAM, perr(PerpsError::InvalidOracleAccount)),
+        // 61 s ahead of the clock: past the future bound
+        (PriceUpdateV2View { publish_time: t + 61, ..g }.to_bytes(), PYTH_PROGRAM, perr(PerpsError::StaleOraclePrice)),
+        (PriceUpdateV2View { conf: 75_010_000, ..g }.to_bytes(), PYTH_PROGRAM, perr(PerpsError::OracleConfidenceTooWide)),
+    ] {
+        set_feed(&mut env.base, data, owner).await;
+        env.rejects(&fa, fill_params(n), &[], code).await;
+    }
+    // 60 s ahead (the cluster clock lagging the publisher's) passes the
+    // venue's 15 s age limit: it used to be refused as 60 s "old" (D52)
+    set_feed(&mut env.base, PriceUpdateV2View { publish_time: t + 60, ..g }.to_bytes(), PYTH_PROGRAM).await;
+    env.fill(&fa, fill_params(n)).await.unwrap();
+}
+
 #[tokio::test]
 async fn approvals_are_required_and_scoped_to_venue_and_role() {
     let mut env = Env::new().await;

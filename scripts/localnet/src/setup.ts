@@ -31,6 +31,8 @@ import {
   mockPythSetPriceIx,
   mustSend,
   namedKey,
+  send,
+  big,
   pdas,
   programs,
   saveState,
@@ -50,7 +52,8 @@ import {
   localnetPoolParams,
 } from "./params";
 import { validatePoolParams, decodePoolParams } from "../../../frontend/src/utils/pool";
-import { isOpen, secondsSinceOpen } from "../../../frontend/src/utils/session";
+import { feedIdToHex } from "../../../frontend/src/config/pythFeeds";
+import { fundingCurrent, isOpen, secondsSinceOpen } from "../../../frontend/src/utils/session";
 
 const C = "setup";
 
@@ -103,9 +106,10 @@ async function main() {
     SystemProgram.createAccount({ fromPubkey: admin.publicKey, newAccountPubkey: mint, lamports: rentMint, space: MINT_SIZE, programId: TOKEN_PROGRAM_ID }),
     createInitializeMintInstruction(mint, 6, admin.publicKey, null),
     SystemProgram.createAccount({ fromPubkey: admin.publicKey, newAccountPubkey: feed, lamports: rentFeed, space: PRICE_ACCOUNT_SIZE, programId: MOCK_PYTH_ID }),
-    mockPythInitializeIx(feed, oracle.publicKey, price, conf),
+    // A Full PriceUpdateV2 for the OIL feed id, owned by mock-pyth (D47)
+    mockPythInitializeIx(feed, oracle.publicKey, price, conf, MARKET_PARAMS.pythFeedId),
   ], [admin, mintKp, feedKp, oracle]);
-  log(C, `mint ${mint.toBase58()}, mock-pyth feed ${feed.toBase58()} at $${START_PRICE}`);
+  log(C, `mint ${mint.toBase58()}, mock-pyth feed ${feed.toBase58()} (feed id ${feedIdToHex(MARKET_PARAMS.pythFeedId)}) at $${START_PRICE}`);
 
   // --- protocol config: mock-pyth is the oracle program (TEST ONLY) ---------
   await mustSend(conn, C, "initialize_config", [
@@ -157,6 +161,10 @@ async function main() {
   ], [admin]);
   const m = (await perps.account.market.fetch(market)) as any;
   if (m.sessionSchedule !== MARKET_CONFIG.sessionSchedule) throw new Error("schedule not applied");
+  // The market pins the feed, its id and mock-pyth as the owner every read checks (D47)
+  if (!m.pythPriceFeed.equals(feed) || feedIdToHex(m.pythFeedId) !== feedIdToHex(MARKET_PARAMS.pythFeedId) || !m.oracleProgram.equals(MOCK_PYTH_ID)) {
+    throw new Error("the market does not pin the mock-pyth feed");
+  }
   log(C, `market ${market.toBase58()} on SCHEDULE_TEST_HOURLY; LP pool ${lpPool.toBase58()} (initialize_pool validated the scaled params on chain)`);
 
   // The seed lp_deposit needs the market open and outside the reopen quiet
@@ -171,21 +179,48 @@ async function main() {
   }
   // The price driver starts only after setup: when setup waited (over a
   // weekend, say) the feed written at creation is older than 60 s by now
-  // (StaleOraclePrice), so the seed transaction republishes it first
-  await mustSend(conn, C, "seed_lp_deposit", [
-    mockPythSetPriceIx(feed, oracle.publicKey, price, conf),
-    await perps.methods
-      .initLpPosition(0)
-      .accounts({ owner: admin.publicKey, lpPool, lpPosition: seedPosition, systemProgram: SystemProgram.programId })
-      .instruction(),
-    await perps.methods
-      .lpDeposit(seed, seed.subn(1_000_000))
-      .accounts({
-        owner: admin.publicKey, market, lpPool, lpPosition: seedPosition, vaultTokenAccount: vaultToken,
-        ownerTokenAccount: ata(admin.publicKey), pythPriceFeed: feed, tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .instruction(),
-  ], [admin, oracle]);
+  // (StaleOraclePrice), so the seed transaction republishes it first. The
+  // keeper also starts only after setup, and lp_deposit refuses a funding
+  // accumulator more than one interval (60 s) of open time behind
+  // (FundingStale): after a wait the seed cranks update_funding itself
+  // (permissionless) between the republish and the deposit. Decided at the
+  // chain clock; a decision the clock overtakes before the transaction lands
+  // (FundingStale or FundingNotDue) is retried.
+  for (let attempt = 1; ; attempt++) {
+    const mk = (await perps.account.market.fetch(market)) as any;
+    const t = await chainTime(conn);
+    const current = fundingCurrent(
+      MARKET_CONFIG.sessionSchedule,
+      big(mk.settlementPrice) > 0n,
+      Number(big(mk.lastFundingTime)),
+      Number(big(mk.fundingCarrySecs)),
+      Number(big(mk.fundingInterval)),
+      t
+    );
+    const ixs = [mockPythSetPriceIx(feed, oracle.publicKey, price, conf)];
+    if (!current) {
+      ixs.push(await perps.methods.updateFunding().accounts({ keeper: admin.publicKey, market, pythPriceFeed: feed }).instruction());
+    }
+    ixs.push(
+      await perps.methods
+        .initLpPosition(0)
+        .accounts({ owner: admin.publicKey, lpPool, lpPosition: seedPosition, systemProgram: SystemProgram.programId })
+        .instruction(),
+      await perps.methods
+        .lpDeposit(seed, seed.subn(1_000_000))
+        .accounts({
+          owner: admin.publicKey, market, lpPool, lpPosition: seedPosition, vaultTokenAccount: vaultToken,
+          ownerTokenAccount: ata(admin.publicKey), pythPriceFeed: feed, tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .instruction()
+    );
+    const r = await send(conn, C, current ? "seed_lp_deposit" : "seed_lp_deposit+update_funding", ixs, [admin, oracle]);
+    if (r.ok) break;
+    const raced = r.code === "perps_core:FundingStale" || r.code === "perps_core:FundingNotDue";
+    if (!raced || attempt >= 3) throw new Error(`seed_lp_deposit failed: ${r.code}\n${(r.logs ?? []).join("\n")}`);
+    log(C, `seed_lp_deposit raced the funding interval (${r.code}); retrying`);
+    await new Promise((res) => setTimeout(res, 2_000));
+  }
   log(C, `LP pool seeded with $${LP_SEED_USDC}`);
 
   // PoolParams::validate on the test schedule once more: the TS mirror, and
@@ -248,6 +283,7 @@ async function main() {
     createdAt: await chainTime(conn),
     mint: mint.toBase58(),
     feed: feed.toBase58(),
+    feedId: feedIdToHex(MARKET_PARAMS.pythFeedId),
     market: market.toBase58(),
     vault: vault.toBase58(),
     vaultToken: vaultToken.toBase58(),

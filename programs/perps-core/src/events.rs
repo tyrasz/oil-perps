@@ -193,3 +193,30 @@ pub struct PoolParamsCancelled {
     pub params: PoolParams,
     pub effective_at: i64,
 }
+
+/// Oracle feed rotation (docs/lp-pool.md D47). `price_feed` / `feed_id` are
+/// the proposed (Proposed, Cancelled) or new (Applied) feed; `effective_at`
+/// is when it may be or was applied.
+#[event]
+pub struct OracleFeedProposed {
+    pub market: Pubkey,
+    pub price_feed: Pubkey,
+    pub feed_id: [u8; 32],
+    pub effective_at: i64,
+}
+
+#[event]
+pub struct OracleFeedApplied {
+    pub market: Pubkey,
+    pub price_feed: Pubkey,
+    pub feed_id: [u8; 32],
+    pub effective_at: i64,
+}
+
+#[event]
+pub struct OracleFeedCancelled {
+    pub market: Pubkey,
+    pub price_feed: Pubkey,
+    pub feed_id: [u8; 32],
+    pub effective_at: i64,
+}

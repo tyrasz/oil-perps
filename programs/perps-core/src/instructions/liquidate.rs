@@ -23,7 +23,7 @@ pub struct Liquidate<'info> {
     pub liquidator: Signer<'info>,
 
     /// CHECK: Position owner, doesn't need to sign
-    pub position_owner: AccountInfo<'info>,
+    pub position_owner: UncheckedAccount<'info>,
 
     #[account(
         mut,
@@ -70,7 +70,7 @@ pub struct Liquidate<'info> {
 
     /// CHECK: Pyth price feed
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
-    pub pyth_price_feed: AccountInfo<'info>,
+    pub pyth_price_feed: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 
@@ -388,7 +388,7 @@ pub fn handler(ctx: Context<Liquidate>) -> Result<()> {
             to: a.liquidator_token_account.to_account_info(),
             authority: a.vault.to_account_info(),
         };
-        let cpi_ctx = CpiContext::new_with_signer(a.token_program.to_account_info(), cpi_accounts, signer);
+        let cpi_ctx = CpiContext::new_with_signer(a.token_program.key(), cpi_accounts, signer);
         token::transfer(cpi_ctx, o.keeper_reward)?;
     }
     let after = vt_before.checked_sub(o.keeper_reward).ok_or(PerpsError::VaultInvariantViolated)?;
@@ -403,7 +403,7 @@ pub fn handler(ctx: Context<Liquidate>) -> Result<()> {
         insurance_before,
         a.market.insurance_fund
     );
-    emit!(PositionLiquidated {
+    emit_event!(PositionLiquidated {
         position: position_key,
         stage: o.stage,
         size_closed: o.size_closed,

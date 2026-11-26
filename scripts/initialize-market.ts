@@ -1,33 +1,30 @@
-import * as anchor from '@coral-xyz/anchor';
-import { Program } from '@coral-xyz/anchor';
+import * as anchor from '@anchor-lang/core';
+import { Program } from '@anchor-lang/core';
+// Generated with the IDL by scripts/gen-idl.sh (target/types/perps_core.ts)
+import type { PerpsCore } from '../target/types/perps_core';
 import { PublicKey, Keypair, Connection } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, getAccount, getAssociatedTokenAddressSync } from '@solana/spl-token';
-import * as fs from 'fs';
-import * as path from 'path';
+import {
+  PERPS_CORE_PROGRAM_ID,
+  USDC_MINT,
+  getConfigPDA,
+  getLpPoolPDA,
+  getMarketPDA,
+  getProgramDataPDA,
+  loadKeypair,
+  loadPerpsProgram,
+} from './common';
+import { PythPrograms, assertPythFeed, commodityFeed, feedIdToHex, pythPrograms } from './pyth-feeds';
 
-// Program ID
-const PERPS_CORE_PROGRAM_ID = new PublicKey('Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS');
-const BPF_LOADER_UPGRADEABLE = new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111');
-
-function getConfigPDA(): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync([Buffer.from('config')], PERPS_CORE_PROGRAM_ID);
-}
-
-function getProgramDataPDA(): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync([PERPS_CORE_PROGRAM_ID.toBuffer()], BPF_LOADER_UPGRADEABLE);
-}
-
-// USDC Mint (Testnet)
-const USDC_MINT = new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU');
-
-// Pyth Price Feeds (Testnet)
-const PYTH_PRICE_FEEDS: Record<string, PublicKey> = {
-  OIL: new PublicKey('GVXRSBjFk6e6J3NbVPXohDJetcTjaeeuykUpbQF8UoMU'),
-  GOLD: new PublicKey('sXgHcPCNsXM8KaC3CXNXQS8qprLR4dVxQyJyxNmBsLR'),
-  SILVER: new PublicKey('77JipqJaP9LPFyEGjT2zqz5qxL6KBx3nVtbMd1PPdPr9'),
-  NATGAS: new PublicKey('DBE3N8uNjhKPNAR4oJT8vKwZQN5yDsRXGBCQu4k3Gfgr'),
-  COPPER: new PublicKey('4wxQsP2B7HNyH4sH3n2J1oKeW6vPExU6mBLgPswN8pqZ'),
-};
+// Pyth price feeds (docs/lp-pool.md D47, D51): each market pins the Pyth
+// push oracle's shard-0 PriceUpdateV2 account for its Pyth Core feed id,
+// PDA([0u16 LE, feed_id], push oracle), owned by the Pyth Receiver
+// (ProtocolConfig.oracle_program). PYTH_PROGRAMS (required) picks the
+// pro-compatible or legacy program pair; the feed ids are
+// frontend/src/config/pythFeeds.ts. NATGAS and COPPER have no verified Core
+// feed id and are refused. Pyth sponsors no commodity feed on Solana: the
+// protocol's price pusher must have pushed the feed (which creates the
+// account) before its market is created, and must keep it fresh.
 
 // Market configurations per commodity
 const MARKET_CONFIGS: Record<string, {
@@ -114,14 +111,6 @@ const RISK_CONFIGS: Record<string, {
 };
 
 // PDA derivation functions
-// One market per (collateral mint, commodity)
-function getMarketPDA(collateralMint: PublicKey, commodity: string): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from('market'), collateralMint.toBuffer(), Buffer.from(commodity)],
-    PERPS_CORE_PROGRAM_ID
-  );
-}
-
 function getVaultPDA(market: PublicKey): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
     [Buffer.from('vault'), market.toBuffer()],
@@ -134,10 +123,6 @@ function getVaultTokenAccountPDA(market: PublicKey): [PublicKey, number] {
     [Buffer.from('vault_token'), market.toBuffer()],
     PERPS_CORE_PROGRAM_ID
   );
-}
-
-function getLpPoolPDA(market: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync([Buffer.from('lp_pool'), market.toBuffer()], PERPS_CORE_PROGRAM_ID);
 }
 
 function getLpPositionPDA(lpPool: PublicKey, owner: PublicKey): [PublicKey, number] {
@@ -248,7 +233,7 @@ function adlKeeper(authority: Keypair): PublicKey {
  * lp_deposit if the admin holds LP_SEED.
  */
 async function poolBootstrapIxs(
-  program: Program,
+  program: Program<PerpsCore>,
   connection: Connection,
   authority: Keypair,
   marketPda: PublicKey,
@@ -319,10 +304,11 @@ async function poolBootstrapIxs(
 
 /** For an existing market: create its pool if missing and seed it if it has no LPs. */
 async function ensurePool(
-  program: Program,
+  program: Program<PerpsCore>,
   connection: Connection,
   authority: Keypair,
-  commodity: string
+  commodity: string,
+  pythPriceFeed: PublicKey
 ): Promise<void> {
   const [marketPda] = getMarketPDA(USDC_MINT, commodity);
   const [lpPool] = getLpPoolPDA(marketPda);
@@ -336,7 +322,7 @@ async function ensurePool(
     }
   }
   console.log(exists ? `LP pool ${lpPool} has no LPs yet: seeding` : `Market has no LP pool: creating ${lpPool}`);
-  const { ixs, seeded } = await poolBootstrapIxs(program, connection, authority, marketPda, PYTH_PRICE_FEEDS[commodity], {
+  const { ixs, seeded } = await poolBootstrapIxs(program, connection, authority, marketPda, pythPriceFeed, {
     createPool: !exists,
     withSeed: true,
     commodity,
@@ -359,28 +345,20 @@ async function ensurePool(
   }
 }
 
-async function loadKeypair(): Promise<Keypair> {
-  const keypairPath = process.env.ANCHOR_WALLET ||
-    path.join(process.env.HOME || '', '.config/solana/id.json');
-
-  const keypairData = JSON.parse(fs.readFileSync(keypairPath, 'utf-8'));
-  return Keypair.fromSecretKey(Uint8Array.from(keypairData));
-}
-
 async function initializeMarket(
-  program: Program,
+  program: Program<PerpsCore>,
   authority: Keypair,
-  commodity: string
+  commodity: string,
+  pyth: PythPrograms
 ): Promise<string> {
   const config = MARKET_CONFIGS[commodity];
   if (!config) {
     throw new Error(`Unknown commodity: ${commodity}`);
   }
 
-  const pythPriceFeed = PYTH_PRICE_FEEDS[commodity];
-  if (!pythPriceFeed) {
-    throw new Error(`No Pyth price feed for commodity: ${commodity}`);
-  }
+  // Throws for a commodity without a verified feed id
+  const feed = commodityFeed(commodity, pyth);
+  const pythPriceFeed = feed.address;
 
   const [marketPda] = getMarketPDA(USDC_MINT, commodity);
   const [vaultPda] = getVaultPDA(marketPda);
@@ -390,7 +368,7 @@ async function initializeMarket(
   console.log(`  Market PDA: ${marketPda.toString()}`);
   console.log(`  Vault PDA: ${vaultPda.toString()}`);
   console.log(`  Vault Token Account: ${vaultTokenAccountPda.toString()}`);
-  console.log(`  Pyth Price Feed: ${pythPriceFeed.toString()}`);
+  console.log(`  Pyth Price Feed: ${pythPriceFeed.toString()} (feed id ${feed.feedIdHex}, ${pyth.set} push oracle shard 0)`);
 
   const params = {
     commodity,
@@ -402,6 +380,8 @@ async function initializeMarket(
     liquidationFee: config.liquidationFee,
     maxOpenInterest: new anchor.BN(config.maxOpenInterest),
     fundingInterval: new anchor.BN(config.fundingInterval),
+    // The feed account must be a Full PriceUpdateV2 for this id (D47)
+    pythFeedId: feed.feedId,
   };
 
   const initMarket = () =>
@@ -451,7 +431,7 @@ async function initializeMarket(
 }
 
 async function applyRiskConfig(
-  program: Program,
+  program: Program<PerpsCore>,
   authority: Keypair,
   commodity: string,
   isPaused: boolean
@@ -489,15 +469,16 @@ async function applyRiskConfig(
 /**
  * One-time protocol setup. Must be signed by the program's upgrade authority,
  * which becomes the admin (hand over later with propose_admin/accept_admin).
- * The guardian (pause-only) comes from GUARDIAN; the Pyth oracle program from
- * PYTH_PROGRAM_ID (required: it is what price feeds are checked against, so it
- * must not be read off a feed account).
+ * The guardian (pause-only) comes from GUARDIAN; the oracle program is the
+ * Pyth Receiver of the PYTH_PROGRAMS pair (required: it is what price feeds
+ * are checked against, so it must not be read off a feed account).
  */
 async function ensureProtocolConfig(
-  program: Program,
+  program: Program<PerpsCore>,
   connection: Connection,
   authority: Keypair,
-  commodity: string
+  commodity: string,
+  pyth: PythPrograms
 ): Promise<void> {
   const [configPda] = getConfigPDA();
   const existing = await connection.getAccountInfo(configPda);
@@ -509,11 +490,19 @@ async function ensureProtocolConfig(
     if (!config.admin.equals(authority.publicKey)) {
       throw new Error(`This wallet (${authority.publicKey}) is not the protocol admin (${config.admin})`);
     }
+    // New markets snapshot config.oracle_program as their feed owner (D47)
+    if (!config.oracleProgram.equals(pyth.receiver)) {
+      throw new Error(
+        `The protocol's oracle program is ${config.oracleProgram}, not the ${pyth.set} Pyth Receiver ${pyth.receiver}: ` +
+          'fix PYTH_PROGRAMS, or change it with update_roles (existing markets then need a feed rotation, oracle-feed.ts)'
+      );
+    }
     return;
   }
 
-  const oracleProgram = requiredPythProgram();
-  await assertPythFeed(connection, PYTH_PRICE_FEEDS[commodity], oracleProgram);
+  const oracleProgram = pyth.receiver;
+  const feed = commodityFeed(commodity, pyth);
+  await assertPythFeed(connection, feed.address, oracleProgram, feed.feedId);
   let guardian = authority.publicKey;
   if (process.env.GUARDIAN) {
     guardian = new PublicKey(process.env.GUARDIAN);
@@ -535,27 +524,6 @@ async function ensureProtocolConfig(
   console.log(`Protocol config created: ${tx}`);
 }
 
-const PYTH_MAGIC = 0xa1b2c3d4;
-
-function requiredPythProgram(): PublicKey {
-  if (!process.env.PYTH_PROGRAM_ID) {
-    throw new Error('Set PYTH_PROGRAM_ID to the Pyth oracle program for this cluster (see https://docs.pyth.network)');
-  }
-  return new PublicKey(process.env.PYTH_PROGRAM_ID);
-}
-
-/** Fail unless `feed` is a Pyth price account owned by `oracleProgram`. */
-async function assertPythFeed(connection: Connection, feed: PublicKey, oracleProgram: PublicKey): Promise<void> {
-  const info = await connection.getAccountInfo(feed);
-  if (!info) throw new Error(`Price feed ${feed} does not exist`);
-  if (!info.owner.equals(oracleProgram)) {
-    throw new Error(`Price feed ${feed} is owned by ${info.owner}, not the Pyth program ${oracleProgram}`);
-  }
-  if (info.data.length < 4 || info.data.readUInt32LE(0) !== PYTH_MAGIC) {
-    throw new Error(`Price feed ${feed} is not a Pyth price account`);
-  }
-}
-
 async function checkMarketExists(connection: Connection, commodity: string): Promise<boolean> {
   const [marketPda] = getMarketPDA(USDC_MINT, commodity);
   const accountInfo = await connection.getAccountInfo(marketPda);
@@ -574,18 +542,28 @@ async function main() {
   console.log(`Network: ${rpcUrl}`);
   console.log(`Commodity: ${commodity}`);
   console.log(`Program ID: ${PERPS_CORE_PROGRAM_ID.toString()}`);
-  console.log(`USDC Mint: ${USDC_MINT.toString()}\n`);
+  console.log(`USDC Mint: ${USDC_MINT.toString()}`);
+
+  // Refuse a commodity without a verified Pyth feed id, or no PYTH_PROGRAMS,
+  // before touching the cluster
+  let pyth: PythPrograms;
+  let feed: ReturnType<typeof commodityFeed>;
+  try {
+    pyth = pythPrograms();
+    feed = commodityFeed(commodity, pyth);
+  } catch (error) {
+    console.error((error as Error).message);
+    process.exit(1);
+  }
+  console.log(`Pyth: ${pyth.set} programs (Receiver ${pyth.receiver}, push oracle ${pyth.pushOracle})`);
+  console.log(`Feed: id ${feed.feedIdHex}, account ${feed.address}\n`);
 
   // Load keypair
   const authority = await loadKeypair();
   console.log(`Authority: ${authority.publicKey.toString()}`);
 
-  // Setup connection and provider
+  // Setup connection
   const connection = new Connection(rpcUrl, 'confirmed');
-  const wallet = new anchor.Wallet(authority);
-  const provider = new anchor.AnchorProvider(connection, wallet, {
-    commitment: 'confirmed',
-  });
 
   // Check balance
   const balance = await connection.getBalance(authority.publicKey);
@@ -597,21 +575,13 @@ async function main() {
     process.exit(1);
   }
 
-  // Load IDL
-  const idlPath = path.join(__dirname, '../target/idl/perps_core.json');
-  if (!fs.existsSync(idlPath)) {
-    console.error(`IDL not found at ${idlPath}`);
-    console.log('Run: anchor build');
-    process.exit(1);
-  }
-
-  const idl = JSON.parse(fs.readFileSync(idlPath, 'utf-8'));
-  const program = new Program(idl, PERPS_CORE_PROGRAM_ID, provider);
+  // perps-core from target/idl (exits if missing or for another program id)
+  const program = loadPerpsProgram(connection, authority);
 
   // Only the upgrade authority can create the config, and only the admin can
   // create markets: do this right after deploying.
   try {
-    await ensureProtocolConfig(program, connection, authority, commodity);
+    await ensureProtocolConfig(program, connection, authority, commodity, pyth);
   } catch (error) {
     console.error('Protocol config setup failed (is this wallet the upgrade authority / admin?):', error);
     process.exit(1);
@@ -627,12 +597,18 @@ async function main() {
       isPaused = market.isPaused;
       console.log(`Market already exists: ${marketPda.toString()} (paused: ${isPaused})`);
       // Never adopt a market pointing at a different price feed (e.g. one
-      // created before admin-only market creation existed)
-      const feed = market.pythPriceFeed as PublicKey;
-      if (!feed.equals(PYTH_PRICE_FEEDS[commodity])) {
-        throw new Error(`Existing ${commodity} market uses price feed ${feed}, expected ${PYTH_PRICE_FEEDS[commodity]}. Pause or settle it instead of configuring it.`);
+      // created before admin-only market creation existed). A deliberate
+      // change of feed goes through the timelocked rotation (oracle-feed.ts).
+      const pinned = market.pythPriceFeed as PublicKey;
+      const pinnedId = feedIdToHex(market.pythFeedId as number[]);
+      if (!pinned.equals(feed.address) || pinnedId !== feed.feedIdHex) {
+        throw new Error(
+          `Existing ${commodity} market uses price feed ${pinned} (feed id ${pinnedId}), expected ${feed.address} ` +
+            `(feed id ${feed.feedIdHex}). Rotate it with scripts/oracle-feed.ts, or pause or settle it, instead of configuring it.`
+        );
       }
-      await assertPythFeed(connection, feed, requiredPythProgram());
+      // Every price read checks the owner the market snapshotted
+      await assertPythFeed(connection, pinned, market.oracleProgram as PublicKey, market.pythFeedId as number[]);
       // Don't silently overwrite settings an operator may have tightened
       if (!updateConfig) {
         const current = ['sessionSchedule', 'preCloseWindowSecs', 'weekendInitialMarginRatio',
@@ -640,13 +616,13 @@ async function main() {
           .map((k) => `  ${k}: ${String(market[k])}`).join('\n');
         console.log(`Current risk settings:\n${current}`);
         console.log(`Not changing them. Re-run with --update-config to apply this script's values:`, RISK_CONFIGS[commodity]);
-        await ensurePool(program, connection, authority, commodity);
+        await ensurePool(program, connection, authority, commodity, pinned);
         return;
       }
-      await ensurePool(program, connection, authority, commodity);
+      await ensurePool(program, connection, authority, commodity, pinned);
     } else {
-      await assertPythFeed(connection, PYTH_PRICE_FEEDS[commodity], requiredPythProgram());
-      const signature = await initializeMarket(program, authority, commodity);
+      await assertPythFeed(connection, feed.address, pyth.receiver, feed.feedId);
+      const signature = await initializeMarket(program, authority, commodity, pyth);
       console.log(`https://explorer.solana.com/tx/${signature}?cluster=testnet`);
     }
 

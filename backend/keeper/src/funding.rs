@@ -96,6 +96,10 @@ async fn update_market_funding(
         open_secs
     );
 
+    // update_funding reads the price before it charges: skip the crank (and
+    // report why) if the program would refuse the feed (D47)
+    crate::oracle::fetch_oracle_price(client, &market_data, now)?;
+
     // Log current OI for transparency
     info!(
         "Current OI - Long: ${:.2}, Short: ${:.2}",

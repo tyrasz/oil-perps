@@ -3,10 +3,12 @@
 use anchor_lang::{InstructionData, ToAccountMetas};
 use prop_amm::instructions::{ClosePositionParams, InitializeVaultParams, OpenPositionParams};
 use prop_amm::PropAmmError;
-use pyth_sdk_solana::state::{AccountType, PriceAccount, PriceInfo, PriceStatus, MAGIC, VERSION_2};
+use prop_amm::oracle::pyth_receiver::PriceUpdateV2View;
+use prop_amm::LpVault;
+use anchor_lang::{AccountDeserialize, AccountSerialize};
 use solana_program_test::{processor, BanksClientError, ProgramTest, ProgramTestContext};
 use solana_sdk::{
-    account::Account,
+    account::{Account, AccountSharedData},
     bpf_loader_upgradeable::{self, UpgradeableLoaderState},
     clock::Clock,
     instruction::{Instruction, InstructionError},
@@ -23,14 +25,30 @@ const NOW: i64 = 1_794_416_400;
 const PYTH_PROGRAM: Pubkey = Pubkey::new_from_array([0x50; 32]);
 
 fn process(program_id: &Pubkey, accounts: &[solana_sdk::account_info::AccountInfo], data: &[u8]) -> solana_sdk::entrypoint::ProgramResult {
+    // Anchor 1.2's entry wants one lifetime for the id, the accounts and the data
+    let program_id: &Pubkey = Box::leak(Box::new(*program_id));
+    let data: &[u8] = Box::leak(data.to_vec().into_boxed_slice());
     let accounts = Box::leak(Box::new(accounts.to_vec()));
     prop_amm::entry(program_id, accounts, data)
 }
 
+/// The vault's Pyth feed id (USOILSPOT's, as perps-core's OIL market).
+const FEED_ID: [u8; 32] = [
+    0x92, 0x5c, 0xa9, 0x2f, 0xf0, 0x05, 0xae, 0x94, 0x3c, 0x15, 0x8e, 0x35, 0x63, 0xf5, 0x96, 0x98,
+    0xce, 0x7e, 0x75, 0xc5, 0xa8, 0xc8, 0xdd, 0x43, 0x30, 0x3a, 0x0a, 0x15, 0x48, 0x87, 0xb3, 0xe6,
+];
+
+/// A Full Pyth Receiver `PriceUpdateV2` for `FEED_ID` at `price` (expo -8), published at `NOW`.
 fn pyth_account(price: i64, owner: Pubkey) -> Account {
-    let mut acct = PriceAccount { magic: MAGIC, ver: VERSION_2, atype: AccountType::Price as u32, expo: -8, timestamp: NOW, ..Default::default() };
-    acct.agg = PriceInfo { price, conf: 0, status: PriceStatus::Trading, ..Default::default() };
-    Account { lamports: 1_000_000_000, data: bytemuck::bytes_of(&acct).to_vec(), owner, executable: false, rent_epoch: 0 }
+    feed(PriceUpdateV2View::new(FEED_ID, price, 0, -8, NOW).to_bytes(), owner)
+}
+
+fn feed(data: Vec<u8>, owner: Pubkey) -> Account {
+    Account { lamports: 1_000_000_000, data, owner, executable: false, rent_epoch: 0 }
+}
+
+fn perr(e: PropAmmError) -> u32 {
+    e.into()
 }
 
 fn config_pda() -> Pubkey {
@@ -95,6 +113,8 @@ impl Env {
             rent_epoch: 0,
         });
         let mut ctx = pt.start_with_context().await;
+        // Lets the native (non-SBF) program reach program-test's clock and CPI stubs
+        solana_sdk::native_stubs::install();
         let mut clock: Clock = ctx.banks_client.get_sysvar().await.unwrap();
         clock.unix_timestamp = NOW;
         ctx.set_sysvar(&clock);
@@ -139,6 +159,10 @@ impl Env {
     }
 
     async fn init_vault(&mut self, signer: &Keypair, oracle: Pubkey) -> Result<(), BanksClientError> {
+        self.init_vault_for(signer, oracle, FEED_ID).await
+    }
+
+    async fn init_vault_for(&mut self, signer: &Keypair, oracle: Pubkey, pyth_feed_id: [u8; 32]) -> Result<(), BanksClientError> {
         let accounts = prop_amm::accounts::InitializeVault {
             authority: signer.pubkey(),
             config: config_pda(),
@@ -160,6 +184,7 @@ impl Env {
             trading_fee: 5,
             lp_fee_share: 7_000,
             withdrawal_delay: 86_400,
+            pyth_feed_id,
         };
         self.exec(accounts, prop_amm::instruction::InitializeVault { params }, signer).await
     }
@@ -180,12 +205,17 @@ impl Env {
     }
 
     async fn open(&mut self, trader: &Keypair) -> Result<(), BanksClientError> {
+        let tokens = self.attacker_tokens;
+        self.open_with(trader, tokens).await
+    }
+
+    async fn open_with(&mut self, trader: &Keypair, trader_token_account: Pubkey) -> Result<(), BanksClientError> {
         let accounts = prop_amm::accounts::OpenPositionAmm {
             trader: trader.pubkey(),
             config: config_pda(),
             vault: self.vault,
             vault_token_account: self.vault_token,
-            trader_token_account: self.attacker_tokens,
+            trader_token_account,
             pyth_price_feed: self.oracle,
             token_program: spl_token::ID,
         };
@@ -254,4 +284,151 @@ async fn admin_handover_moves_trading_rights() {
     let exposure: u32 = PropAmmError::ExposureLimitExceeded.into();
     assert_eq!(custom_error(env.open(&new_admin).await), exposure);
     assert_eq!(custom_error(env.open(&deployer).await), unauthorized());
+}
+
+impl Env {
+    /// `with_funded_vault`, with the $1M recorded as LP assets (so a trade
+    /// passes the utilization check and reaches the oracle) and a token
+    /// account of the deployer's. Returns that account.
+    async fn tradable(&mut self) -> Pubkey {
+        let mut acct = self.ctx.banks_client.get_account(self.vault).await.unwrap().unwrap();
+        let mut v = LpVault::try_deserialize(&mut acct.data.as_slice()).unwrap();
+        v.total_assets = 1_000_000 * USDC;
+        let mut data = Vec::new();
+        v.try_serialize(&mut data).unwrap();
+        acct.data[..data.len()].copy_from_slice(&data);
+        self.ctx.set_account(&self.vault, &AccountSharedData::from(acct));
+
+        let payer = self.ctx.payer.insecure_clone();
+        let tokens = Keypair::new();
+        let rent = self.ctx.banks_client.get_rent().await.unwrap();
+        let len = spl_token::state::Account::LEN;
+        send(&mut self.ctx, &[
+            system_instruction::create_account(&payer.pubkey(), &tokens.pubkey(), rent.minimum_balance(len), len as u64, &spl_token::ID),
+            spl_token::instruction::initialize_account(&spl_token::ID, &tokens.pubkey(), &self.mint, &self.deployer.pubkey()).unwrap(),
+        ], &[&tokens]).await.unwrap();
+        tokens.pubkey()
+    }
+
+    fn set_feed(&mut self, data: Vec<u8>, owner: Pubkey) {
+        let oracle = self.oracle;
+        self.ctx.set_account(&oracle, &AccountSharedData::from(feed(data, owner)));
+    }
+
+    async fn set_time(&mut self, ts: i64) {
+        let mut clock: Clock = self.ctx.banks_client.get_sysvar().await.unwrap();
+        clock.unix_timestamp = ts;
+        self.ctx.set_sysvar(&clock);
+    }
+}
+
+/// open/close read the pinned feed with perps-core's PriceUpdateV2 checks
+/// (docs/lp-pool.md D47): owner = the vault's snapshot of
+/// config.oracle_program (D52), Full, the vault's feed id, at most 60 s old
+/// or ahead, then the shared price rules.
+#[tokio::test]
+async fn trades_read_the_vaults_price_update() {
+    let mut env = Env::new().await.with_funded_vault().await;
+    let deployer = env.deployer.insecure_clone();
+    let tokens = env.tradable().await;
+    env.open_with(&deployer, tokens).await.unwrap();
+    let v: LpVault = {
+        let acct = env.ctx.banks_client.get_account(env.vault).await.unwrap().unwrap();
+        LpVault::try_deserialize(&mut acct.data.as_slice()).unwrap()
+    };
+    assert_eq!((v.total_long_size, v.pyth_feed_id), (USDC, FEED_ID));
+
+    let good = PriceUpdateV2View::new(FEED_ID, 7_500_000_000, 0, -8, NOW);
+    let cases: Vec<(Vec<u8>, Pubkey, u32)> = vec![
+        // Published 61 s before or after the clock
+        (PriceUpdateV2View { publish_time: NOW - 61, ..good }.to_bytes(), PYTH_PROGRAM, perr(PropAmmError::StaleOraclePrice)),
+        (PriceUpdateV2View { publish_time: NOW + 61, ..good }.to_bytes(), PYTH_PROGRAM, perr(PropAmmError::StaleOraclePrice)),
+        (PriceUpdateV2View { feed_id: [7; 32], ..good }.to_bytes(), PYTH_PROGRAM, perr(PropAmmError::OracleFeedIdMismatch)),
+        (good.to_partial_bytes(13), PYTH_PROGRAM, perr(PropAmmError::OracleNotFullyVerified)),
+        (good.to_bytes(), Pubkey::new_unique(), perr(PropAmmError::InvalidOracleAccount)),
+        (good.to_bytes()[..132].to_vec(), PYTH_PROGRAM, perr(PropAmmError::InvalidOracleAccount)),
+        ({ let mut d = good.to_bytes(); d[0] ^= 1; d }, PYTH_PROGRAM, perr(PropAmmError::InvalidOracleAccount)),
+        (PriceUpdateV2View { conf: 75_000_001, ..good }.to_bytes(), PYTH_PROGRAM, perr(PropAmmError::OracleConfidenceTooWide)),
+        (PriceUpdateV2View { price: -1, ..good }.to_bytes(), PYTH_PROGRAM, perr(PropAmmError::InvalidOraclePrice)),
+    ];
+    for (i, (data, owner, code)) in cases.into_iter().enumerate() {
+        env.set_feed(data, owner);
+        assert_eq!(custom_error(env.open_with(&deployer, tokens).await), code, "case {}", i);
+    }
+    // Inside the age limit either way
+    for t in [NOW - 60, NOW + 60] {
+        env.set_feed(PriceUpdateV2View { publish_time: t, ..good }.to_bytes(), PYTH_PROGRAM);
+        env.open_with(&deployer, tokens).await.unwrap();
+    }
+    // The clock moves on: stale
+    env.set_feed(good.to_bytes(), PYTH_PROGRAM);
+    env.set_time(NOW + 61).await;
+    assert_eq!(custom_error(env.open_with(&deployer, tokens).await), perr(PropAmmError::StaleOraclePrice));
+}
+
+#[tokio::test]
+async fn vaults_need_a_full_update_for_their_feed_id() {
+    let mut env = Env::new().await;
+    let deployer = env.deployer.insecure_clone();
+    env.init_config(&deployer).await.unwrap();
+    let oracle = env.oracle;
+    assert_eq!(custom_error(env.init_vault_for(&deployer, oracle, [0; 32]).await), perr(PropAmmError::InvalidParameters));
+    assert_eq!(custom_error(env.init_vault_for(&deployer, oracle, [7; 32]).await), perr(PropAmmError::OracleFeedIdMismatch));
+    env.set_feed(PriceUpdateV2View::new(FEED_ID, 7_500_000_000, 0, -8, NOW).to_partial_bytes(1), PYTH_PROGRAM);
+    assert_eq!(custom_error(env.init_vault(&deployer, oracle).await), perr(PropAmmError::OracleNotFullyVerified));
+    // A stale update is accepted at creation (no age check)
+    env.set_feed(PriceUpdateV2View::new(FEED_ID, 7_500_000_000, 0, -8, NOW - 86_400).to_bytes(), PYTH_PROGRAM);
+    env.init_vault(&deployer, oracle).await.unwrap();
+}
+
+impl Env {
+    async fn set_oracle_program(&mut self, oracle_program: Pubkey) -> Result<(), BanksClientError> {
+        let deployer = self.deployer.insecure_clone();
+        let accounts = prop_amm::accounts::AdminOnly { admin: deployer.pubkey(), config: config_pda() };
+        self.exec(accounts, prop_amm::instruction::SetOracleProgram { oracle_program }, &deployer).await
+    }
+}
+
+/// The vault snapshots the oracle program at creation (docs/lp-pool.md
+/// D52): a later set_oracle_program reaches new vaults only, so existing
+/// vaults keep trading on their feed.
+#[tokio::test]
+async fn vaults_keep_the_oracle_program_they_were_created_with() {
+    let mut env = Env::new().await.with_funded_vault().await;
+    let deployer = env.deployer.insecure_clone();
+    let tokens = env.tradable().await;
+    let v: LpVault = {
+        let acct = env.ctx.banks_client.get_account(env.vault).await.unwrap().unwrap();
+        LpVault::try_deserialize(&mut acct.data.as_slice()).unwrap()
+    };
+    assert_eq!(v.oracle_program, PYTH_PROGRAM);
+    env.set_oracle_program(Pubkey::new_unique()).await.unwrap();
+    env.open_with(&deployer, tokens).await.unwrap();
+    // A feed owned by the new program is not the vault's
+    let good = PriceUpdateV2View::new(FEED_ID, 7_500_000_000, 0, -8, NOW).to_bytes();
+    env.set_feed(good, Pubkey::new_unique());
+    assert_eq!(custom_error(env.open_with(&deployer, tokens).await), perr(PropAmmError::InvalidOracleAccount));
+}
+
+/// Under a Pyth Receiver the vault's feed must be the push oracle's shard-0
+/// account for its feed id (D52): an account anyone can post into is refused.
+#[tokio::test]
+async fn vaults_under_a_pyth_receiver_pin_the_push_feed_account() {
+    use prop_amm::oracle::pyth_push::{push_feed_address, PYTH_PUSH_ORACLE_LEGACY, PYTH_PUSH_ORACLE_PRO, PYTH_RECEIVER_PRO};
+    let mut env = Env::new().await;
+    let deployer = env.deployer.insecure_clone();
+    env.init_config(&deployer).await.unwrap();
+    env.set_oracle_program(PYTH_RECEIVER_PRO).await.unwrap();
+    let data = PriceUpdateV2View::new(FEED_ID, 7_500_000_000, 0, -8, NOW).to_bytes();
+    // A keypair account and the other pair's PDA, both owned by the Receiver
+    for key in [Pubkey::new_unique(), push_feed_address(&PYTH_PUSH_ORACLE_LEGACY, &FEED_ID)] {
+        env.ctx.set_account(&key, &AccountSharedData::from(feed(data.clone(), PYTH_RECEIVER_PRO)));
+        assert_eq!(custom_error(env.init_vault(&deployer, key).await), perr(PropAmmError::InvalidOracleAccount));
+    }
+    let pda = push_feed_address(&PYTH_PUSH_ORACLE_PRO, &FEED_ID);
+    env.ctx.set_account(&pda, &AccountSharedData::from(feed(data, PYTH_RECEIVER_PRO)));
+    env.init_vault(&deployer, pda).await.unwrap();
+    let acct = env.ctx.banks_client.get_account(env.vault).await.unwrap().unwrap();
+    let v = LpVault::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!((v.pyth_price_feed, v.oracle_program), (pda, PYTH_RECEIVER_PRO));
 }

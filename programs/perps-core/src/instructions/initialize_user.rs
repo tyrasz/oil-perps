@@ -33,7 +33,7 @@ pub fn handler(ctx: Context<InitializeUser>) -> Result<()> {
     user_account.total_positions = 0;
     user_account.total_trades = 0;
     user_account.realized_pnl = 0;
-    user_account.bump = *ctx.bumps.get("user_account").unwrap();
+    user_account.bump = ctx.bumps.user_account;
 
     msg!("User account initialized: {}", user_account.key());
     Ok(())

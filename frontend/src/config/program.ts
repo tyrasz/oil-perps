@@ -1,4 +1,12 @@
 import { PublicKey } from '@solana/web3.js';
+import {
+  DEFAULT_PYTH_PROGRAM_SET,
+  PYTH_FEED_IDS,
+  PYTH_PROGRAM_SETS,
+  feedIdFromHex,
+  pushFeedSeeds,
+  type PythProgramSet,
+} from './pythFeeds';
 
 // Perps Core Program ID
 export const PERPS_CORE_PROGRAM_ID = new PublicKey(
@@ -44,17 +52,40 @@ export const ORACLE_SOURCE: 'api' | 'chain' =
 
 export const RPC_ENDPOINT = import.meta.env.VITE_RPC_URL || RPC_ENDPOINTS[network as keyof typeof RPC_ENDPOINTS] || RPC_ENDPOINTS.testnet;
 
-// Pyth Price Feed IDs (Testnet/Devnet - these are the same on both)
-// VITE_PYTH_FEED_<ID> overrides one (localnet: the mock-pyth feed)
-const feedOverride = (id: string, fallback: string) =>
-  new PublicKey((import.meta.env as Record<string, string | undefined>)[`VITE_PYTH_FEED_${id}`] || fallback);
-export const PYTH_PRICE_FEEDS: Record<string, PublicKey> = {
-  OIL: feedOverride('OIL', 'GVXRSBjFk6e6J3NbVPXohDJetcTjaeeuykUpbQF8UoMU'),
-  GOLD: feedOverride('GOLD', 'sXgHcPCNsXM8KaC3CXNXQS8qprLR4dVxQyJyxNmBsLR'),
-  SILVER: feedOverride('SILVER', '77JipqJaP9LPFyEGjT2zqz5qxL6KBx3nVtbMd1PPdPr9'),
-  NATGAS: feedOverride('NATGAS', 'DBE3N8uNjhKPNAR4oJT8vKwZQN5yDsRXGBCQu4k3Gfgr'),
-  COPPER: feedOverride('COPPER', '4wxQsP2B7HNyH4sH3n2J1oKeW6vPExU6mBLgPswN8pqZ'),
-};
+// The price feed account each market pins (docs/lp-pool.md D47, D51): the
+// Pyth push oracle's shard-0 PriceUpdateV2 account for the commodity's feed
+// id, PDA([0u16 LE, feed_id], push oracle). VITE_PYTH_PROGRAMS picks the
+// Pyth program pair ('pro', the default, or 'legacy'; check which one the
+// cluster uses). VITE_PYTH_FEED_<ID> overrides one account (localnet: the
+// mock-pyth feed). A commodity without a verified feed id and no override has
+// none. Transactions and the chain price source use the market's own pinned
+// account (Market.pyth_price_feed, the only key perps-core accepts), so a
+// feed rotation needs no frontend change; this is the configured default
+// (what scripts/initialize-market.ts creates a market with).
+export const PYTH_PROGRAM_SET: PythProgramSet =
+  import.meta.env.VITE_PYTH_PROGRAMS === 'legacy' ? 'legacy' : DEFAULT_PYTH_PROGRAM_SET;
+export const PYTH_RECEIVER_PROGRAM_ID = new PublicKey(PYTH_PROGRAM_SETS[PYTH_PROGRAM_SET].receiver);
+export const PYTH_PUSH_ORACLE_PROGRAM_ID = new PublicKey(PYTH_PROGRAM_SETS[PYTH_PROGRAM_SET].pushOracle);
+
+/** The push oracle's shard-0 feed account for a feed id (hex). */
+export function pythPushFeedAddress(feedIdHex: string, pushOracle: PublicKey = PYTH_PUSH_ORACLE_PROGRAM_ID): PublicKey {
+  return PublicKey.findProgramAddressSync(pushFeedSeeds(feedIdFromHex(feedIdHex)), pushOracle)[0];
+}
+
+const feedAccounts = new Map<string, PublicKey | undefined>();
+/**
+ * The configured feed account of a commodity: VITE_PYTH_FEED_<ID>, else the
+ * shard-0 account of its feed id; undefined without either. Derived on first
+ * use (not at import: web3.js cannot derive addresses under jsdom).
+ */
+export function pythPriceFeed(commodityId: string): PublicKey | undefined {
+  if (!feedAccounts.has(commodityId)) {
+    const override = (import.meta.env as Record<string, string | undefined>)[`VITE_PYTH_FEED_${commodityId}`];
+    const feedId = PYTH_FEED_IDS[commodityId];
+    feedAccounts.set(commodityId, override ? new PublicKey(override) : feedId ? pythPushFeedAddress(feedId) : undefined);
+  }
+  return feedAccounts.get(commodityId);
+}
 
 // Program constants
 export const PRICE_DECIMALS = 6; // All prices stored with 6 decimals

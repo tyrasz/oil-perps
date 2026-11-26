@@ -43,7 +43,7 @@ pub fn handler(ctx: Context<ApplyReferralCode>) -> Result<()> {
     user_referral.total_fees_paid = 0;
     user_referral.total_referrer_rewards = 0;
     user_referral.applied_at = clock.unix_timestamp;
-    user_referral.bump = *ctx.bumps.get("user_referral").unwrap();
+    user_referral.bump = ctx.bumps.user_referral;
 
     // Increment referral count
     referral_code.total_referred = referral_code.total_referred

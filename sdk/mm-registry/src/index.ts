@@ -8,6 +8,12 @@ export {
   TakerFill,
 } from "./client";
 
+// mm-registry's IDL (committed copy of target/idl/mm_registry.json, kept in
+// sync by scripts/gen-idl.sh --sync) and its TS type, for
+// `new Program(MM_REGISTRY_IDL as MmRegistryIdl, provider)`
+export { default as MM_REGISTRY_IDL } from "./idl/mm_registry.json";
+export type { MmRegistry as MmRegistryIdl } from "./idl/mm_registry";
+
 // Types
 export {
   // Enums
@@ -72,6 +78,10 @@ export {
   PROPOSE_POOL_PARAMS_DISCRIMINATOR,
   MARKET_FUNDING_CARRY_SECS,
   MARKET_SETTLED_AT,
+  MARKET_LEN,
+  MARKET_ORACLE_OFFSETS,
+  MarketOracleInfo,
+  decodeMarketOracleFields,
   LP_POOL_OFFSETS,
   LP_POSITION_OFFSETS,
   POOL_PARAMS_LAYOUT,

@@ -15,6 +15,9 @@ use solana_program_test::{processor, ProgramTest};
 use support::*;
 
 fn book_process(program_id: &Pubkey, accounts: &[solana_sdk::account_info::AccountInfo], data: &[u8]) -> solana_sdk::entrypoint::ProgramResult {
+    // Anchor 1.2's entry wants one lifetime for the id, the accounts and the data
+    let program_id: &Pubkey = Box::leak(Box::new(*program_id));
+    let data: &[u8] = Box::leak(data.to_vec().into_boxed_slice());
     let accounts = Box::leak(Box::new(accounts.to_vec()));
     orderbook::entry(program_id, accounts, data)
 }

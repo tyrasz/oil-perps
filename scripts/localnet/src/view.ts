@@ -5,6 +5,8 @@
 import { Connection, PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import { AccountLayout } from "@solana/spl-token";
 import { FeedView, LocalnetState, Programs, decodeFeed } from "./lib";
+import { feedIdToHex } from "../../../frontend/src/config/pythFeeds";
+import { isFresh } from "../../../frontend/src/utils/oracleAccount";
 import * as pool from "../../../frontend/src/utils/pool";
 import * as pm from "../../../frontend/src/utils/poolMath";
 import { inPreCloseWindow, isOpen, secondsSinceOpen, secondsUntilWeeklyClose } from "../../../frontend/src/utils/session";
@@ -39,11 +41,15 @@ export async function readView(conn: Connection, p: Programs, st: LocalnetState)
   const res = await conn.getMultipleAccountsInfoAndContext(keys, "confirmed");
   const [mi, pi, fi, vi, ci] = res.value;
   if (!mi || !pi || !fi || !vi || !ci) throw new Error("market, pool, feed, vault or clock missing");
-  const marketRaw = p.perps.coder.accounts.decode("Market", mi.data);
-  const poolRaw = p.perps.coder.accounts.decode("LpPool", pi.data);
+  const marketRaw = p.perps.coder.accounts.decode("market", mi.data);
+  const poolRaw = p.perps.coder.accounts.decode("lpPool", pi.data);
   const m = pool.decodeMarket(marketRaw);
   const lp = pool.decodeLpPool(poolRaw);
+  // As read_price checks (D47): the owner the market snapshotted and its feed
+  // id; a mismatch is a broken setup, not a price to reason on
   const feed = decodeFeed(fi.data);
+  if (!fi.owner.equals(marketRaw.oracleProgram)) throw new Error(`feed owner ${fi.owner.toBase58()} is not the market's oracle program`);
+  if (feed.feedId !== feedIdToHex(marketRaw.pythFeedId)) throw new Error(`feed id ${feed.feedId} is not the market's`);
   const t = Number(ci.data.readBigInt64LE(32));
   const vaultTokens = AccountLayout.decode(vi.data).amount;
   const s = m.sessionSchedule;
@@ -75,7 +81,7 @@ export function maxLeverage(v: View): number {
   return Math.floor((10_000_000 / Number(imr)) * 0.98);
 }
 
-/** Whether the feed is fresh for read_price (|publish − now| ≤ 60). */
+/** Whether the feed is fresh for read_price: at most `maxAge` old, at most 60 s ahead (`pyth_receiver::is_fresh`, D52). */
 export function oracleFresh(v: View, maxAge = 60): boolean {
-  return Math.abs(v.feed.publishTime - v.t) <= maxAge;
+  return isFresh(v.feed.publishTime, v.t, maxAge);
 }

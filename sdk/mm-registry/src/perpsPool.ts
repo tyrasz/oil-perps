@@ -375,6 +375,48 @@ export function decodeMarketPoolFields(data: Buffer): { fundingCarrySecs: number
 }
 
 /**
+ * The Market's oracle fields (docs/lp-pool.md D47): the pinned price feed
+ * account (offset 104, unchanged), and appended after `settled_at` the Pyth
+ * feed id, the oracle program snapshotted from ProtocolConfig when the feed
+ * was set (the owner every price read checks), and a pending feed rotation
+ * (propose_oracle_feed; `pendingOracleAt` 0 = none). Market is 434 bytes.
+ */
+export const MARKET_LEN = 434;
+export const MARKET_ORACLE_OFFSETS = {
+  pythPriceFeed: 104,
+  pythFeedId: 295,
+  oracleProgram: 327,
+  pendingPriceFeed: 359,
+  pendingFeedId: 391,
+  pendingOracleAt: 423,
+} as const;
+
+export interface MarketOracleInfo {
+  pythPriceFeed: PublicKey;
+  /** 32 bytes */
+  pythFeedId: Buffer;
+  oracleProgram: PublicKey;
+  pendingPriceFeed: PublicKey;
+  pendingFeedId: Buffer;
+  /** Unix seconds apply_oracle_feed may run from; 0 = nothing pending */
+  pendingOracleAt: BN;
+}
+
+/** Market.pyth_price_feed, pyth_feed_id, oracle_program and the pending rotation. Throws on a pre-D47 (shorter) account. */
+export function decodeMarketOracleFields(data: Buffer): MarketOracleInfo {
+  const o = MARKET_ORACLE_OFFSETS;
+  if (data.length < o.pendingOracleAt + 8) throw new Error(`Market: ${data.length} bytes, expected ${MARKET_LEN} (pre-D47 layout?)`);
+  return {
+    pythPriceFeed: keyAt(data, o.pythPriceFeed),
+    pythFeedId: Buffer.from(data.subarray(o.pythFeedId, o.pythFeedId + 32)),
+    oracleProgram: keyAt(data, o.oracleProgram),
+    pendingPriceFeed: keyAt(data, o.pendingPriceFeed),
+    pendingFeedId: Buffer.from(data.subarray(o.pendingFeedId, o.pendingFeedId + 32)),
+    pendingOracleAt: i64At(data, o.pendingOracleAt),
+  };
+}
+
+/**
  * perps-core initialize_pool(params, adl_keeper), admin-signed. The pool
  * must be created on a fresh market; send it with initialize_market,
  * init_lp_position and the seed lp_deposit in one transaction (D11).

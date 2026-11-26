@@ -97,6 +97,10 @@ export const PERPS_ERRORS: [string, string][] = [
   ['WithdrawalExpired', 'Withdrawal request has lapsed; cancel and request again'],
   ['MarketNotSettled', 'Market is not settled'],
   ['ProfitCloseQuiet', 'Profitable closes wait profit_close_quiet_secs after a session open'],
+  ['OracleNotFullyVerified', 'Oracle price update is not fully verified'],
+  ['OracleFeedIdMismatch', 'Oracle price update is for another feed id'],
+  ['NoPendingOracleChange', 'No oracle feed change is pending'],
+  ['OracleChangeTimelocked', 'Oracle feed change is still timelocked'],
 ];
 
 export const PERPS_ERROR_BASE = 6000;

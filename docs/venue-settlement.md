@@ -5,6 +5,12 @@ positions (`venue_fill`). This is the design the implementation was built
 from. Section 11 amends sections 0–10, and the code then changed further
 after two adversarial reviews. Where they differ, the code wins:
 
+> Historical, pre-D48: toolchain and oracle details below (Rust 1.75, no
+> `div_ceil`, pyth-sdk-solana's `get_price_no_older_than`, `scripts/idlgen`)
+> describe the stack this was built on. Since [lp-pool.md](lp-pool.md) D47–D52
+> the programs build with Rust 1.95 (platform-tools v1.57, `div_ceil` allowed)
+> and read Pyth Receiver `PriceUpdateV2` accounts with `pyth_receiver.rs`.
+
 | Spec says | Code does | Why |
 |---|---|---|
 | Pin the venue's ProgramData `slot` (A9 `expected_program_slot`) | Pin its upgrade **authority** (`Venue.upgrade_authority`, `expected_upgrade_authority`; default = immutable) | Loader `ExtendProgram` needs no authority and rewrites the slot, so anyone could halt every venue's fills for a few thousand lamports |
@@ -61,7 +67,7 @@ Claims in the source designs that turned out wrong:
 | `Position` | add `ExecutionSource::Venue` as the **last** variant (Borsh tag 2) | 168 | 32 (unchanged) |
 | `Venue` | new account | 267 | 64 |
 | `VenueApproval` | new account | 191 | 32 |
-| `Market`, `UserAccount`, `Vault` | unchanged | 298 / 85 / 145 | — |
+| `Market`, `UserAccount`, `Vault` | unchanged | 298 (434 since lp-pool.md D47) / 85 / 145 | — |
 
 Existing accounts read the new bytes as 0: `venue_fills_paused = false`. No realloc or migration is needed.
 
@@ -640,7 +646,7 @@ Permissionless matching is deferred. It would be safe for funds, since perps-cor
   - Loop over `perps-core prop-amm mm-registry orderbook`, in that order. In `$WORK`, mm-registry's and orderbook's `path = "../perps-core"` resolves to the stripped copy. Verify this, and that its `[workspace]` table is accepted for a path dependency.
   - Pipe `cargo-build-sbf` output through `tee "$dst/build.log"`, then `! grep -q "Stack offset" "$dst/build.log"`, so stack warnings fail the build.
 - **CI (`.github/workflows/ci.yml`).** The SBF step becomes `SBF_OUT_DIR=$PWD/target/deploy cargo test -p perps-core -p prop-amm -p mm-registry -p orderbook --test integration`. Remove `pt.prefer_bpf(false)` from `programs/orderbook/tests/integration.rs`.
-- **IDL and clients** (regenerate with `scripts/idlgen`).
+- **IDL and clients** (regenerate with `scripts/gen-idl.sh`; `scripts/idlgen` before D49).
   - perps-core: 8 instructions, the `Venue` and `VenueApproval` accounts, the `VenueFilled` event, `ExecutionSource::Venue`. **Ship the frontend IDL before the first fill**: Anchor TS fails to decode tag 2, and `program.account.position.all` would throw. Frontend `OnChainPosition.executionSource` gains `venue?: object`.
   - Keeper: no change. `PositionData` decodes the prefix up to `status`, and status sits at offset 133 either way.
   - `sdk/mm-registry` `buildFillQuoteIx` drops `mmCollateralAccount`, `takerTokenAccount` and `tokenProgram`. It gains the perps accounts, PDA helpers (`venue`, `perps_venue` authority, ProgramData, `venue_approval`, `vposition`, `vmaker`), the one-shot approval builder and the compute-budget instruction. `PostQuoteParams` / `UpdateQuoteParams` / `TwoSidedQuote` types gain `leverage` and `expires_in`.

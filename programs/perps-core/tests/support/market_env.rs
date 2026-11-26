@@ -10,7 +10,7 @@ use perps_core::instructions::{
     InitializeMarketParams, MarketConfigParams, OpenPositionParams, ProtocolRolesParams, VenueApprovalParams, VenueParams,
 };
 use perps_core::state::{LpPool, LpPosition, Market, PoolParams, Position, PositionStatus, UserAccount, Venue};
-use pyth_sdk_solana::state::{AccountType, PriceAccount, PriceInfo, PriceStatus, MAGIC, VERSION_2};
+use perps_core::pyth_receiver::{set_publish_times, PriceUpdateV2View};
 pub use solana_program_test::{BanksClientError, ProgramTest, ProgramTestContext};
 #[allow(unused_imports)]
 pub use solana_sdk::{
@@ -26,7 +26,15 @@ pub use solana_sdk::{
     transaction::{Transaction, TransactionError},
 };
 
+/// Stands in for the Pyth Solana Receiver: owner of the test feeds and the
+/// configured `oracle_program`.
 pub const PYTH_PROGRAM: Pubkey = Pubkey::new_from_array([0x50; 32]);
+/// The OIL market's Pyth feed id: Commodities.USOILSPOT's
+/// (925ca92f…b3e6; docs/lp-pool.md D47).
+pub const OIL_FEED_ID: [u8; 32] = [
+    0x92, 0x5c, 0xa9, 0x2f, 0xf0, 0x05, 0xae, 0x94, 0x3c, 0x15, 0x8e, 0x35, 0x63, 0xf5, 0x96, 0x98,
+    0xce, 0x7e, 0x75, 0xc5, 0xa8, 0xc8, 0xdd, 0x43, 0x30, 0x3a, 0x0a, 0x15, 0x48, 0x87, 0xb3, 0xe6,
+];
 pub const USDC: u64 = 1_000_000;
 pub const CONTRACT: u64 = 1_000_000;
 pub const OIL_PRICE: f64 = 75.0;
@@ -40,6 +48,9 @@ pub const WEDNESDAY: i64 = 1_794_416_400;
 pub const SATURDAY: i64 = FRIDAY_CLOSE + 86_400;
 
 pub fn perps_process(program_id: &Pubkey, accounts: &[solana_sdk::account_info::AccountInfo], data: &[u8]) -> solana_sdk::entrypoint::ProgramResult {
+    // Anchor 1.2's entry wants one lifetime for the id, the accounts and the data
+    let program_id: &Pubkey = Box::leak(Box::new(*program_id));
+    let data: &[u8] = Box::leak(data.to_vec().into_boxed_slice());
     let accounts = Box::leak(Box::new(accounts.to_vec()));
     perps_core::entry(program_id, accounts, data)
 }
@@ -399,8 +410,14 @@ pub fn buckets_watched(pool: &Pubkey) -> (u64, bool) {
 #[cfg(not(test))]
 pub async fn rebaseline_buckets(_ctx: &mut ProgramTestContext) {}
 
-/// `send`, returning the `T` events the transaction emitted (Anchor `emit!`,
-/// logged as "Program data: <base64>").
+/// `send`, returning the `T` events the transaction emitted, logged as
+/// "Program data: <base64>". perps-core's events reach this natively too:
+/// its `emit_event!` (lib.rs) also logs that line through the forwarded
+/// `sol_log` stub natively, which program-test records as "Program log:
+/// Program data: …" (stripped below), so perps-core event asserts need no
+/// `is_sbf()` gate. Natively there are still no `msg!` lines, no return data
+/// and no events from programs that use Anchor's `emit!` directly
+/// (mm-registry, orderbook): gate those on `is_sbf()` (docs/lp-pool.md D48).
 pub async fn send_events<T: anchor_lang::Event>(ctx: &mut ProgramTestContext, ixs: &[Instruction], signers: &[&Keypair]) -> Result<Vec<T>, BanksClientError> {
     use anchor_lang::__private::base64;
     let payer = ctx.payer.insecure_clone();
@@ -413,14 +430,15 @@ pub async fn send_events<T: anchor_lang::Event>(ctx: &mut ProgramTestContext, ix
     watch_buckets(ctx, ixs).await;
     let mut events = Vec::new();
     for line in out.metadata.map(|m| m.log_messages).unwrap_or_default() {
-        // SBF: "Program data: …"; native: through `install_event_log`
+        // "Program data: …" on SBF; "Program log: Program data: …" natively
+        // (perps-core's emit_event! through the forwarded sol_log stub)
         let b64 = line.strip_prefix("Program data: ").or_else(|| line.strip_prefix("Program log: Program data: "));
         if let Some(b64) = b64 {
             let data = match base64::decode(b64) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            if data.len() >= 8 && data[..8] == T::discriminator() {
+            if data.len() >= 8 && &data[..8] == T::DISCRIMINATOR {
                 if let Ok(e) = T::try_from_slice(&data[8..]) {
                     events.push(e);
                 }
@@ -430,49 +448,17 @@ pub async fn send_events<T: anchor_lang::Event>(ctx: &mut ProgramTestContext, ix
     Ok(events)
 }
 
-/// Native runs only: program-test's syscall stubs print `sol_log_data`
-/// (Anchor `emit!`) to stdout instead of the transaction log. Wrap them once
-/// so events reach the log as "Program log: Program data: <base64>", which
-/// `send_events` reads. Call after the first `ProgramTest::start*`.
+/// Native runs only: let the Anchor 1.2 programs reach program-test's syscall
+/// stubs (clock, CPI, return data, stack height; test-sdk's native_stubs.rs).
+/// Call after the first `ProgramTest::start*`. Natively `msg!` lines and
+/// return data stay unavailable, and so do Anchor `emit!` events; perps-core's
+/// events reach the log through `emit_event!` (see `send_events`).
 #[cfg(test)]
-pub fn install_event_log() {
-    use solana_sdk::program_stubs::{set_syscall_stubs, SyscallStubs};
-    struct EventLog(Box<dyn SyscallStubs>);
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    impl SyscallStubs for EventLog {
-        fn sol_log(&self, message: &str) { self.0.sol_log(message) }
-        fn sol_log_compute_units(&self) { self.0.sol_log_compute_units() }
-        fn sol_invoke_signed(&self, ix: &Instruction, infos: &[solana_sdk::account_info::AccountInfo], seeds: &[&[&[u8]]]) -> solana_sdk::entrypoint::ProgramResult {
-            self.0.sol_invoke_signed(ix, infos, seeds)
-        }
-        fn sol_get_clock_sysvar(&self, a: *mut u8) -> u64 { self.0.sol_get_clock_sysvar(a) }
-        fn sol_get_epoch_schedule_sysvar(&self, a: *mut u8) -> u64 { self.0.sol_get_epoch_schedule_sysvar(a) }
-        fn sol_get_fees_sysvar(&self, a: *mut u8) -> u64 { self.0.sol_get_fees_sysvar(a) }
-        fn sol_get_rent_sysvar(&self, a: *mut u8) -> u64 { self.0.sol_get_rent_sysvar(a) }
-        unsafe fn sol_memcpy(&self, d: *mut u8, s: *const u8, n: usize) { self.0.sol_memcpy(d, s, n) }
-        unsafe fn sol_memmove(&self, d: *mut u8, s: *const u8, n: usize) { self.0.sol_memmove(d, s, n) }
-        unsafe fn sol_memcmp(&self, a: *const u8, b: *const u8, n: usize, r: *mut i32) { self.0.sol_memcmp(a, b, n, r) }
-        unsafe fn sol_memset(&self, s: *mut u8, c: u8, n: usize) { self.0.sol_memset(s, c, n) }
-        fn sol_get_return_data(&self) -> Option<(Pubkey, Vec<u8>)> { self.0.sol_get_return_data() }
-        fn sol_set_return_data(&self, data: &[u8]) { self.0.sol_set_return_data(data) }
-        fn sol_log_data(&self, fields: &[&[u8]]) {
-            let parts: Vec<String> = fields.iter().map(|f| anchor_lang::__private::base64::encode(f)).collect();
-            self.0.sol_log(&format!("Program data: {}", parts.join(" ")));
-        }
-        fn sol_get_processed_sibling_instruction(&self, i: usize) -> Option<Instruction> { self.0.sol_get_processed_sibling_instruction(i) }
-        fn sol_get_stack_height(&self) -> u64 { self.0.sol_get_stack_height() }
-    }
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let inner = set_syscall_stubs(Box::new(EventLog(Box::new(NoStubs))));
-        set_syscall_stubs(Box::new(EventLog(inner)));
-    });
-    struct NoStubs;
-    impl SyscallStubs for NoStubs {}
+pub fn install_native_stubs() {
+    solana_sdk::native_stubs::install();
 }
-
 #[cfg(not(test))]
-pub fn install_event_log() {}
+pub fn install_native_stubs() {}
 
 /// Simulate, returning the result and the compute units consumed.
 pub async fn simulate(ctx: &mut ProgramTestContext, ixs: &[Instruction], signers: &[&Keypair]) -> (Result<(), TransactionError>, u64) {
@@ -501,21 +487,15 @@ pub fn anchor_err(e: anchor_lang::error::ErrorCode) -> u32 {
     e.into()
 }
 
-/// A Pyth v2 price account: `price * 10^expo` with confidence `conf`, published at `timestamp`.
+/// A Full Pyth Receiver `PriceUpdateV2` for `OIL_FEED_ID`: `price * 10^expo`
+/// with confidence `conf`, published at `timestamp`.
 pub fn pyth_account(price: i64, conf: u64, expo: i32, timestamp: i64) -> Account {
-    let mut acct = PriceAccount {
-        magic: MAGIC,
-        ver: VERSION_2,
-        atype: AccountType::Price as u32,
-        expo,
-        timestamp,
-        prev_timestamp: timestamp,
-        prev_price: price,
-        prev_conf: conf,
-        ..Default::default()
-    };
-    acct.agg = PriceInfo { price, conf, status: PriceStatus::Trading, ..Default::default() };
-    Account { lamports: 1_000_000_000, data: bytemuck::bytes_of(&acct).to_vec(), owner: PYTH_PROGRAM, executable: false, rent_epoch: 0 }
+    feed_account(PriceUpdateV2View::new(OIL_FEED_ID, price, conf, expo, timestamp).to_bytes(), PYTH_PROGRAM)
+}
+
+/// A feed account holding `data`, owned by `owner`.
+pub fn feed_account(data: Vec<u8>, owner: Pubkey) -> Account {
+    Account { lamports: 1_000_000_000, data, owner, executable: false, rent_epoch: 0 }
 }
 
 /// Dollars as a Pyth price with expo -8.
@@ -582,7 +562,7 @@ pub async fn start_seeded(mut pt: ProgramTest, pool_params: PoolParams, seed: u6
     let program_data = program_data_pda(&perps_core::ID);
     pt.add_account(program_data, Account { lamports: 1_000_000_000, data: bincode::serialize(&state).unwrap(), owner: bpf_loader_upgradeable::id(), executable: false, rent_epoch: 0 });
     let mut ctx = pt.start_with_context().await;
-    install_event_log();
+    install_native_stubs();
     // Before the market exists, so its funding clock starts here too
     let mut clock: Clock = ctx.banks_client.get_sysvar().await.unwrap();
     clock.unix_timestamp = WEDNESDAY;
@@ -606,6 +586,7 @@ pub async fn start_seeded(mut pt: ProgramTest, pool_params: PoolParams, seed: u6
     let params = InitializeMarketParams {
         commodity: "OIL".into(), max_leverage: 20_000, maintenance_margin_ratio: 500, initial_margin_ratio: 1_000,
         taker_fee: 5, maker_fee: 2, liquidation_fee: 100, max_open_interest: 1_000_000_000_000, funding_interval: 3_600,
+        pyth_feed_id: OIL_FEED_ID,
     };
     let (vault, vault_token) = (vault_pda(&market), vault_token_pda(&market));
     let lp_pool = lp_pool_pda(&market);
@@ -695,10 +676,7 @@ pub async fn set_time(base: &mut Base, unix_timestamp: i64) {
     clock.unix_timestamp = unix_timestamp;
     base.ctx.set_sysvar(&clock);
     let mut acct = base.ctx.banks_client.get_account(base.oracle).await.unwrap().unwrap();
-    let mut pa: PriceAccount = *bytemuck::from_bytes(&acct.data);
-    pa.timestamp = unix_timestamp;
-    pa.prev_timestamp = unix_timestamp;
-    acct.data = bytemuck::bytes_of(&pa).to_vec();
+    set_publish_times(&mut acct.data, unix_timestamp);
     base.ctx.set_account(&base.oracle, &AccountSharedData::from(acct));
 }
 
@@ -711,6 +689,11 @@ pub async fn set_price(base: &mut Base, dollars: f64) {
 /// Set the oracle to a raw expo -8 price and confidence, published at `timestamp`.
 pub async fn set_price_raw(base: &mut Base, price: i64, conf: u64, timestamp: i64) {
     base.ctx.set_account(&base.oracle, &AccountSharedData::from(pyth_account(price, conf, -8, timestamp)));
+}
+
+/// Replace the market feed account's data and owner (negative oracle tests).
+pub async fn set_feed(base: &mut Base, data: Vec<u8>, owner: Pubkey) {
+    base.ctx.set_account(&base.oracle, &AccountSharedData::from(feed_account(data, owner)));
 }
 
 // --- accounts -----------------------------------------------------------------
@@ -878,6 +861,38 @@ fn pool_admin_accounts(base: &Base, signer: &Keypair) -> perps_core::accounts::P
 
 pub async fn cancel_pool_params(base: &mut Base, signer: &Keypair) -> Result<(), BanksClientError> {
     let ix = perps_ix(pool_admin_accounts(base, signer), perps_core::instruction::CancelPoolParams {});
+    send(&mut base.ctx, &[ix], &[signer]).await
+}
+
+// --- oracle feed rotation (D47) ------------------------------------------------
+
+pub fn propose_oracle_feed_ix(base: &Base, signer: &Pubkey, new_price_feed: Pubkey, feed_id: [u8; 32]) -> Instruction {
+    perps_ix(perps_core::accounts::ProposeOracleFeed {
+        admin: *signer, config: config_pda(), market: base.market, lp_pool: base.lp_pool, new_price_feed,
+    }, perps_core::instruction::ProposeOracleFeed { feed_id })
+}
+
+pub async fn propose_oracle_feed(base: &mut Base, signer: &Keypair, new_price_feed: Pubkey, feed_id: [u8; 32]) -> Result<(), BanksClientError> {
+    let ix = propose_oracle_feed_ix(base, &signer.pubkey(), new_price_feed, feed_id);
+    send(&mut base.ctx, &[ix], &[signer]).await
+}
+
+pub fn apply_oracle_feed_ix(base: &Base, new_price_feed: Pubkey) -> Instruction {
+    perps_ix(perps_core::accounts::ApplyOracleFeed { market: base.market, config: config_pda(), new_price_feed }, perps_core::instruction::ApplyOracleFeed {})
+}
+
+/// Permissionless: sent by the payer alone.
+pub async fn apply_oracle_feed(base: &mut Base, new_price_feed: Pubkey) -> Result<(), BanksClientError> {
+    let ix = apply_oracle_feed_ix(base, new_price_feed);
+    send(&mut base.ctx, &[ix], &[]).await
+}
+
+pub fn cancel_oracle_feed_ix(base: &Base, signer: &Pubkey) -> Instruction {
+    perps_ix(perps_core::accounts::CancelOracleFeed { admin: *signer, config: config_pda(), market: base.market }, perps_core::instruction::CancelOracleFeed {})
+}
+
+pub async fn cancel_oracle_feed(base: &mut Base, signer: &Keypair) -> Result<(), BanksClientError> {
+    let ix = cancel_oracle_feed_ix(base, &signer.pubkey());
     send(&mut base.ctx, &[ix], &[signer]).await
 }
 

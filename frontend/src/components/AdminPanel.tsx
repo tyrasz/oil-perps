@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { PublicKey } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddress } from '@solana/spl-token';
-import { BN } from '@project-serum/anchor';
+import { BN, type IdlTypes } from '@anchor-lang/core';
+import type { PerpsCore } from '../idl/perps_core';
 import { useMarketStore, COMMODITIES } from '../stores/marketStore';
 import { usePerpsProgram } from '../hooks/usePerpsProgram';
 import { useLpPool } from '../hooks/useLpPool';
@@ -168,7 +169,7 @@ export function AdminPanel() {
     accounts && parsed.params &&
     send('Propose pool params', () =>
       accounts.program.methods
-        .proposePoolParams(encodePoolParams(parsed.params!, bn))
+        .proposePoolParams(encodePoolParams(parsed.params!, bn) as IdlTypes<PerpsCore>['poolParams'])
         .accounts({ admin: accounts.admin, config: accounts.config, market: accounts.market, lpPool: accounts.lpPool })
         .rpc()
     );

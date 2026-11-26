@@ -163,7 +163,7 @@ mod tests {
         let params = crate::instructions::VenueApprovalParams {
             allowance: 1, max_leverage: 2, max_buy_price: 3, min_sell_price: 4, max_price_deviation_bps: 5, expires_at: 6, allowed_sides: 7,
         };
-        let enc = params.try_to_vec().unwrap();
+        let enc = anchor_lang::prelude::borsh::to_vec(&params).unwrap();
         assert_eq!(enc.len(), 39);
         assert_eq!(enc[38], 7);
     }
@@ -189,9 +189,9 @@ mod tests {
     #[test]
     fn account_sizes_are_pinned() {
         assert_eq!(Venue::LEN, 267);
-        assert_eq!(8 + Venue::default().try_to_vec().unwrap().len() + 68, Venue::LEN);
+        assert_eq!(8 + anchor_lang::prelude::borsh::to_vec(&Venue::default()).unwrap().len() + 68, Venue::LEN);
         assert_eq!(VenueApproval::LEN, 191);
-        assert_eq!(8 + VenueApproval::default().try_to_vec().unwrap().len() + 30, VenueApproval::LEN);
+        assert_eq!(8 + anchor_lang::prelude::borsh::to_vec(&VenueApproval::default()).unwrap().len() + 30, VenueApproval::LEN);
     }
 
     #[test]

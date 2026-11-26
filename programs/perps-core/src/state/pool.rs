@@ -497,7 +497,7 @@ pub fn absorb_deficit(
     }
     pool.bad_debt_cum = pool.bad_debt_cum.saturating_add(d);
 
-    emit!(BadDebt {
+    emit_event!(BadDebt {
         position,
         side: side_u8(bankrupt_side),
         deficit: d,
@@ -670,12 +670,12 @@ mod tests {
     #[test]
     fn account_sizes_are_pinned() {
         assert_eq!(PoolParams::LEN, 104);
-        assert_eq!(PoolParams::default().try_to_vec().unwrap().len(), 104);
+        assert_eq!(anchor_lang::prelude::borsh::to_vec(&PoolParams::default()).unwrap().len(), 104);
         assert_eq!(LpPool::LEN, 601);
-        assert_eq!(8 + LpPool::default().try_to_vec().unwrap().len() + LpPool::PADDING, LpPool::LEN);
+        assert_eq!(8 + anchor_lang::prelude::borsh::to_vec(&LpPool::default()).unwrap().len() + LpPool::PADDING, LpPool::LEN);
         assert_eq!(LpPool::PADDING, 48);
         assert_eq!(LpPosition::LEN, 166);
-        assert_eq!(8 + LpPosition::default().try_to_vec().unwrap().len() + 32, LpPosition::LEN);
+        assert_eq!(8 + anchor_lang::prelude::borsh::to_vec(&LpPosition::default()).unwrap().len() + 32, LpPosition::LEN);
     }
 
     fn bytes<T: anchor_lang::AccountSerialize>(account: &T) -> Vec<u8> {
@@ -816,13 +816,13 @@ mod tests {
         assert_eq!(i64_at(312), p.vest_end);
         assert_eq!(u64_at(320), p.donated_cum);
         assert_eq!(i64_at(328), p.pending_params_at);
-        assert_eq!(&b[336..440], p.params.try_to_vec().unwrap().as_slice());
-        assert_eq!(&b[440..544], p.pending_params.try_to_vec().unwrap().as_slice());
+        assert_eq!(&b[336..440], anchor_lang::prelude::borsh::to_vec(&p.params).unwrap().as_slice());
+        assert_eq!(&b[440..544], anchor_lang::prelude::borsh::to_vec(&p.pending_params).unwrap().as_slice());
         assert_eq!(b[544], p.bump);
         assert_eq!(i64_at(545), p.pending_since_short);
 
         // PoolParams offsets (relative to the struct)
-        let q = p.params.try_to_vec().unwrap();
+        let q = anchor_lang::prelude::borsh::to_vec(&p.params).unwrap();
         let qu64 = |o: usize| u64::from_le_bytes(q[o..o + 8].try_into().unwrap());
         let qu32 = |o: usize| u32::from_le_bytes(q[o..o + 4].try_into().unwrap());
         let qu16 = |o: usize| u16::from_le_bytes(q[o..o + 2].try_into().unwrap());

@@ -1,7 +1,7 @@
 //! Pure integer math for the LP pool (docs/lp-pool.md §2, §3, §7, §8, §9).
 //!
 //! No Anchor or Solana imports, like `session.rs` and `price.rs`:
-//! `backend/keeper` (anchor 0.29, outside the workspace) and `sim/`
+//! `backend/keeper` (outside the workspace; its own lockfile) and `sim/`
 //! `#[path]`-include this file. Keep it dependency-free and free of `crate::`
 //! paths. `state/pool.rs` wraps these functions for the Anchor types.
 //!

@@ -47,7 +47,7 @@ pub fn handler(ctx: Context<CreateReferralCode>, params: CreateReferralCodeParam
     referral_code.pending_rewards = 0;
     referral_code.created_at = clock.unix_timestamp;
     referral_code.is_active = true;
-    referral_code.bump = *ctx.bumps.get("referral_code").unwrap();
+    referral_code.bump = ctx.bumps.referral_code;
 
     msg!(
         "Referral code created: {} by {}",

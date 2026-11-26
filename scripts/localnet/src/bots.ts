@@ -150,7 +150,7 @@ class Trader {
   async freeCollateral(): Promise<bigint> {
     const info = await conn.getAccountInfo(this.user);
     if (!info) return 0n;
-    return big((P.perps.coder.accounts.decode("UserAccount", info.data) as any).collateralBalance);
+    return big((P.perps.coder.accounts.decode("userAccount", info.data) as any).collateralBalance);
   }
 
   depositIx(amount: bigint) {
@@ -190,7 +190,7 @@ class Trader {
     });
     this.positions = accts
       .map((a) => {
-        const p = P.perps.coder.accounts.decode("Position", a.account.data) as any;
+        const p = P.perps.coder.accounts.decode("position", a.account.data) as any;
         return {
           address: a.pubkey,
           isLong: "long" in p.side,
@@ -229,7 +229,7 @@ class Trader {
     const acceptable = pool.acceptablePrice(isLong, q.value.exec, slippageBps);
     return openMutex.run(async () => {
       const info = await conn.getAccountInfo(market, "confirmed");
-      const total = big((P.perps.coder.accounts.decode("Market", info!.data) as any).totalPositions);
+      const total = big((P.perps.coder.accounts.decode("market", info!.data) as any).totalPositions);
       const position = pdas.position(this.key, market, total);
       const ix = await P.perps.methods
         .openPosition({ side: isLong ? 0 : 1, size: new BN(size.toString()), leverage, acceptablePrice: new BN(acceptable.toString()) })
@@ -888,7 +888,7 @@ class Lp extends Trader {
 
   async lpPos(): Promise<pool.LpPositionAccount | null> {
     const info = await conn.getAccountInfo(this.position);
-    return info ? pool.decodeLpPosition(P.perps.coder.accounts.decode("LpPosition", info.data)) : null;
+    return info ? pool.decodeLpPosition(P.perps.coder.accounts.decode("lpPosition", info.data)) : null;
   }
 
   /** Crank funding first when it is due: LP flows refuse a stale accumulator (FundingStale). */

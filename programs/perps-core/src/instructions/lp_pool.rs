@@ -66,7 +66,7 @@ fn transfer_in<'info>(
     authority: AccountInfo<'info>,
     amount: u64,
 ) -> Result<()> {
-    let cpi = CpiContext::new(token_program, Transfer { from, to, authority });
+    let cpi = CpiContext::new(*token_program.key, Transfer { from, to, authority });
     token::transfer(cpi, amount)
 }
 
@@ -101,7 +101,7 @@ pub fn init_lp_position(ctx: Context<InitLpPosition>, class: u8) -> Result<()> {
     pos.owner = ctx.accounts.owner.key();
     pos.pool = ctx.accounts.lp_pool.key();
     pos.class = class;
-    pos.bump = *ctx.bumps.get("lp_position").unwrap();
+    pos.bump = ctx.bumps.lp_position;
     Ok(())
 }
 
@@ -142,7 +142,7 @@ pub struct LpDeposit<'info> {
 
     /// CHECK: Pyth price feed, validated by read_price
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
-    pub pyth_price_feed: AccountInfo<'info>,
+    pub pyth_price_feed: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -198,7 +198,7 @@ pub fn lp_deposit(ctx: Context<LpDeposit>, amount: u64, min_shares_out: u64) -> 
 
     let after = vt_before.checked_add(amount).ok_or(PerpsError::MathOverflow)?;
     assert_backed(pool, m, after)?;
-    emit!(LpDeposited { owner: pos.owner, amount, shares: owner_shares, nav_mint: v.nav_mint, lp_shares: pool.lp_shares });
+    emit_event!(LpDeposited { owner: pos.owner, amount, shares: owner_shares, nav_mint: v.nav_mint, lp_shares: pool.lp_shares });
     Ok(())
 }
 
@@ -229,7 +229,7 @@ pub struct LpRequestWithdrawal<'info> {
 
     /// CHECK: Pyth price feed, validated by read_price (unused once settled)
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
-    pub pyth_price_feed: AccountInfo<'info>,
+    pub pyth_price_feed: UncheckedAccount<'info>,
 }
 
 /// Starts the delay; never gated by ADL, drawdown or the windows. Pending
@@ -259,7 +259,7 @@ pub fn lp_request_withdrawal(ctx: Context<LpRequestWithdrawal>, shares: u64) -> 
     pos.claim_window_secs = pool.params.withdrawal_claim_window_secs;
     pool.pending_withdraw_shares = pool.pending_withdraw_shares.checked_add(shares).ok_or(PerpsError::MathOverflow)?;
 
-    emit!(LpWithdrawalRequested {
+    emit_event!(LpWithdrawalRequested {
         owner: pos.owner,
         shares,
         value: requested_value,
@@ -306,7 +306,7 @@ pub fn lp_cancel_withdrawal(ctx: Context<LpCancelWithdrawal>) -> Result<()> {
     let shares = pos.pending_shares;
     pool.pending_withdraw_shares = pool.pending_withdraw_shares.checked_sub(shares).ok_or(PerpsError::BucketUnderflow)?;
     clear_request(pos);
-    emit!(LpWithdrawalCancelled { owner: pos.owner, shares, lp_shares: pool.lp_shares });
+    emit_event!(LpWithdrawalCancelled { owner: pos.owner, shares, lp_shares: pool.lp_shares });
     Ok(())
 }
 
@@ -350,7 +350,7 @@ pub struct LpWithdraw<'info> {
 
     /// CHECK: Pyth price feed, validated by read_price (unused once settled)
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
-    pub pyth_price_feed: AccountInfo<'info>,
+    pub pyth_price_feed: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -409,7 +409,7 @@ pub fn lp_withdraw(ctx: Context<LpWithdraw>) -> Result<()> {
     let vault_seeds = &[b"vault".as_ref(), market_key.as_ref(), &[ctx.accounts.vault.bump]];
     let signer = &[&vault_seeds[..]];
     let cpi = CpiContext::new_with_signer(
-        ctx.accounts.token_program.to_account_info(),
+        ctx.accounts.token_program.key(),
         Transfer {
             from: ctx.accounts.vault_token_account.to_account_info(),
             to: ctx.accounts.owner_token_account.to_account_info(),
@@ -430,7 +430,7 @@ pub fn lp_withdraw(ctx: Context<LpWithdraw>) -> Result<()> {
     // 11.
     let after = vt_before.checked_sub(value).ok_or(PerpsError::VaultInvariantViolated)?;
     assert_backed(pool, m, after)?;
-    emit!(LpWithdrawn { owner: pos.owner, shares: pending, value, nav_redeem: v.nav_redeem, lp_shares: pool.lp_shares });
+    emit_event!(LpWithdrawn { owner: pos.owner, shares: pending, value, nav_redeem: v.nav_redeem, lp_shares: pool.lp_shares });
     Ok(())
 }
 
@@ -485,7 +485,7 @@ pub fn donate_to_pool(ctx: Context<DonateToPool>, amount: u64) -> Result<()> {
 
     let after = vt_before.checked_add(amount).ok_or(PerpsError::MathOverflow)?;
     assert_backed(pool, &ctx.accounts.market, after)?;
-    emit!(PoolDonated { donor: ctx.accounts.donor.key(), amount, recovered, vested });
+    emit_event!(PoolDonated { donor: ctx.accounts.donor.key(), amount, recovered, vested });
     Ok(())
 }
 
@@ -528,7 +528,7 @@ pub fn sweep_insurance_excess(ctx: Context<SweepInsuranceExcess>) -> Result<()> 
     let vested = x - recovered;
     add_vesting(pool, vested, now)?;
 
-    emit!(InsuranceSwept { amount: x, recovered, vested });
+    emit_event!(InsuranceSwept { amount: x, recovered, vested });
     Ok(())
 }
 
@@ -586,7 +586,7 @@ pub fn close_settled_position(ctx: Context<CloseSettledPosition>) -> Result<()> 
     a.lp_pool.free_collateral = a.lp_pool.free_collateral.checked_add(o.payout).ok_or(PerpsError::MathOverflow)?;
 
     msg!("Position closed: PnL={}, Funding={}, Fee={}, Settlement={}", o.pnl, o.funding, o.fee, o.payout);
-    emit!(PositionClosed {
+    emit_event!(PositionClosed {
         position: position_key,
         owner: a.position.owner,
         mark: price,

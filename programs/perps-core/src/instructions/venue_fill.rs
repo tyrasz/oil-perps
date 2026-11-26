@@ -69,7 +69,7 @@ pub struct VenueFill<'info> {
 
     /// CHECK: key pinned by the market
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
-    pub pyth_price_feed: AccountInfo<'info>,
+    pub pyth_price_feed: UncheckedAccount<'info>,
 
     /// CHECK: wallet; bound to its UserAccount and approval by seeds; is_signer read for min_signers
     pub taker: UncheckedAccount<'info>,
@@ -103,8 +103,14 @@ pub struct VenueFill<'info> {
     #[account(constraint = maker.key() != taker.key() @ PerpsError::SelfTrade)]
     pub maker: UncheckedAccount<'info>,
 
+    // `dup`: with maker == taker this is taker_user again, and Anchor 1.x's
+    // duplicate-mutable check (ConstraintDuplicateMutableAccount, run before
+    // the field constraints) would then refuse the fill with 2040 instead of
+    // `maker`'s SelfTrade. SelfTrade still refuses it before the handler, so
+    // the two never alias in a fill that runs.
     #[account(
         mut,
+        dup,
         seeds = [b"user", maker.key().as_ref(), market.key().as_ref()],
         bump = maker_user.bump,
         constraint = maker_user.owner == maker.key()
@@ -153,8 +159,8 @@ pub struct VenueFilled {
 }
 
 pub fn handler(ctx: Context<VenueFill>, params: VenueFillParams) -> Result<()> {
-    let taker_bump = *ctx.bumps.get("taker_position").unwrap();
-    let maker_bump = *ctx.bumps.get("maker_position").unwrap();
+    let taker_bump = ctx.bumps.taker_position;
+    let maker_bump = ctx.bumps.maker_position;
     let a = ctx.accounts;
     let now = Clock::get()?.unix_timestamp;
 
@@ -229,7 +235,7 @@ pub fn handler(ctx: Context<VenueFill>, params: VenueFillParams) -> Result<()> {
     venue.total_fills = venue.total_fills.checked_add(1).ok_or(PerpsError::MathOverflow)?;
     venue.total_notional = venue.total_notional.saturating_add(notional);
 
-    emit!(VenueFilled {
+    emit_event!(VenueFilled {
         venue: venue.key(),
         market: market_key,
         taker: a.taker.key(),

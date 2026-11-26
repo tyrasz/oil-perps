@@ -12,7 +12,8 @@
 //! - `write_off_bad_debt` once a side's pending is `ADL_WRITE_OFF_SECS` old.
 
 use crate::ix::{self, KeeperResult};
-use crate::liquidator::{chain_now, fetch_lp_pool, fetch_open_positions, fetch_oracle_price, for_each_market};
+use crate::liquidator::{chain_now, fetch_lp_pool, fetch_open_positions, for_each_market};
+use crate::oracle::fetch_oracle_price;
 use crate::mirror::{
     self, adl_plan, exposure_triggers, in_profit_close_quiet, net_after_close, pool_view, quote_profit, AdlPlan,
     ADL_MODE_DEFICIT, ADL_MODE_EXPOSURE,

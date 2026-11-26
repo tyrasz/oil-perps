@@ -3,9 +3,15 @@ name = "idlgen"
 version = "0.1.0"
 edition = "2021"
 
+# `anchor idl build` without anchor-cli: the IDL builder anchor-cli 1.2.2 uses
+# (anchor-lang-idl 0.1.4, which compiles the program with `idl-build` and
+# reads what its `__anchor_private_print_idl` tests print) plus anchor-cli's
+# `idl_ts` for the TS type. Driven by scripts/gen-idl.sh.
 [dependencies]
-anchor-syn = { version = "=0.28.0", features = ["idl", "init-if-needed"] }
+anchor-lang-idl = { version = "=0.1.4", features = ["build"] }
+anyhow = "1"
+bs58 = "0.5"
+heck = "0.5"
 serde_json = "1"
-heck = "0.4"
 
 [workspace]

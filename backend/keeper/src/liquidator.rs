@@ -1,6 +1,6 @@
 use crate::ix::{self, KeeperResult};
 use crate::mirror;
-use crate::price;
+use crate::oracle::fetch_oracle_price;
 use crate::state::decode_account;
 pub use crate::state::{anchor_discriminator, LpPoolData, MarketData, PositionData, STATUS_OPEN};
 use crate::{get_lp_pool_pda, get_market_pda, KeeperConfig};
@@ -9,7 +9,7 @@ use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_sdk::{pubkey::Pubkey, signature::Signer};
-use spl_associated_token_account::get_associated_token_address;
+use spl_associated_token_account::address::get_associated_token_address;
 use std::{sync::Arc, time::Duration};
 use tokio::time::interval;
 use tracing::{info, error, warn, debug};
@@ -79,7 +79,13 @@ pub fn fetch_market(client: &RpcClient, config: &KeeperConfig, commodity: &str) 
     let Some(account) = client.get_account_with_commitment(&market_pda, client.commitment())?.value else {
         return Ok(None);
     };
-    Ok(decode_market(&account.owner, &account.data, &config.perps_program_id).map(|m| (market_pda, m)))
+    let market = decode_market(&account.owner, &account.data, &config.perps_program_id);
+    if market.is_none() && account.owner == config.perps_program_id {
+        // A program-owned account at the market address that does not decode:
+        // most likely a program with another Market layout (LEN 434 since D47)
+        warn!("{} market {} did not decode ({} bytes); skipping", commodity, market_pda, account.data.len());
+    }
+    Ok(market.map(|m| (market_pda, m)))
 }
 
 /// Decode a Market account, or `None` if it isn't one: anyone can send
@@ -271,45 +277,6 @@ fn mark_margin_ratio(position: &PositionData, mark: u64, cumulative_funding: i64
     (equity as u128 * 10_000 / n).min(u32::MAX as u128) as u32
 }
 
-/// Read the market's Pyth price with the same rules as `oracle::read_price` in
-/// perps-core (staleness, confidence, floor), so the keeper doesn't submit
-/// liquidations the program would reject.
-pub fn fetch_oracle_price(
-    client: &RpcClient,
-    market: &MarketData,
-    now: i64,
-) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let account = client.get_account(&market.pyth_price_feed)?;
-    let price_account = pyth_sdk_solana::state::load_price_account::<32, ()>(&account.data)
-        .map_err(|e| format!("Failed to parse Pyth feed: {:?}", e))?;
-    // Same selection as pyth-sdk's PriceFeed: the aggregate while trading,
-    // otherwise the previous price.
-    let (px, conf, publish_time) = if price_account.agg.status == pyth_sdk_solana::state::PriceStatus::Trading {
-        (price_account.agg.price, price_account.agg.conf, price_account.timestamp)
-    } else {
-        (price_account.prev_price, price_account.prev_conf, price_account.prev_timestamp)
-    };
-    if !is_fresh(publish_time, now) {
-        return Err("Oracle price is stale".into());
-    }
-    validated_price(px, conf, price_account.expo, market)
-}
-
-/// pyth-sdk's get_price_no_older_than: |publish_time - now| <= max age.
-fn is_fresh(publish_time: i64, now: i64) -> bool {
-    publish_time.abs_diff(now) <= price::MAX_PRICE_AGE_SECS
-}
-
-fn validated_price(
-    price: i64,
-    conf: u64,
-    expo: i32,
-    market: &MarketData,
-) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    price::validate_price(price, conf, expo, market.max_confidence_bps, market.min_oracle_price)
-        .map_err(|r| format!("Oracle price rejected: {:?} (price={}, conf={}, expo={})", r, price, conf, expo).into())
-}
-
 /// Offset of `Position::market` (after the discriminator and owner).
 const POSITION_MARKET_OFFSET: usize = 8 + 32;
 
@@ -331,11 +298,14 @@ pub fn fetch_open_positions(client: &RpcClient, program_id: &Pubkey, market: &Pu
         ..Default::default()
     };
 
-    let accounts = client.get_program_accounts_with_config(program_id, config)?;
+    let accounts = client.get_program_ui_accounts_with_config(program_id, config)?;
 
     let mut positions = Vec::new();
     for (pubkey, account) in accounts {
-        let Some(data) = account.data.get(8..) else { continue };
+        // Base64 always decodes; failing the scan otherwise is what the
+        // deprecated `get_program_accounts_with_config` did.
+        let data = account.data.decode().ok_or("getProgramAccounts: undecodable account data")?;
+        let Some(data) = data.get(8..) else { continue };
         if let Ok(position) = PositionData::deserialize(&mut &data[..]) {
             if position.status == STATUS_OPEN {
                 positions.push((pubkey, position));
@@ -431,8 +401,13 @@ mod tests {
         bytes.extend_from_slice(&(-3i64).to_le_bytes()); // funding_rate
         bytes.extend_from_slice(&5_400u32.to_le_bytes()); // funding_carry_secs
         bytes.extend_from_slice(&1_800_000_000i64.to_le_bytes()); // settled_at
+        bytes.extend_from_slice(&[0x92; 32]); // pyth_feed_id
+        bytes.extend_from_slice(&[0x50; 32]); // oracle_program
+        bytes.extend_from_slice(&[0x61; 32]); // pending_price_feed
+        bytes.extend_from_slice(&[0x62; 32]); // pending_feed_id
+        bytes.extend_from_slice(&1_800_864_000i64.to_le_bytes()); // pending_oracle_at
         bytes.extend_from_slice(&[0u8; 3]); // padding
-        assert_eq!(8 + bytes.len(), 298); // Market::LEN
+        assert_eq!(8 + bytes.len(), 434); // Market::LEN
 
         let m = MarketData::deserialize(&mut bytes.as_slice()).unwrap();
         assert_eq!(m.vault, Pubkey::new_from_array([3; 32]));
@@ -446,27 +421,32 @@ mod tests {
         assert_eq!((m.weekend_initial_margin_ratio, m.weekend_maintenance_margin_ratio), (2_000, 1_000));
         assert_eq!((m.max_confidence_bps, m.min_oracle_price, m.settlement_price), (150, 5_000_000, 0));
         assert_eq!((m.funding_carry_secs, m.settled_at), (5_400, 1_800_000_000));
+        assert_eq!((m.pyth_feed_id, m.oracle_program), ([0x92; 32], Pubkey::new_from_array([0x50; 32])));
+        assert_eq!((m.pending_price_feed, m.pending_feed_id), (Pubkey::new_from_array([0x61; 32]), [0x62; 32]));
+        assert_eq!(m.pending_oracle_at, 1_800_864_000);
     }
 
     #[test]
     fn ignores_accounts_that_are_not_markets() {
         let program = Pubkey::new_unique();
         let mut data = anchor_discriminator("account", "Market").to_vec();
-        data.extend(vec![0u8; 290]);
+        data.extend(vec![0u8; 434 - 8]);
         assert!(decode_market(&program, &data, &program).is_some());
         // Lamports sent to an unused market address: system-owned, empty
         assert!(decode_market(&Pubkey::default(), &[], &program).is_none());
         // Program-owned but too short, or another account type
         assert!(decode_market(&program, &data[..5], &program).is_none());
         let mut other = anchor_discriminator("account", "Position").to_vec();
-        other.extend(vec![0u8; 290]);
+        other.extend(vec![0u8; 434 - 8]);
         assert!(decode_market(&program, &other, &program).is_none());
+        // A market in the layout before D47 (LEN 298) is not one any more
+        assert!(decode_market(&program, &data[..298], &program).is_none());
     }
 
     #[test]
     fn markets_created_before_risk_fields_decode_as_defaults() {
         // A market created before the risk fields existed has zeros there.
-        let mut bytes = vec![0u8; 298 - 8];
+        let mut bytes = vec![0u8; 434 - 8];
         bytes[4 * 32 + 8..4 * 32 + 12].copy_from_slice(&20_000u32.to_le_bytes());
         let m = MarketData::deserialize(&mut bytes.as_slice()).unwrap();
         assert_eq!(m.max_leverage, 20_000);
@@ -496,17 +476,6 @@ mod tests {
         let mut bytes = vec![0u8; 8];
         bytes.extend(borsh::to_vec(&p).unwrap());
         assert_eq!(&bytes[POSITION_MARKET_OFFSET..POSITION_MARKET_OFFSET + 32], market.as_ref());
-    }
-
-    #[test]
-    fn oracle_checks_match_program() {
-        let market = MarketData { min_oracle_price: 5_000_000, ..Default::default() };
-        // $75.00 +/- $0.05 passes; a 2% band fails the default 1% limit
-        assert_eq!(validated_price(7_500_000_000, 5_000_000, -8, &market).unwrap(), 75_000_000);
-        assert!(validated_price(7_500_000_000, 150_000_000, -8, &market).is_err());
-        // Below the $5 floor, and negative prices, are rejected
-        assert!(validated_price(499_000_000, 0, -8, &market).is_err());
-        assert!(validated_price(-3_763_000_000, 0, -8, &market).is_err());
     }
 
     /// After a reopen gap the keeper sends the worst positions first (it used
@@ -560,13 +529,6 @@ mod tests {
         let friday_close = 1_794_607_200;
         assert!(cme.is_in_session_for(friday_close - 3, 2));
         assert!(!cme.is_in_session_for(friday_close - 1, 2));
-    }
-
-    #[test]
-    fn staleness_matches_pyth_sdk() {
-        assert!(is_fresh(1_000, 1_060));
-        assert!(!is_fresh(1_000, 1_061));
-        assert!(is_fresh(1_060, 1_000)); // pyth-sdk compares the absolute difference
     }
 
     #[test]

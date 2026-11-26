@@ -8,7 +8,7 @@
     "init-market:silver": "npx ts-node initialize-market.ts SILVER"
   },
   "dependencies": {
-    "@coral-xyz/anchor": "^0.29.0",
+    "@anchor-lang/core": "^1.2.2",
     "@solana/spl-token": "^0.4.0",
     "@solana/web3.js": "^1.87.0",
     "ts-node": "^10.9.2",

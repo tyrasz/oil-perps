@@ -30,13 +30,31 @@ pub struct Config {
 }
 
 fn mm_process(program_id: &Pubkey, accounts: &[solana_sdk::account_info::AccountInfo], data: &[u8]) -> solana_sdk::entrypoint::ProgramResult {
+    // Anchor 1.2's entry wants one lifetime for the id, the accounts and the data
+    let program_id: &Pubkey = Box::leak(Box::new(*program_id));
+    let data: &[u8] = Box::leak(data.to_vec().into_boxed_slice());
     let accounts = Box::leak(Box::new(accounts.to_vec()));
     mm_registry::entry(program_id, accounts, data)
 }
 
 fn book_process(program_id: &Pubkey, accounts: &[solana_sdk::account_info::AccountInfo], data: &[u8]) -> solana_sdk::entrypoint::ProgramResult {
+    // Anchor 1.2's entry wants one lifetime for the id, the accounts and the data
+    let program_id: &Pubkey = Box::leak(Box::new(*program_id));
+    let data: &[u8] = Box::leak(data.to_vec().into_boxed_slice());
     let accounts = Box::leak(Box::new(accounts.to_vec()));
     orderbook::entry(program_id, accounts, data)
+}
+
+/// Native runs: the v3-cohort programs reach program-test's clock and CPI
+/// only through test-sdk's forwarding stubs (docs/lp-pool.md D48), which wrap
+/// the stubs program-test installs when its first bank starts. The harness
+/// sends the market's setup transactions inside `start_with`, and its own
+/// `install_native_stubs` is a no-op outside the harness's tests, so start a
+/// throwaway bank first (program-test installs its stubs once per process)
+/// and install the forwarding stubs before the real one starts.
+async fn prime_native_stubs() {
+    drop(ProgramTest::default().start_with_context().await);
+    solana_sdk::native_stubs::install();
 }
 
 /// mm-registry's deploy defaults: 50 bps band, 15 s oracle, $50k per fill, the taker signs.
@@ -146,14 +164,14 @@ impl Spec {
 
 impl Sim {
     pub async fn new(cfg: Config) -> Sim {
+        if !is_sbf() {
+            prime_native_stubs().await;
+        }
         let mut pt = ProgramTest::new("mm_registry", mm_registry::ID, processor!(mm_process));
         pt.add_program("orderbook", orderbook::ID, processor!(book_process));
         // Production pool parameters with a one-day withdrawal delay, seeded
         // with the protocol's $1M at t0 (D11, docs/lp-pool.md §16.7)
         let mut base = start_with(pt, crate::chain::pool_params()).await;
-        if !is_sbf() {
-            crate::quiet_events::install();
-        }
         configure(&mut base, cme_config()).await.expect("CME schedule and weekend margins");
         let admin = base.admin.insecure_clone();
 

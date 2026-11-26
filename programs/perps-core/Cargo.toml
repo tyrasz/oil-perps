@@ -14,25 +14,42 @@ no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
 default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+# Declared so Anchor's macros' cfg checks don't warn (unexpected_cfgs)
+anchor-debug = []
+custom-heap = []
+custom-panic = []
 # TEST ONLY: accept session::SCHEDULE_TEST_HOURLY, the one-hour "week" of a
 # live localnet run (docs/localnet.md, D46). Never enabled by a production
 # build: scripts/build-sbf.sh enables it only with --localnet, into
 # target/deploy-localnet.
 localnet = []
 
+# The program macros test `target_os = "solana"`, which the host rustc doesn't list
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
+
 [profile.release]
 overflow-checks = true
 
 [dependencies]
-anchor-lang = "0.28.0"
-anchor-spl = "0.28.0"
-pyth-sdk-solana = "0.8"
+anchor-lang = "=1.2.2"
+anchor-spl = { version = "=1.2.2", default-features = false, features = ["token", "token_2022", "solana-v3"] }
+# sysvar::instructions loaders (no longer re-exported by anchor_lang::solana_program)
+solana-instructions-sysvar = "3"
 
 [dev-dependencies]
 # Runs the program natively in-process for integration tests (no SBF build or validator)
-solana-program-test = "~1.16"
-solana-sdk = "~1.16"
-spl-token = { version = "3.5", features = ["no-entrypoint"] }
+# Agave 4.x gates the crate behind `agave-unstable-api`
+solana-program-test = { version = "=4.4.1", features = ["agave-unstable-api"] }
+# solana-sdk paths without solana-sdk itself (test-sdk/Cargo.toml says why)
+solana-sdk = { package = "oil-test-sdk", path = "../../test-sdk" }
+# spl-token 3.5 no longer builds on these crates; same instructions and state
+spl-token = { package = "spl-token-interface", version = "2" }
 bytemuck = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 bincode = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Pins the hand-written PriceUpdateV2 reader (src/pyth_receiver.rs) to Pyth's
+# own types (tests/pyth_receiver_parity.rs; docs/lp-pool.md D47). Test only:
+# the program does not link it.
+pyth-solana-receiver-sdk = "=2.0.0"

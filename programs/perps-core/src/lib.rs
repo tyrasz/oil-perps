@@ -1,10 +1,35 @@
 use anchor_lang::prelude::*;
 
+/// Anchor's `emit!`, which also hands the event to the test harness when the
+/// program runs natively (in-process solana-program-test; never on chain).
+///
+/// Anchor 1.2's native `sol_log_data` drops the data, so a native run would
+/// see no events. Natively this also logs "Program data: <base64>" through
+/// the solana-sysvar 3 syscall stubs, which the tests forward to
+/// program-test's log (test-sdk's native_stubs.rs), as native runs did before
+/// Anchor 1.2. On SBF it is exactly `anchor_lang::emit!` (docs/lp-pool.md
+/// D48). Defined before the modules so they all see it; every event in this
+/// crate goes through it.
+macro_rules! emit_event {
+    ($event:expr) => {{
+        let event = $event;
+        #[cfg(not(target_os = "solana"))]
+        {
+            #[allow(deprecated)]
+            let data = anchor_lang::__private::base64::encode(anchor_lang::Event::data(&event));
+            anchor_lang::compat::solana_sysvar::program_stubs::sol_log(&format!("Program data: {}", data));
+        }
+        anchor_lang::emit!(event);
+    }};
+}
+
 pub mod errors;
 pub mod events;
 pub mod oracle;
 pub mod pool_math;
 pub mod price;
+pub mod pyth_push;
+pub mod pyth_receiver;
 pub mod session;
 pub mod instructions;
 pub mod state;
@@ -218,5 +243,19 @@ pub mod perps_core {
 
     pub fn write_off_bad_debt(ctx: Context<WriteOffBadDebt>) -> Result<()> {
         instructions::adl::write_off_bad_debt(ctx)
+    }
+
+    // Oracle feed rotation (docs/lp-pool.md D47). Admin proposes and
+    // cancels; anyone applies once the timelock has passed.
+    pub fn propose_oracle_feed(ctx: Context<ProposeOracleFeed>, feed_id: [u8; 32]) -> Result<()> {
+        instructions::oracle_admin::propose_oracle_feed(ctx, feed_id)
+    }
+
+    pub fn apply_oracle_feed(ctx: Context<ApplyOracleFeed>) -> Result<()> {
+        instructions::oracle_admin::apply_oracle_feed(ctx)
+    }
+
+    pub fn cancel_oracle_feed(ctx: Context<CancelOracleFeed>) -> Result<()> {
+        instructions::oracle_admin::cancel_oracle_feed(ctx)
     }
 }

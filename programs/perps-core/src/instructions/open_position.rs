@@ -51,7 +51,7 @@ pub struct OpenPosition<'info> {
 
     /// CHECK: Pyth price feed, validated below
     #[account(constraint = pyth_price_feed.key() == market.pyth_price_feed)]
-    pub pyth_price_feed: AccountInfo<'info>,
+    pub pyth_price_feed: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 
@@ -168,7 +168,7 @@ pub fn house_open_pool(m: &mut Market, pool: &mut LpPool, user: &mut UserAccount
 }
 
 pub fn handler(ctx: Context<OpenPosition>, params: OpenPositionParams) -> Result<()> {
-    let bump = *ctx.bumps.get("position").unwrap();
+    let bump = ctx.bumps.position;
     let a = ctx.accounts;
 
     // 1. Validate leverage, session, size and side
@@ -240,7 +240,7 @@ pub fn handler(ctx: Context<OpenPosition>, params: OpenPositionParams) -> Result
         params.leverage / 1000
     );
     let net_after = market.long_open_interest as i128 - market.short_open_interest as i128;
-    emit!(PositionOpened {
+    emit_event!(PositionOpened {
         position: a.position.key(),
         owner: a.owner.key(),
         side: side_u8(side),

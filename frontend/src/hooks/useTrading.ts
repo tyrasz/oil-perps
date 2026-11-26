@@ -2,7 +2,7 @@ import { useCallback, useMemo, useState } from 'react';
 import { useConnection } from '@solana/wallet-adapter-react';
 import { PublicKey, SystemProgram } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddress } from '@solana/spl-token';
-import { BN } from '@project-serum/anchor';
+import { BN } from '@anchor-lang/core';
 import { usePerpsProgram } from './usePerpsProgram';
 import {
   getUserAccountPDA,
@@ -32,7 +32,6 @@ import { useMarketStore } from '../stores/marketStore';
 import {
   PERPS_CORE_PROGRAM_ID,
   USDC_MINT,
-  PYTH_PRICE_FEEDS,
   LEVERAGE_DECIMALS,
   DEFAULT_SLIPPAGE_BPS,
   TRIGGER_EXTRA_SLIPPAGE_BPS,
@@ -324,10 +323,9 @@ export function useTrading() {
 
         const [positionPda] = getPositionPDA(publicKey, marketPda, positionIndex);
 
-        // Get Pyth price feed for selected commodity
-        const pythPriceFeed =
-          PYTH_PRICE_FEEDS[selectedCommodity.id] ||
-          new PublicKey(selectedCommodity.pythPriceFeed);
+        // The market's pinned price feed (Market.pyth_price_feed; perps-core
+        // refuses any other key, and a feed rotation moves it)
+        const pythPriceFeed = marketAccount.pythPriceFeed as PublicKey;
 
         // Convert parameters
         const sideValue = side === 'long' ? 0 : 1;

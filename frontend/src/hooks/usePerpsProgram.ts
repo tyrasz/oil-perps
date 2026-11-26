@@ -1,9 +1,18 @@
 import { useMemo } from 'react';
-import { Program, AnchorProvider } from '@project-serum/anchor';
-import type { Idl } from '@project-serum/anchor';
+import { Program, AnchorProvider } from '@anchor-lang/core';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { PERPS_CORE_PROGRAM_ID } from '../config/program';
-import { IDL } from '../../../target/types/perps_core';
+// perps-core's IDL (spec 0.1.0) and its TS type: committed copies of
+// target/idl/perps_core.json and target/types/perps_core.ts, refreshed by
+// `scripts/gen-idl.sh --sync` and checked in CI (docs/lp-pool.md D49)
+import perpsCoreIdl from '../idl/perps_core.json';
+import type { PerpsCore } from '../idl/perps_core';
+
+/**
+ * The IDL at PERPS_CORE_PROGRAM_ID: @anchor-lang/core takes the program id
+ * from the IDL's `address`.
+ */
+const IDL = { ...perpsCoreIdl, address: PERPS_CORE_PROGRAM_ID.toBase58() } as PerpsCore;
 
 /**
  * Hook to get the Anchor Program instance for perps-core
@@ -31,13 +40,7 @@ export function usePerpsProgram() {
 
   const program = useMemo(() => {
     if (!provider) return null;
-
-    // Cast IDL to work with the Program constructor
-    return new Program(
-      IDL as unknown as Idl,
-      PERPS_CORE_PROGRAM_ID,
-      provider
-    );
+    return new Program<PerpsCore>(IDL, provider);
   }, [provider]);
 
   return {
