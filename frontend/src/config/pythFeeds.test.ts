@@ -18,9 +18,17 @@ describe('Pyth push-feed accounts (PDA [u16 LE shard, feed_id], push oracle)', (
     );
   });
 
-  it('derives the commodity accounts the SDK computes (migration spec A5)', () => {
-    expect(address(PYTH_FEED_IDS.OIL!, 'pro')).toBe('65sQHMgQBPWnV9nPGL5PKsBmAs3B24cJcFzFh9GwPip7');
-    expect(address(PYTH_FEED_IDS.OIL!, 'legacy')).toBe('4LPPjSGx5s3fvANM78zVhVFhEUQSJGHc1PUFKRjR76sX');
+  it('derives the commodity accounts (GOLD and SILVER as found on mainnet, D53)', () => {
+    expect(address(PYTH_FEED_IDS.OIL!, 'pro')).toBe('DSwsLkLj7sUfkuae3ac6WBHNxHrmZoJzR9BbdKe7CVSK');
+    expect(address(PYTH_FEED_IDS.OIL!, 'legacy')).toBe('9MWouZQyeC82KVGh1xnGTZH3PSinwiTwezhdrV7tBoU7');
+    expect(address(PYTH_FEED_IDS.NATGAS!, 'pro')).toBe('CVMJYsj94tnTgzwbAsAALpvioBq5Sk6qoLddHhMSRjdn');
+    expect(address(PYTH_FEED_IDS.NATGAS!, 'legacy')).toBe('C1y48FLUpndFZL6QbdmGfaQXhjxaJBR8EbG7DiVM65qu');
+    expect(address(PYTH_FEED_IDS.COPPER!, 'pro')).toBe('8zc9xcGJL1Di6PfxHmamyb6SKGh6B8oHFr7jqDJKHeSe');
+    expect(address(PYTH_FEED_IDS.COPPER!, 'legacy')).toBe('4ZjENrBSB65VUqQFQDofyExSgokRXxcaADT2jKV7WiYn');
+    // The former OIL feed, USOILSPOT: its legacy account is the frozen one in the Rust fixtures
+    expect(address('925ca92ff005ae943c158e3563f59698ce7e75c5a8c8dd43303a0a154887b3e6', 'legacy')).toBe(
+      '4LPPjSGx5s3fvANM78zVhVFhEUQSJGHc1PUFKRjR76sX'
+    );
     expect(address(PYTH_FEED_IDS.GOLD!, 'pro')).toBe('csXV1aFF7uAfTHYWx6dDj718hnf7dUDU8v54dubib17');
     expect(address(PYTH_FEED_IDS.GOLD!, 'legacy')).toBe('2uPQGpm8X4ZkxMHxrAW1QuhXcse1AHEgPih6Xp9NuEWW');
     expect(address(PYTH_FEED_IDS.SILVER!, 'pro')).toBe('6Ls6yntvTkfHW992uxPoKjGmcaCih5xP9EYdrAnPUBSs');
@@ -49,21 +57,21 @@ describe('feed ids', () => {
     expect(() => feedIdFromHex('zz'.repeat(32))).toThrow();
   });
 
-  it('leaves the commodities without a verified Core feed id unset (NATGAS, COPPER)', () => {
-    expect(PYTH_FEED_IDS.NATGAS).toBeNull();
-    expect(PYTH_FEED_IDS.COPPER).toBeNull();
-    for (const id of [PYTH_FEED_IDS.OIL, PYTH_FEED_IDS.GOLD, PYTH_FEED_IDS.SILVER]) expect(id).toMatch(/^[0-9a-f]{64}$/);
+  it('has a Pyth Core feed id for every commodity, none of them USOILSPOT (D53)', () => {
+    for (const id of Object.values(PYTH_FEED_IDS)) expect(id).toMatch(/^[0-9a-f]{64}$/);
+    expect(Object.values(PYTH_FEED_IDS)).not.toContain('925ca92ff005ae943c158e3563f59698ce7e75c5a8c8dd43303a0a154887b3e6');
+    expect(new Set(Object.values(PYTH_FEED_IDS)).size).toBe(Object.keys(PYTH_FEED_IDS).length);
   });
 });
 
 describe('pythPriceFeed (config/program.ts)', () => {
-  it('defaults to the pro-compatible shard-0 account, none without a feed id', async () => {
+  it('defaults to the pro-compatible shard-0 account', async () => {
     const { pythPriceFeed, PYTH_PROGRAM_SET, PYTH_RECEIVER_PROGRAM_ID } = await import('./program');
     expect(PYTH_PROGRAM_SET).toBe('pro');
     expect(PYTH_RECEIVER_PROGRAM_ID.toBase58()).toBe(PYTH_PROGRAM_SETS.pro.receiver);
-    expect(pythPriceFeed('OIL')?.toBase58()).toBe('65sQHMgQBPWnV9nPGL5PKsBmAs3B24cJcFzFh9GwPip7');
-    expect(pythPriceFeed('NATGAS')).toBeUndefined();
-    expect(pythPriceFeed('COPPER')).toBeUndefined();
+    expect(pythPriceFeed('OIL')?.toBase58()).toBe('DSwsLkLj7sUfkuae3ac6WBHNxHrmZoJzR9BbdKe7CVSK');
+    expect(pythPriceFeed('GOLD')?.toBase58()).toBe('csXV1aFF7uAfTHYWx6dDj718hnf7dUDU8v54dubib17');
+    expect(pythPriceFeed('COPPER')?.toBase58()).toBe('8zc9xcGJL1Di6PfxHmamyb6SKGh6B8oHFr7jqDJKHeSe');
   });
 });
 

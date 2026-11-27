@@ -21,10 +21,10 @@ import { PythPrograms, assertPythFeed, commodityFeed, feedIdToHex, pythPrograms 
 // PDA([0u16 LE, feed_id], push oracle), owned by the Pyth Receiver
 // (ProtocolConfig.oracle_program). PYTH_PROGRAMS (required) picks the
 // pro-compatible or legacy program pair; the feed ids are
-// frontend/src/config/pythFeeds.ts. NATGAS and COPPER have no verified Core
-// feed id and are refused. Pyth sponsors no commodity feed on Solana: the
-// protocol's price pusher must have pushed the feed (which creates the
-// account) before its market is created, and must keep it fresh.
+// frontend/src/config/pythFeeds.ts (a commodity without one is refused).
+// Of the market feeds Pyth sponsors only XAU/USD on Solana (D53): for the
+// others the protocol's price pusher must have pushed the feed (which
+// creates the account) before its market is created, and must keep it fresh.
 
 // Market configurations per commodity
 const MARKET_CONFIGS: Record<string, {

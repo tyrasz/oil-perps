@@ -92,7 +92,7 @@ and mock-pyth as a plain BPF program. `setup.ts` then:
 1. funds the oracle, keeper, matcher and 25 bot keys with SOL and a 6-decimal
    USDC-like mint;
 2. creates the OIL feed (mock-pyth, $75: a Full `PriceUpdateV2` carrying the
-   production OIL feed id, `Commodities.USOILSPOT` `925ca92f…b3e6`) and
+   production OIL feed id, `Commodities.Index.WTI1M/USD` `f2464139…2933`; D53) and
    `initialize_config` with `oracle_program` = mock-pyth;
 3. in one transaction: `initialize_market` (initialize-market.ts's OIL values,
    funding interval 60 s, `pyth_feed_id` = that id; setup then checks that the

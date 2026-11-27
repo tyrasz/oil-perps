@@ -31,9 +31,11 @@ const TWELVE_DATA_URL: &str = "https://api.twelvedata.com";
 
 /// Pyth Price Feed IDs (hex format for Hermes API)
 pub const PYTH_FEEDS: &[(&str, &str)] = &[
-    ("OIL", "925ca92ff005ae943c158e3563f59698ce7e75c5a8c8dd43303a0a154887b3e6"),     // WTI USOILSPOT
+    ("OIL", "f2464139c45f26097e0173b03207c4a490dbd8bf1b72dfbf064eeb832c7c2933"),     // Commodities.Index.WTI1M/USD (D53)
     ("GOLD", "765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2"),    // XAU/USD
     ("SILVER", "f2fb02c32b055c805e7238d628e5e9dadef274376114eb1f012337cabe93871e"),  // XAG/USD
+    ("NATGAS", "3d8ec049064b20008f62b36ac247a751a1c57d8f082132e64d42cd74668db7c1"),  // Commodities.Index.HHGAS1M/USD
+    ("COPPER", "4073f4c331bf7920a3887536093b57c78ea535e88ac09c761e5b949221c33414"),  // Commodities.Index.COPPER/USD
 ];
 
 /// Twelve Data symbols for backup
@@ -291,7 +293,12 @@ impl OracleService {
 
         let url = format!("{}/v2/updates/price/latest?{}", PYTH_HERMES_URL, ids_param);
 
-        let response = self.client.get(&url).send().await?;
+        // Hermes needs a Pyth API key since 2026-08-26 (401 without one; D53)
+        let mut request = self.client.get(&url);
+        if let Ok(key) = std::env::var("PYTH_API_KEY") {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             return Err(format!("Pyth API error: {}", response.status()).into());

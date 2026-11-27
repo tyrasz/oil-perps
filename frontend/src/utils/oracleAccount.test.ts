@@ -17,11 +17,14 @@ import {
   writePriceUpdateV2,
   type PriceUpdateV2,
 } from './oracleAccount';
-import { PYTH_FEED_IDS, feedIdFromHex } from '../config/pythFeeds';
+import { feedIdFromHex } from '../config/pythFeeds';
 
 // pyth-solana-receiver-sdk 2.0.0's own bytes for one update (Full, and Partial
 // with 13 signatures), written by perps-core's parity test
 // (tests/pyth_receiver_parity.rs, fixture_view()).
+/** Commodities.USOILSPOT, the SDK fixtures' feed id (no longer the OIL feed, D53). */
+const USOILSPOT = '925ca92ff005ae943c158e3563f59698ce7e75c5a8c8dd43303a0a154887b3e6';
+
 const FIXTURES: Record<string, string> = {
   'price_update_v2_full.bin': fileURLToPath(new URL('../../../programs/perps-core/tests/fixtures/price_update_v2_full.bin', import.meta.url)),
   'price_update_v2_partial.bin': fileURLToPath(new URL('../../../programs/perps-core/tests/fixtures/price_update_v2_partial.bin', import.meta.url)),
@@ -29,7 +32,8 @@ const FIXTURES: Record<string, string> = {
 const fixture = (name: string) => new Uint8Array(readFileSync(FIXTURES[name]));
 const FIXTURE: PriceUpdateV2 = {
   writeAuthority: new Uint8Array(32).fill(0x11),
-  feedId: feedIdFromHex(PYTH_FEED_IDS.OIL!),
+  // The SDK fixtures' feed id: USOILSPOT, the former OIL feed (D53)
+  feedId: feedIdFromHex(USOILSPOT),
   price: 7_512_345_678n,
   conf: 4_200_000n,
   exponent: -8,
@@ -80,6 +84,28 @@ describe('parsePriceUpdateV2 against the SDK fixtures', () => {
   });
 });
 
+// Real Solana mainnet push-feed accounts, saved byte for byte by the Rust
+// tests' fixtures (tests/oracle/mainnet.rs, mainnet_price_updates.json; D53)
+const mainnet = (name: string) =>
+  new Uint8Array(readFileSync(fileURLToPath(new URL(`../../../programs/perps-core/tests/fixtures/${name}`, import.meta.url))));
+
+describe('parsePriceUpdateV2 against real mainnet accounts', () => {
+  it('reads the sponsored XAU/USD account of the pro-compatible push oracle', () => {
+    const r = parsePriceUpdateV2(mainnet('mainnet_xau_usd_pro.bin'));
+    if ('reason' in r) throw new Error(r.reason);
+    expect(Buffer.from(r.update.feedId).toString('hex')).toBe('765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2');
+    expect([r.update.price, r.update.conf, r.update.exponent, r.update.publishTime]).toEqual([3_623_512n, 263n, -3, 1_795_746_734n]);
+    expect(decodeOraclePrice(mainnet('mainnet_xau_usd_pro.bin'), 1_795_746_782)!.price).toBeCloseTo(3623.512, 9);
+  });
+
+  it('reads the frozen USOILSPOT account as stale', () => {
+    const p = decodeOraclePrice(mainnet('mainnet_usoilspot_legacy.bin'), 1_795_746_782)!;
+    expect(p.feedId).toBe(USOILSPOT);
+    expect(p.publishTime).toBe(1_787_760_039); // 2026-08-26 16:00:39 UTC
+    expect(p.trading).toBe(false);
+  });
+});
+
 describe('parsePriceUpdateV2 rejections (pyth_receiver.rs order)', () => {
   const full = () => writePriceUpdateV2(FIXTURE);
 
@@ -121,7 +147,7 @@ describe('decodeOraclePrice', () => {
     expect(p.price).toBeCloseTo(75.12345678, 8);
     expect(p.conf).toBeCloseTo(0.042, 8);
     expect(p.publishTime).toBe(1_794_416_400);
-    expect(p.feedId).toBe(PYTH_FEED_IDS.OIL);
+    expect(p.feedId).toBe(USOILSPOT);
     expect(p.trading).toBe(true);
   });
 

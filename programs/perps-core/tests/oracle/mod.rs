@@ -11,6 +11,9 @@ use perps_core::instructions::{MarketConfigParams, ProtocolRolesParams};
 use perps_core::pyth_receiver::PriceUpdateV2View;
 use perps_core::state::PoolParams;
 
+// Real mainnet PriceUpdateV2 accounts as fixtures (D53)
+mod mainnet;
+
 fn perr(e: PerpsError) -> u32 {
     perps_err(e)
 }

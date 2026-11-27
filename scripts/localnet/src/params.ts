@@ -16,7 +16,7 @@ export const MARKET_PARAMS = {
   liquidationFee: 100,
   maxOpenInterest: new BN(10_000_000_000_000),
   fundingInterval: new BN(Number(process.env.FUNDING_INTERVAL_SECS ?? 60)),
-  // The production OIL feed id (USOILSPOT), which the mock-pyth feed carries (D47)
+  // The production OIL feed id (Commodities.Index.WTI1M/USD, D53), which the mock-pyth feed carries
   pythFeedId: OIL_FEED_ID,
 };
 

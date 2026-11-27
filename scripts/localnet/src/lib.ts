@@ -238,7 +238,7 @@ export const wallNow = () => Date.now() / 1000;
 export const PRICE_ACCOUNT_SIZE = PRICE_UPDATE_V2_LEN;
 export const PRICE_EXPO = -8;
 export const STATUS_TRADING = 1;
-/** The localnet OIL feed carries the production OIL feed id (Commodities.USOILSPOT). */
+/** The localnet OIL feed carries the production OIL feed id (Commodities.Index.WTI1M/USD, D53). */
 export const OIL_FEED_ID: number[] = Array.from(feedIdFromHex(PYTH_FEED_IDS.OIL!));
 
 /** mock-pyth `Initialize` (tag 0): feed_id[32], price i64, conf u64, expo i32; the feed and the authority sign. */

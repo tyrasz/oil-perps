@@ -29,8 +29,10 @@ pub use solana_sdk::{
 /// Stands in for the Pyth Solana Receiver: owner of the test feeds and the
 /// configured `oracle_program`.
 pub const PYTH_PROGRAM: Pubkey = Pubkey::new_from_array([0x50; 32]);
-/// The OIL market's Pyth feed id: Commodities.USOILSPOT's
-/// (925ca92f…b3e6; docs/lp-pool.md D47).
+/// The test OIL market's Pyth feed id: Commodities.USOILSPOT's
+/// (925ca92f…b3e6; docs/lp-pool.md D47), the SDK fixtures' id. No longer the
+/// production OIL feed: Pyth dropped USOILSPOT at its 2026-08-26 Core
+/// upgrade (D53), so it is only a test value here.
 pub const OIL_FEED_ID: [u8; 32] = [
     0x92, 0x5c, 0xa9, 0x2f, 0xf0, 0x05, 0xae, 0x94, 0x3c, 0x15, 0x8e, 0x35, 0x63, 0xf5, 0x96, 0x98,
     0xce, 0x7e, 0x75, 0xc5, 0xa8, 0xc8, 0xdd, 0x43, 0x30, 0x3a, 0x0a, 0x15, 0x48, 0x87, 0xb3, 0xe6,
@@ -551,13 +553,43 @@ pub async fn start_with(pt: ProgramTest, pool_params: PoolParams) -> Base {
 
 /// `start_with` and a seed deposit of `seed` (0 = none: the pool has no LPs
 /// and `seed_lp` only has its LpPosition and `LP_SEED` in its wallet).
-pub async fn start_seeded(mut pt: ProgramTest, pool_params: PoolParams, seed: u64) -> Base {
+pub async fn start_seeded(pt: ProgramTest, pool_params: PoolParams, seed: u64) -> Base {
+    // Fresh at WEDNESDAY: the seed lp_deposit in the market's transaction reads it
+    let feed = FeedSetup {
+        commodity: "OIL",
+        oracle_program: PYTH_PROGRAM,
+        oracle: Pubkey::new_unique(),
+        account: pyth_account(pyth_dollars(OIL_PRICE), 0, -8, WEDNESDAY),
+        feed_id: OIL_FEED_ID,
+        clock: WEDNESDAY,
+    };
+    let mut base = start_on_feed(pt, pool_params, seed, feed).await;
+    set_time(&mut base, WEDNESDAY).await;
+    base
+}
+
+/// The market's oracle for `start_on_feed`: the config's `oracle_program`,
+/// the pinned account and its contents, the feed id and the clock to start at.
+pub struct FeedSetup {
+    pub commodity: &'static str,
+    pub oracle_program: Pubkey,
+    pub oracle: Pubkey,
+    pub account: Account,
+    pub feed_id: [u8; 32],
+    /// The clock before the market is created and after `start_on_feed`
+    /// returns; the feed must be fresh here for the seed deposit
+    pub clock: i64,
+}
+
+/// `start_seeded` on `feed` (for instance a real mainnet push-feed account
+/// under the real Receiver): the oracle account is left as given (no
+/// restamp), the clock at `feed.clock`.
+pub async fn start_on_feed(mut pt: ProgramTest, pool_params: PoolParams, seed: u64, feed: FeedSetup) -> Base {
     let admin = Keypair::new();
     let guardian = Keypair::new();
-    let oracle = Pubkey::new_unique();
+    let oracle = feed.oracle;
     pt.add_program("perps_core", perps_core::ID, solana_program_test::processor!(perps_process));
-    // Fresh at WEDNESDAY: the seed lp_deposit in the market's transaction reads it
-    pt.add_account(oracle, pyth_account(pyth_dollars(OIL_PRICE), 0, -8, WEDNESDAY));
+    pt.add_account(oracle, feed.account.clone());
     let state = UpgradeableLoaderState::ProgramData { slot: 0, upgrade_authority_address: Some(admin.pubkey()) };
     let program_data = program_data_pda(&perps_core::ID);
     pt.add_account(program_data, Account { lamports: 1_000_000_000, data: bincode::serialize(&state).unwrap(), owner: bpf_loader_upgradeable::id(), executable: false, rent_epoch: 0 });
@@ -565,7 +597,7 @@ pub async fn start_seeded(mut pt: ProgramTest, pool_params: PoolParams, seed: u6
     install_native_stubs();
     // Before the market exists, so its funding clock starts here too
     let mut clock: Clock = ctx.banks_client.get_sysvar().await.unwrap();
-    clock.unix_timestamp = WEDNESDAY;
+    clock.unix_timestamp = feed.clock;
     ctx.set_sysvar(&clock);
     let payer = ctx.payer.insecure_clone();
     fund(&mut ctx, &admin.pubkey()).await;
@@ -581,12 +613,12 @@ pub async fn start_seeded(mut pt: ProgramTest, pool_params: PoolParams, seed: u6
 
     send(&mut ctx, &[perps_ix(perps_core::accounts::InitializeConfig {
         upgrade_authority: admin.pubkey(), config: config_pda(), program_data, system_program: system_program::ID,
-    }, perps_core::instruction::InitializeConfig { params: ProtocolRolesParams { guardian: guardian.pubkey(), oracle_program: PYTH_PROGRAM } })], &[&admin]).await.unwrap();
-    let market = pda(&[b"market", mint.as_ref(), b"OIL"], &perps_core::ID);
+    }, perps_core::instruction::InitializeConfig { params: ProtocolRolesParams { guardian: guardian.pubkey(), oracle_program: feed.oracle_program } })], &[&admin]).await.unwrap();
+    let market = pda(&[b"market", mint.as_ref(), feed.commodity.as_bytes()], &perps_core::ID);
     let params = InitializeMarketParams {
-        commodity: "OIL".into(), max_leverage: 20_000, maintenance_margin_ratio: 500, initial_margin_ratio: 1_000,
+        commodity: feed.commodity.into(), max_leverage: 20_000, maintenance_margin_ratio: 500, initial_margin_ratio: 1_000,
         taker_fee: 5, maker_fee: 2, liquidation_fee: 100, max_open_interest: 1_000_000_000_000, funding_interval: 3_600,
-        pyth_feed_id: OIL_FEED_ID,
+        pyth_feed_id: feed.feed_id,
     };
     let (vault, vault_token) = (vault_pda(&market), vault_token_pda(&market));
     let lp_pool = lp_pool_pda(&market);
@@ -608,7 +640,7 @@ pub async fn start_seeded(mut pt: ProgramTest, pool_params: PoolParams, seed: u6
     ixs.extend(pool_bootstrap_ixs(&admin.pubkey(), market, oracle, &seed_lp, pool_params, seed));
     send(&mut ctx, &ixs, &[&admin]).await.unwrap();
     let mut base = Base { ctx, admin, guardian, market, oracle, mint, vault, vault_token, lp_pool, seed_lp };
-    set_time(&mut base, WEDNESDAY).await;
+    set_clock(&mut base, feed.clock).await;
     base
 }
 
@@ -668,6 +700,13 @@ pub async fn rotate_admin(base: &mut Base) -> Keypair {
 
 pub async fn now(base: &mut Base) -> i64 {
     base.ctx.banks_client.get_sysvar::<Clock>().await.unwrap().unix_timestamp
+}
+
+/// Warp the clock to `unix_timestamp`, leaving the oracle as it is.
+pub async fn set_clock(base: &mut Base, unix_timestamp: i64) {
+    let mut clock: Clock = base.ctx.banks_client.get_sysvar().await.unwrap();
+    clock.unix_timestamp = unix_timestamp;
+    base.ctx.set_sysvar(&clock);
 }
 
 /// Warp the clock to `unix_timestamp` and restamp the oracle so its price stays fresh.

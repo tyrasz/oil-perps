@@ -21,7 +21,7 @@ pub struct CommodityConfig {
     /// The market's price feed account: the Pyth push oracle's shard-0
     /// PriceUpdateV2 account for the commodity's feed id (pro-compatible
     /// push oracle pyt2F414…; frontend/src/config/pythFeeds.ts, docs/lp-pool.md
-    /// D47/D51). Empty: no verified Pyth Core feed id (NATGAS, COPPER).
+    /// D47/D51/D53). Empty: no verified Pyth Core feed id (none today).
     pub pyth_feed: String,
 }
 
@@ -34,7 +34,7 @@ lazy_static::lazy_static! {
             name: "Crude Oil".to_string(),
             base_price: 75_000_000,  // $75.00
             max_leverage: 20_000,
-            pyth_feed: "65sQHMgQBPWnV9nPGL5PKsBmAs3B24cJcFzFh9GwPip7".to_string(),
+            pyth_feed: "DSwsLkLj7sUfkuae3ac6WBHNxHrmZoJzR9BbdKe7CVSK".to_string(),
         });
         m.insert("GOLD".to_string(), CommodityConfig {
             id: "GOLD".to_string(),
@@ -58,7 +58,7 @@ lazy_static::lazy_static! {
             name: "Natural Gas".to_string(),
             base_price: 2_500_000,  // $2.50
             max_leverage: 15_000,
-            pyth_feed: "".to_string(),
+            pyth_feed: "CVMJYsj94tnTgzwbAsAALpvioBq5Sk6qoLddHhMSRjdn".to_string(),
         });
         m.insert("COPPER".to_string(), CommodityConfig {
             id: "COPPER".to_string(),
@@ -66,7 +66,7 @@ lazy_static::lazy_static! {
             name: "Copper".to_string(),
             base_price: 4_200_000,  // $4.20
             max_leverage: 15_000,
-            pyth_feed: "".to_string(),
+            pyth_feed: "8zc9xcGJL1Di6PfxHmamyb6SKGh6B8oHFr7jqDJKHeSe".to_string(),
         });
         m
     };

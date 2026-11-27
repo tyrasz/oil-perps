@@ -68,12 +68,17 @@ mod pyth_push_tests {
 
     const OIL: &str = "925ca92ff005ae943c158e3563f59698ce7e75c5a8c8dd43303a0a154887b3e6";
 
-    /// Pyth's documented SOL/USD shard-0 account, and the commodity
-    /// accounts frontend/src/config/pythFeeds.test.ts pins (D51).
+    /// Pyth's documented SOL/USD shard-0 account, and accounts that exist
+    /// on mainnet at these addresses, owned by the matching Receiver (D53):
+    /// SOL/USD and XAU/USD under the pro pair, and USOILSPOT (the former OIL
+    /// feed id) under the legacy one.
     #[test]
     fn derivation_matches_pyths_published_address() {
         let sol = hex32("ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d");
         assert_eq!(push_feed_address(&PYTH_PUSH_ORACLE_LEGACY, &sol), pubkey!("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE"));
+        assert_eq!(push_feed_address(&PYTH_PUSH_ORACLE_PRO, &sol), pubkey!("7AviUf9nL62mcxNbQGKm4nKDQnPjswo6c5MX4D57HmyE"));
+        let xau = hex32("765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2");
+        assert_eq!(push_feed_address(&PYTH_PUSH_ORACLE_PRO, &xau), pubkey!("csXV1aFF7uAfTHYWx6dDj718hnf7dUDU8v54dubib17"));
         assert_eq!(push_feed_address(&PYTH_PUSH_ORACLE_PRO, &hex32(OIL)), pubkey!("65sQHMgQBPWnV9nPGL5PKsBmAs3B24cJcFzFh9GwPip7"));
         assert_eq!(push_feed_address(&PYTH_PUSH_ORACLE_LEGACY, &hex32(OIL)), pubkey!("4LPPjSGx5s3fvANM78zVhVFhEUQSJGHc1PUFKRjR76sX"));
     }

@@ -61,14 +61,14 @@ export interface CommodityFeed {
 
 /**
  * A commodity's Pyth Core feed id and its shard-0 push-feed account. Throws
- * for a commodity without a verified feed id (NATGAS, COPPER): no guessing.
+ * for a commodity without a verified feed id (none today, D53): no guessing.
  */
 export function commodityFeed(commodity: string, programs: PythPrograms): CommodityFeed {
   if (!(commodity in PYTH_FEED_IDS)) throw new Error(`Unknown commodity: ${commodity}`);
   const hex = PYTH_FEED_IDS[commodity];
   if (!hex) {
     throw new Error(
-      `${commodity} has no verified Pyth Core feed id (UNKNOWN; docs/lp-pool.md §18): it cannot launch until one is ` +
+      `${commodity} has no verified Pyth Core feed id (docs/lp-pool.md §18 #17): it cannot launch until one is ` +
         'found, checked and added to frontend/src/config/pythFeeds.ts'
     );
   }
@@ -90,7 +90,7 @@ export async function assertPythFeed(
 ): Promise<void> {
   const info = await connection.getAccountInfo(feed);
   if (!info) {
-    throw new Error(`Price feed ${feed} does not exist (Pyth sponsors no commodity feed: the protocol's price pusher must push it first)`);
+    throw new Error(`Price feed ${feed} does not exist (of the market feeds Pyth sponsors only XAU/USD: the protocol's price pusher must push it first)`);
   }
   if (!info.owner.equals(oracleProgram)) {
     throw new Error(`Price feed ${feed} is owned by ${info.owner}, not the oracle program ${oracleProgram}`);
