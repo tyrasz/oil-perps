@@ -1,0 +1,25 @@
+{
+  "name": "oil-perps-price-pusher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Keeps the commodity markets' Pyth push-feed accounts fresh (docs/lp-pool.md D54)",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "selftest": "tsx src/selftest.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "0.29.0",
+    "@pythnetwork/hermes-client": "3.1.0",
+    "@pythnetwork/pyth-solana-receiver": "0.17.0",
+    "@solana/web3.js": "1.98.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.3.0"
+  },
+  "overrides": {
+    "@solana/web3.js": "$@solana/web3.js"
+  }
+}

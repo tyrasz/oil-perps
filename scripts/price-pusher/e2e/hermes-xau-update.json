@@ -1,0 +1,31 @@
+{
+ "binary": {
+  "encoding": "base64",
+  "data": [
+   "UE5BVQEAAAABJAEAAAABAwGl3kmC37e83vvDCrWxBp8L6cAUcKHot1XDkP8k4i8kQj+ybU5qZrClPLK6YW8nPYuxu/ld7KRn3XywVOgHd6oYAQJ94cBaTqNWpoN8/0e9zBpCgerhXE3vx0PF2ONnXCrOy35IR7ElfTpdEKaQwpVQnjaivDJvKVSkJ6WrND9pmHUcAAQ3IEvzTzDAC6+7yspq0p25Ixg+ME7nkZmVYx4lnL6kTAxu9mBKICchFzp5GObMM4VbNaQ7T/TxlB/N64HkFLShAWsJ3ZEAAAAAABpQeXRobmV0UHl0aG5ldFB5dGhuZXRQeXRobmV0UHl0aAAAAAhcxU9UAEFVV1YAAAAACFzFT1QAAAAArLgv0sy1X+E5A3RE5ULPapakGYgBAFUAdl0rqQbbwyyhfMEfUxConp7h9kIFCMY4YfL4uk7jS7IAAAAAADe8cgAAAAAAAADU/////QAAAABrCd2RAAAAAGsJ3ZAAAAAAADeTxgAAAAAAAAC4DMfheZSfz94ZGqgNMflTV6rcdBG9xL/n4ZABJfPwoy7hpNG09EuVnJACoN9ZbmWaVpgaYFdrtO2+E0YSecLNztYh1GWqSW6lA+RvveJW1CfUQ6nPU6gJckipbrz/7L4CcNI+bc8BKB+18RVYSDGaGXENQUsALUUtKOE57zWDLX2A0aUe2cfkLLGRWuPeWQtgtDQqlB/oCSQJchuy0BNUWf+XH6Ofh8M/kdh3k9wEWOfVfifprJ58iKnoEzzpKXTjbPvMNk8IX0yGfRJqbxSpk7B29cdwEiL0nIlBTaGEzHXgpz3xJefyNJaDxoJVeZgXIA=="
+  ]
+ },
+ "parsed": [
+  {
+   "id": "765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2",
+   "price": {
+    "price": "3652722",
+    "conf": "212",
+    "expo": -3,
+    "publish_time": 1795808657
+   },
+   "ema_price": {
+    "price": "3642310",
+    "conf": "184",
+    "expo": -3,
+    "publish_time": 1795808657
+   },
+   "metadata": {}
+  }
+ ],
+ "_source": {
+  "note": "Rebuilt by rebuild-update.py from a mainnet push-oracle transaction (Wormhole VAA + Merkle proof of the XAU/USD message), not fetched from Hermes",
+  "signature": "3KauDfaS1LDvApqXxWQCW6ojokJVySKTVe9eDEXoKSLefQCCxYqFb3wSQfyYAtaimGYVK2ViNzx1vJKwt7ymH56H",
+  "slot": 474671983
+ }
+}

@@ -181,6 +181,24 @@ jobs:
       - run: npm run build
         working-directory: frontend
 
+  # The price pusher (scripts/price-pusher, docs/price-pusher.md, D54): its
+  # types and its decisions. The localnet end-to-end run (e2e/run.sh) clones
+  # Pyth's programs from mainnet and is run by hand.
+  price-pusher:
+    name: Price pusher (typecheck, self-test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: scripts/price-pusher/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: scripts/price-pusher
+      - run: npm run typecheck && npm run selftest
+        working-directory: scripts/price-pusher
+
   session-vectors:
     name: Session vectors up to date
     runs-on: ubuntu-latest

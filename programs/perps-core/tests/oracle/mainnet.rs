@@ -148,6 +148,23 @@ fn fixtures() -> Vec<Fixture> {
             publish_time: 1_787_760_039,
             ema_price: 8_201_013,
         },
+        // Written on a localnet by the real pro-compatible push oracle,
+        // Receiver and Wormhole (cloned from mainnet) when
+        // scripts/price-pusher pushed a mainnet XAU/USD update (D54): what
+        // the protocol's pusher will leave in the GOLD market's account
+        Fixture {
+            file: "localnet_pusher_xau_usd_pro.bin",
+            bytes: include_bytes!("../fixtures/localnet_pusher_xau_usd_pro.bin"),
+            address: pubkey!("csXV1aFF7uAfTHYWx6dDj718hnf7dUDU8v54dubib17"),
+            receiver: PYTH_RECEIVER_PRO,
+            push_oracle: PYTH_PUSH_ORACLE_PRO,
+            feed_id: XAU,
+            price: 3_652_722,
+            conf: 212,
+            exponent: -3,
+            publish_time: 1_795_808_657,
+            ema_price: 3_642_310,
+        },
     ]
 }
 
@@ -275,7 +292,7 @@ async fn gold_market(file: &str) -> (Base, Fixture) {
 /// fees only. The account is never rewritten.
 #[tokio::test]
 async fn trades_on_the_real_xau_push_accounts() {
-    for file in ["mainnet_xau_usd_pro.bin", "mainnet_xau_usd_legacy.bin"] {
+    for file in ["mainnet_xau_usd_pro.bin", "mainnet_xau_usd_legacy.bin", "localnet_pusher_xau_usd_pro.bin"] {
         let (mut base, f) = gold_market(file).await;
         let m = market(&mut base).await;
         assert_eq!((m.pyth_price_feed, m.oracle_program, m.pyth_feed_id), (f.address, f.receiver, XAU), "{}", file);
